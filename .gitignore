@@ -26,6 +26,8 @@ lumi_tradier
 lumiwealth_tradier
 ThetaTerminal.jar
 pytest.ini
+.secrets/.env
+.secrets/config.py
 
 # Pypi deployment
 build

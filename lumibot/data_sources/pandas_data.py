@@ -289,6 +289,7 @@ class PandasData(DataSourceBacktesting):
         include_after_hours=True,
         start_date=None,
         end_date=None,
+        is_benchmark_asset=False
     ):
         """Pull all bars for an asset"""
         timestep = timestep if timestep else self.MIN_TIMESTEP
@@ -301,7 +302,10 @@ class PandasData(DataSourceBacktesting):
             return
 
         try:
-            res = data.get_bars_between_dates(start_date=start_date, end_date=end_date, timestep=timestep)
+            res = data.get_bars_between_dates(timestep=timestep,
+                                              start_date=start_date,
+                                              end_date=end_date,
+                                              is_benchmark_asset=is_benchmark_asset)
         # Return None if data.get_bars returns a ValueError
         except ValueError as e:
             logging.info(f"Error getting bars for {asset}: {e}")

@@ -21,9 +21,16 @@ import io
 from sqlalchemy import create_engine, inspect, text
 
 import pandas as pd
+
 from lumibot import LUMIBOT_DEFAULT_PYTZ
-from ..backtesting import BacktestingBroker, PolygonDataBacktesting, ThetaDataBacktesting
-from ..entities import Asset, Position, Order
+
+from ..entities import Data
+
+from ..backtesting import (BacktestingBroker,
+                           PolygonDataBacktesting,
+                           AlpacaDataBacktesting,
+                           ThetaDataBacktesting)
+from ..entities import Asset, Position, Order, Bars
 from ..tools import (
     create_tearsheet,
     day_deduplicate,
@@ -51,6 +58,8 @@ from ..credentials import (
     SHOW_TEARSHEET,
     LIVE_CONFIG,
     POLYGON_MAX_MEMORY_BYTES,
+    ALPACA_MAX_MEMORY_BYTES,
+    ALPACA_CONFIG,
     BACKTESTING_START,
     BACKTESTING_END,
 )
@@ -245,6 +254,8 @@ class _Strategy:
         self.sell_trading_fees = sell_trading_fees
         self.save_logfile = save_logfile
         self.broker = broker
+        self.backtest_start = backtesting_start
+        self.backtest_end = backtesting_end
 
         # initialize cash variables
         self._cash = None
@@ -790,8 +801,8 @@ class _Strategy:
             # for other timeframes as well
             backtesting_end_adjusted = self._backtesting_end
 
-            # If we are using the polgon data source, then get the benchmark returns from polygon
-            if type(self.broker.data_source) == PolygonDataBacktesting:
+            # If we are using the polygon data source, then get the benchmark returns from polygon
+            if type(self.broker.data_source) in (PolygonDataBacktesting, AlpacaDataBacktesting):
                 benchmark_asset = self._benchmark_asset
                 # If the benchmark asset is a string, then convert it to an Asset object
                 if isinstance(benchmark_asset, str):
@@ -799,8 +810,10 @@ class _Strategy:
 
                 timestep = "minute"
                 # If the strategy sleeptime is in days then use daily data, eg. "1D"
-                if "D" in str(self._sleeptime):
+                if "D" in str(self._sleeptime).upper():
                     timestep = "day"
+                elif "H" in str(self._sleeptime).upper():
+                    timestep = "hour"
 
                 bars = self.broker.data_source.get_historical_prices_between_dates(
                     benchmark_asset,
@@ -808,8 +821,13 @@ class _Strategy:
                     start_date=self._backtesting_start,
                     end_date=backtesting_end_adjusted,
                     quote=self._quote_asset,
+                    is_benchmark_asset=True
                 )
-                df = bars.df
+    
+                if isinstance(bars, (Data, Bars)):
+                    df = bars.df
+                else:
+                    df = bars
 
                 # Add returns column
                 df["return"] = df["close"].pct_change(fill_method=None)
@@ -833,7 +851,7 @@ class _Strategy:
 
                 timestep = "minute"
                 # If the strategy sleeptime is in days then use daily data, eg. "1D"
-                if "D" in str(self._sleeptime):
+                if "D" in str(self._sleeptime).upper():
                     timestep = "day"
 
                 bars = self.broker.data_source.get_historical_prices_between_dates(
@@ -1183,6 +1201,14 @@ class _Strategy:
                 "from https://polygon.io/."
             )
 
+        alpaca_api_key = kwargs.get('alpaca_api_key', None) if kwargs.get('alpaca_api_key', None) is not None else ALPACA_CONFIG["API_KEY"]
+        alpaca_secret_key = kwargs.get('alpaca_secret_key', None) if kwargs.get('alpaca_secret_key', None) is not None else ALPACA_CONFIG["API_SECRET"]
+        if datasource_class == AlpacaDataBacktesting and (alpaca_api_key is None and alpaca_secret_key is None):
+            raise ValueError(
+                "Please set `ALPACA_API_KEY`, `ALPACA_API_SECRET`, and `ALPACA_IS_PAPER` to your API key from alpaca.markets "
+                "as an environment variable if you are using AlpacaDataBacktesting. If you don't have one, you can get a free API key "
+                "from https://alpaca.markets/."
+            )            
         # Make sure thetadata_username and thetadata_password are set if using ThetaDataBacktesting
         if thetadata_username is None or thetadata_password is None:
             # Try getting the Theta Data credentials from credentials
@@ -1225,6 +1251,26 @@ class _Strategy:
                 show_progress_bar=show_progress_bar,
                 max_memory=POLYGON_MAX_MEMORY_BYTES,
                 **kwargs,
+            )
+        elif datasource_class == AlpacaDataBacktesting:
+            if all(k in kwargs.keys() for k in ["alpaca_api_key", "alpaca_secret_key"]):
+                api_key = kwargs.pop('alpaca_api_key')
+                secret_key =  kwargs.pop("alpaca_secret_key")
+            else:
+                api_key = ALPACA_CONFIG['API_KEY']
+                secret_key = ALPACA_CONFIG['API_SECRET']
+
+            data_source = datasource_class(
+                backtesting_start,
+                backtesting_end,
+                config=config,
+                alpaca_api_key=api_key,
+                alpaca_secret_key=secret_key,
+                auto_adjust=auto_adjust,
+                show_progress_bar=show_progress_bar,
+                pandas_data=pandas_data,
+                max_memory=ALPACA_MAX_MEMORY_BYTES,
+                **kwargs
             )
         elif datasource_class == ThetaDataBacktesting or optionsource_class == ThetaDataBacktesting:
             data_source = datasource_class(

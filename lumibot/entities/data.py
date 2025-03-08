@@ -49,7 +49,7 @@ class Data:
         Asset object to which this data is attached.
     sybmol : str
         The underlying or stock symbol as a string.
-    df : dataframe
+    df : pd.DataFrame
         Pandas dataframe containing OHLCV etc trade data. Loaded by user
         from csv.
         Index is date and must be pandas datetime64.
@@ -110,8 +110,8 @@ class Data:
 
     def __init__(
         self,
-        asset,
-        df,
+        asset: Asset,
+        df: pd.DataFrame,
         date_start=None,
         date_end=None,
         trading_hours_start=datetime.time(0, 0),
@@ -145,34 +145,18 @@ class Data:
             )
 
         self.timestep = timestep
+        self.df: pd.DataFrame = self.columns(df)
 
-        self.df = self.columns(df)
+        if isinstance(self.df.index, pd.MultiIndex):
+            self.date_index = self.df.index.levels[1]
+        else:
+            self.date_index = self.df.index
 
-        # Check if the index is datetime (it has to be), and if it's not then try to find it in the columns
-        if str(self.df.index.dtype).startswith("datetime") is False:
-            date_cols = [
-                "Date",
-                "date",
-                "Time",
-                "time",
-                "Datetime",
-                "datetime",
-                "timestamp",
-                "Timestamp",
-            ]
-            for date_col in date_cols:
-                if date_col in self.df.columns:
-                    self.df[date_col] = pd.to_datetime(self.df[date_col])
-                    self.df = self.df.set_index(date_col)
-                    break
-
-        if timezone is not None:
-            self.df.index = self.df.index.tz_localize(timezone)
-
-        self.df = self.set_date_format(self.df)
+        self.df = self.set_date_format(self.df, timezone=timezone)
         self.df = self.df.sort_index()
 
-        self.trading_hours_start, self.trading_hours_end = self.set_times(trading_hours_start, trading_hours_end)
+        self.trading_hours_start, self.trading_hours_end = self.set_times(trading_hours_start,
+                                                                          trading_hours_end)
         self.date_start, self.date_end = self.set_dates(date_start, date_end)
 
         self.df = self.trim_data(
@@ -182,8 +166,8 @@ class Data:
             self.trading_hours_start,
             self.trading_hours_end,
         )
-        self.datetime_start = self.df.index[0]
-        self.datetime_end = self.df.index[-1]
+        self.datetime_start = self.date_index[0]
+        self.datetime_end = self.date_index[-1]        
 
     def set_times(self, trading_hours_start, trading_hours_end):
         """Set the start and end times for the data. The default is 0001 hrs to 2359 hrs.
@@ -221,13 +205,78 @@ class Data:
 
         return df
 
-    def set_date_format(self, df):
-        df.index.name = "datetime"
-        df.index = pd.to_datetime(df.index)
-        if not df.index.tzinfo:
-            df.index = df.index.tz_localize(DEFAULT_PYTZ)
-        elif df.index.tzinfo != DEFAULT_PYTZ:
-            df.index = df.index.tz_convert(DEFAULT_PYTZ)
+    def set_date_format(self, df, timezone=None):
+        """
+        Ensure the DataFrame index (or timestamp level in MultiIndex) is in the correct datetime format and timezone.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            The DataFrame to process. Can have a single index or a MultiIndex.
+        timezone : str or pytz.timezone, optional
+            The timezone to localize or convert the index to. If None, uses DEFAULT_PYTZ.
+
+        Returns
+        -------
+        pd.DataFrame
+            The DataFrame with the index (or timestamp level) properly formatted.
+        """
+        if timezone is None:
+            timezone = DEFAULT_PYTZ
+
+        if isinstance(df.index, pd.MultiIndex):
+            date_index = df.index.levels[1]
+        else:
+            date_index = df.index
+
+        # Check if the index is datetime (it has to be), and if it's not then try to find it in the columns
+        if not str(date_index.dtype).startswith("datetime"):
+            date_cols = [
+                "Date",
+                "date",
+                "Time",
+                "time",
+                "Datetime",
+                "datetime",
+                "timestamp",
+                "Timestamp",
+            ]
+            for date_col in date_cols:
+                if date_col in df.columns:
+                    df[date_col] = pd.to_datetime(df[date_col])
+                    df = df.set_index(date_col)
+                    break
+
+        # Handle MultiIndex
+        if isinstance(df.index, pd.MultiIndex):
+            if "timestamp" not in df.index.names:
+                raise ValueError("MultiIndex must have a 'timestamp' level")
+
+            # Extract the timestamp level
+            timestamp_level = df.index.get_level_values("timestamp")
+            timestamp_level = pd.to_datetime(timestamp_level, utc=True)  # Convert to UTC
+
+            # Handle timezone for the timestamp level
+            if timestamp_level.tzinfo is None:
+                timestamp_level = timestamp_level.tz_localize(timezone)
+            elif timestamp_level.tzinfo != timezone:
+                timestamp_level = timestamp_level.tz_convert(timezone)
+
+            # Rebuild the MultiIndex with the updated timestamp level
+            new_index = pd.MultiIndex.from_arrays(
+                [df.index.get_level_values(level) for level in df.index.names if level != "timestamp"] + [timestamp_level],
+                names=df.index.names
+            )
+            df = df.set_index(new_index)
+        else:
+            # Handle single index
+            df.index.name = "datetime"
+            df.index = pd.to_datetime(df.index)
+            if df.index.tzinfo is None:
+                df.index = df.index.tz_localize(timezone)
+            elif df.index.tzinfo != timezone:
+                df.index = df.index.tz_convert(timezone)
+
         return df
 
     def set_dates(self, date_start, date_end):
@@ -237,9 +286,9 @@ class Data:
                 raise TypeError(f"Start and End dates must be entries as full datetimes. {dt} " f"was entered")
 
         if not date_start:
-            date_start = self.df.index.min()
+            date_start = self.date_index.min()
         if not date_end:
-            date_end = self.df.index.max()
+            date_end = self.date_index.max()
 
         date_start = to_datetime_aware(date_start)
         date_end = to_datetime_aware(date_end)
@@ -254,10 +303,22 @@ class Data:
 
     def trim_data(self, df, date_start, date_end, trading_hours_start, trading_hours_end):
         # Trim the dataframe to match the desired backtesting dates.
-
-        df = df.loc[(df.index >= date_start) & (df.index <= date_end), :]
         if self.timestep == "minute":
-            df = df.between_time(trading_hours_start, trading_hours_end)
+            if isinstance(df.index, pd.MultiIndex):
+                # Extract the timestamp level from the MultiIndex
+                timestamp_level = df.index.get_level_values("timestamp")
+                
+                # Extract the time component from the timestamp level
+                time_level = timestamp_level.time
+                
+                # Filter the DataFrame based on the time component
+                mask = (time_level >= pd.to_datetime(trading_hours_start).time()) & \
+                    (time_level <= pd.to_datetime(trading_hours_end).time())
+                df = df[mask]
+            else:
+                # Handle single index
+                df = df.between_time(trading_hours_start, trading_hours_end)
+
         if df.empty:
             raise ValueError(
                 f"When attempting to load a dataframe for {self.asset}, "
@@ -276,24 +337,66 @@ class Data:
     # To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`
 
     def repair_times_and_fill(self, idx):
-        # Trim the global index so that it is within the local data.
+        """
+        Trim the global index to be within the local data range, reindex the DataFrame,
+        and fill missing values. Supports both single-index and multi-index DataFrames.
+
+        Parameters
+        ----------
+        idx : pd.DatetimeIndex
+            The global index to trim and use for reindexing.
+        """
+        # Trim the global index so that it is within the local data range
         idx = idx[(idx >= self.datetime_start) & (idx <= self.datetime_end)]
 
-        # After all time series merged, adjust the local dataframe to reindex and fill nan's.
-        df = self.df.reindex(idx, method="ffill")
-        df.loc[df["volume"].isna(), "volume"] = 0
-        df.loc[:, ~df.columns.isin(["open", "high", "low"])] = df.loc[
-            :, ~df.columns.isin(["open", "high", "low"])
-        ].ffill()
-        for col in ["open", "high", "low"]:
-            df.loc[df[col].isna(), col] = df.loc[df[col].isna(), "close"]
+        # Handle MultiIndex
+        if isinstance(self.df.index, pd.MultiIndex):
+            # Extract the timestamp level from the MultiIndex
+            timestamp_level = self.df.index.get_level_values("timestamp")
+            
+            # Create a new index for reindexing
+            new_index = pd.MultiIndex.from_arrays(
+                [self.df.index.get_level_values(level) for level in self.df.index.names if level != "timestamp"] + [idx],
+                names=self.df.index.names
+            )
+        else:
+            # Handle single index
+            new_index = idx
 
+        # Reindex the DataFrame and forward-fill missing values
+        df = self.df.reindex(new_index, method="ffill")
+
+        # Fill missing volume with 0
+        if "volume" in df.columns:
+            df.loc[df["volume"].isna(), "volume"] = 0
+
+        # Forward-fill all columns except "open", "high", and "low"
+        if any(col in df.columns for col in ["open", "high", "low", "close"]):
+            df.loc[:, ~df.columns.isin(["open", "high", "low"])] = df.loc[
+                :, ~df.columns.isin(["open", "high", "low"])
+            ].ffill()
+
+            # Fill missing "open", "high", and "low" with "close"
+            for col in ["open", "high", "low"]:
+                if col in df.columns:
+                    df.loc[df[col].isna(), col] = df.loc[df[col].isna(), "close"]
+
+        # Update the DataFrame and iterables
         self.df = df
 
-        iter_index = pd.Series(df.index)
+        # Create iter_index and iter_index_dict for iteration
+        # Update the `date_index`, too!
+        if isinstance(self.df.index, pd.MultiIndex):
+            self.date_index = self.df.index.levels[1]
+            iter_index = pd.Series(self.date_index)
+        else:
+            self.date_index = df.index
+            iter_index = pd.Series(self.date_index)
+
         self.iter_index = pd.Series(iter_index.index, index=iter_index)
         self.iter_index_dict = self.iter_index.to_dict()
 
+        # Reset datalines and convert DataFrame to datalines
         self.datalines = dict()
         self.to_datalines()
 
@@ -303,8 +406,8 @@ class Data:
                 "datetime": Dataline(
                     self.asset,
                     "datetime",
-                    self.df.index.to_numpy(),
-                    self.df.index.dtype,
+                    self.date_index.to_numpy(),
+                    self.date_index.dtype,
                 )
             }
         )
@@ -323,7 +426,7 @@ class Data:
             )
             setattr(self, column, self.datalines[column].dataline)
 
-    def get_iter_count(self, dt):
+    def get_iter_count(self, dt, is_benchmark_asset):
         # Return the index location for a given datetime.
 
         # Check if the date is in the dataframe, if not then get the last
@@ -332,17 +435,34 @@ class Data:
 
         # Check if we have the iter_index_dict, if not then repair the times and fill (which will create the iter_index_dict)
         if getattr(self, "iter_index_dict", None) is None:
-            self.repair_times_and_fill(self.df.index)
+            self.repair_times_and_fill(self.date_index)
 
         # Search for dt in self.iter_index_dict
         if dt in self.iter_index_dict:
             i = self.iter_index_dict[dt]
         else:
-            # If not found, get the last known data
-            i = self.iter_index.asof(dt)
+            if is_benchmark_asset:
+                i = self.custom_asof(self.iter_index, dt)
+            else:
+                i = self.iter_index.asof(dt)
 
         return i
 
+    def custom_asof(self, index, label):
+        # Use asof to get the previous label
+        result = index.asof(label)
+        
+        # If the result is NaN, return the next label
+        if pd.isna(result):
+            # Find the index of the first label greater than the given label
+            next_labels = index[index.index > label]
+            if not next_labels.empty:
+                return next_labels.iloc[0]
+            else:
+                return None  # No next label exists
+        else:
+            return result
+        
     def check_data(func):
         # Validates if the provided date, length, timeshift, and timestep
         # will return data. Runs function if data, returns None if no data.
@@ -360,7 +480,7 @@ class Data:
 
             # Search for dt in self.iter_index_dict
             if getattr(self, "iter_index_dict", None) is None:
-                self.repair_times_and_fill(self.df.index)
+                self.repair_times_and_fill(self.date_index)
 
             if dt in self.iter_index_dict:
                 i = self.iter_index_dict[dt]
@@ -403,7 +523,7 @@ class Data:
         -------
         float or Decimal or None
         """
-        iter_count = self.get_iter_count(dt)
+        iter_count = self.get_iter_count(dt, False)
         open_price = self.datalines["open"].dataline[iter_count]
         close_price = self.datalines["close"].dataline[iter_count]
         price = close_price if dt > self.datalines["datetime"].dataline[iter_count] else open_price
@@ -481,7 +601,7 @@ class Data:
         """
 
         # Get bars.
-        end_row = self.get_iter_count(dt) - timeshift
+        end_row = self.get_iter_count(dt, False) - timeshift
         start_row = end_row - length
 
         if start_row < 0:
@@ -497,7 +617,11 @@ class Data:
 
         return dict
 
-    def _get_bars_between_dates_dict(self, timestep=None, start_date=None, end_date=None):
+    def _get_bars_between_dates_dict(self,
+                                     timestep=None,
+                                     start_date=None,
+                                     end_date=None,
+                                     is_benchmark_asset=False):
         """Returns a dictionary of all the data available between the start and end dates.
 
         Parameters
@@ -508,14 +632,15 @@ class Data:
             The start date to get the data for.
         end_date : datetime.datetime
             The end date to get the data for.
+        is_benchmark_asset: bool
+            If the given asset is a benchmark asset. Default False.
 
         Returns
         -------
         dict
         """
-
-        end_row = self.get_iter_count(end_date)
-        start_row = self.get_iter_count(start_date)
+        end_row = self.get_iter_count(end_date, is_benchmark_asset=is_benchmark_asset)
+        start_row = self.get_iter_count(start_date, is_benchmark_asset=is_benchmark_asset)
 
         if start_row < 0:
             start_row = 0
@@ -602,7 +727,12 @@ class Data:
 
         return df_result
 
-    def get_bars_between_dates(self, timestep=MIN_TIMESTEP, exchange=None, start_date=None, end_date=None):
+    def get_bars_between_dates(self,
+                               timestep=MIN_TIMESTEP,
+                               exchange=None,
+                               start_date=None,
+                               end_date=None,
+                               is_benchmark_asset=False):
         """Returns a dataframe of all the data available between the start and end dates.
 
         Parameters
@@ -615,12 +745,13 @@ class Data:
             The start date to get the data for.
         end_date : datetime.datetime
             The end date to get the data for.
+        is_benchmark_asset: bool
+            If the given asset is a benchmark asset. Default False.
 
         Returns
         -------
         pandas.DataFrame
         """
-
         if timestep == "minute" and self.timestep == "day":
             raise ValueError("You are requesting minute data from a daily data source. This is not supported.")
 
@@ -628,7 +759,10 @@ class Data:
             raise ValueError(f"Only minute and day are supported for timestep. You provided: {timestep}")
 
         if timestep == "day" and self.timestep == "minute":
-            dict = self._get_bars_between_dates_dict(timestep=timestep, start_date=start_date, end_date=end_date)
+            dict = self._get_bars_between_dates_dict(timestep=timestep,
+                                                     start_date=start_date,
+                                                     end_date=end_date,
+                                                     is_benchmark_asset=is_benchmark_asset)
 
             if dict is None:
                 return None
@@ -648,7 +782,10 @@ class Data:
             return df_result
 
         else:
-            dict = self._get_bars_between_dates_dict(timestep=timestep, start_date=start_date, end_date=end_date)
+            dict = self._get_bars_between_dates_dict(timestep=timestep,
+                                                     start_date=start_date,
+                                                     end_date=end_date,
+                                                     is_benchmark_asset=is_benchmark_asset)
 
             if dict is None:
                 return None

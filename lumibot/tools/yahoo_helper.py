@@ -365,6 +365,7 @@ class YahooHelper:
         caching=True,
         auto_adjust=False,
         last_needed_datetime=None,
+        debug: bool = False
     ):
         if interval in ["1m", "15m", "1d"]:
             df = YahooHelper.fetch_symbol_data(
@@ -373,6 +374,8 @@ class YahooHelper:
                 caching=caching,
                 last_needed_datetime=last_needed_datetime,
             )
+            if debug:
+                import pdb; pdb.set_trace()
             return YahooHelper.format_df(df, False)
         else:
             raise ValueError("Unknown interval %s" % interval)

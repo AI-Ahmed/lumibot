@@ -81,6 +81,12 @@ class ComparaisonMixin:
         return getattr(self, self.COMPARAISON_PROP) >= getattr(other, self.COMPARAISON_PROP)
 
 
+import os
+import sys
+import datetime as dt
+from termcolor import colored  # Ensure termcolor is installed with pip
+
+
 def print_progress_bar(
     value,
     start_value,
@@ -95,44 +101,91 @@ def print_progress_bar(
     cash=None,
     portfolio_value=None,
 ):
+    """
+    Prints a dynamically sized progress bar with time estimates and portfolio value.
+    
+    Args:
+        value (float): Current iteration value
+        start_value (float): Starting value
+        end_value (float): Ending value
+        backtesting_started (datetime): When backtesting started
+        file (io.TextIOWrapper): Output stream (default: sys.stdout)
+        length (int): Optional fixed bar length
+        prefix (str): Text before bar
+        suffix (str): Text after bar (unused)
+        decimals (int): Decimal places for percentage
+        fill (str): Bar fill character
+        cash (float): Current cash (unused)
+        portfolio_value (float): Current portfolio value
+    """
+    # Ensure total_length is numeric
     total_length = end_value - start_value
-    current_length = value - start_value
-    percent = min((current_length / total_length) * 100, 100)
-    percent_str = ("  {:.%df}" % decimals).format(percent)
-    percent_str = percent_str[-decimals - 4 :]
+    if isinstance(total_length, dt.timedelta):
+        # If start_value and end_value are datetime objects, convert to total seconds
+        total_length = total_length.total_seconds()
+        current_length = (value - start_value).total_seconds()
+    else:
+        # Otherwise, treat as numeric
+        current_length = value - start_value
 
+    if total_length <= 0:
+        return  # Prevent division by zero
+
+    # Progress calculation
+    progress = max(min(current_length / total_length, 1.0), 0.0)
+    percent = progress * 100
+    percent_str = f"{percent:.{decimals}f}%"
+
+    # Time calculations
     now = dt.datetime.now()
     elapsed = now - backtesting_started
+    elapsed_str = str(elapsed).split('.')[0]
 
-    if percent > 0:
-        eta = (elapsed * (100 / percent)) - elapsed
-        eta_str = f"[Elapsed: {str(elapsed).split('.')[0]} ETA: {str(eta).split('.')[0]}]"
+    # ETA calculation
+    eta_str = ""
+    if progress > 0:
+        eta_seconds = elapsed.total_seconds() * (1/progress - 1)
+        eta = dt.timedelta(seconds=int(eta_seconds))
+        eta_str = str(eta).split('.')[0]
+        time_info = f"[Elapsed: {elapsed_str} | ETA: {eta_str}]"
     else:
-        eta_str = ""
+        time_info = f"[Elapsed: {elapsed_str}]"
 
-    # Make the portfolio value string
+    # Portfolio formatting
+    portfolio_info = ""
     if portfolio_value is not None:
-        portfolio_value_str = f"Portfolio Val: {portfolio_value:,.2f}"
-    else:
-        portfolio_value_str = ""
+        portfolio_info = f"Portfolio: ${portfolio_value:,.2f}"
 
-    if not isinstance(length, int):
+    # Dynamic bar sizing
+    if length is None:
         try:
-            terminal_length, _ = os.get_terminal_size()
-            length = max(
-                0,
-                terminal_length - len(prefix) - len(suffix) - decimals - len(eta_str) - len(portfolio_value_str) - 13,
-            )
+            term_width = os.get_terminal_size().columns
+            # Calculate space needed for text elements
+            text_components = [
+                prefix, " |", "| ", percent_str,
+                time_info, " " + portfolio_info if portfolio_info else ""
+            ]
+            reserved_space = sum(len(str(c)) for c in text_components)
+            length = max(10, term_width - reserved_space - 4)  -9  # ANSI code buffer
         except:
-            length = 0
+            length = 40  # Fallback length
 
-    filled_length = int(length * percent / 100)
-    bar = fill * filled_length + "-" * (length - filled_length)
+    # Bar construction
+    filled_len = int(length * progress)
+    bar = fill * filled_len + '-' * (length - filled_len)
+    colored_bar = colored(bar, 'green')
 
-    line = f"\r{prefix} |{colored(bar, 'green')}| {percent_str}% {suffix} {eta_str} {portfolio_value_str}"
-    file.write(line)
+    # Assembly
+    progress_line = f"\r{prefix} |{colored_bar}| {percent_str} {time_info}"
+    if portfolio_info:
+        progress_line += f" {portfolio_info}"
+        
+    # Truncate if over terminal width (ANSI codes aren't counted)
+    max_allowed = os.get_terminal_size().columns if 'TERM' in os.environ else 120
+    progress_line = progress_line[:max_allowed]
+
+    file.write(progress_line)
     file.flush()
-
 
 def get_lumibot_datetime():
     return dt.datetime.now().astimezone(LUMIBOT_DEFAULT_PYTZ)

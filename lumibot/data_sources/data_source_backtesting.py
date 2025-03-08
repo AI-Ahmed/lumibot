@@ -51,20 +51,20 @@ class DataSourceBacktesting(DataSource, ABC):
 
     def get_datetime(self, adjust_for_delay=False):
         """
-        Get the current datetime of the backtest.
+        Get the current datetime of the backtest, adjusted based on the timestep.
 
         Parameters
         ----------
-        adjust_for_delay: bool
-            Not used for backtesting data sources.  This parameter is only used for live data sources.
+        adjust_for_delay : bool
+            Not used for backtesting data sources. This parameter is only used for live data sources.
 
         Returns
         -------
         datetime
-            The current datetime of the backtest.
+            The current datetime of the backtest, adjusted to the start of the timestep period.
         """
         return self._datetime
-
+        
     def get_datetime_range(self, length, timestep="minute", timeshift=None):
         backtesting_timeshift = datetime.now() - self._datetime
         if timeshift:
@@ -73,11 +73,15 @@ class DataSourceBacktesting(DataSource, ABC):
         if timestep == "minute":
             period_length = length * timedelta(minutes=1)
             end_date = self.get_last_minute() - backtesting_timeshift
+        elif timestep == "hour":
+            period_length = length * timedelta(hours=1)
+            end_date = self.get_last_hour() - backtesting_timeshift
         else:
             period_length = length * timedelta(days=1)
             end_date = self.get_last_day() - backtesting_timeshift
 
         start_date = end_date - period_length
+        
         return start_date, end_date
 
     def _update_datetime(self, new_datetime, cash=None, portfolio_value=None):

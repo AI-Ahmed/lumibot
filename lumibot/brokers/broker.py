@@ -18,6 +18,7 @@ from ..data_sources import DataSource
 from ..entities import Asset, Order, Position
 from ..trading_builtins import SafeList
 
+from ..backtesting import AlpacaDataBacktesting
 
 class CustomLoggerAdapter(logging.LoggerAdapter):
     def process(self, msg, kwargs):
@@ -315,7 +316,11 @@ class Broker(ABC):
 
     # =========Market functions=======================
 
-    def get_last_price(self, asset: Asset, quote=None, exchange=None) -> Union[float, Decimal, None]:
+    def get_last_price(self,
+                       asset: Asset,
+                       timestep: str ="",
+                       quote=None,
+                       exchange=None) -> Union[float, Decimal, None]:
         """
         Takes an asset and returns the last known price
 
@@ -323,6 +328,8 @@ class Broker(ABC):
         ----------
         asset : Asset
             The asset to get the price of.
+        timestep: str 
+            The time granularity (e.g., "minute").
         quote : Asset
             The quote asset to get the price of.
         exchange : str
@@ -336,9 +343,25 @@ class Broker(ABC):
         if self.option_source and asset.asset_type == "option":
             return self.option_source.get_last_price(asset, quote=quote, exchange=exchange)
         else:
-            return self.data_source.get_last_price(asset, quote=quote, exchange=exchange)
+            if timestep != "" and isinstance(self.data_source, AlpacaDataBacktesting):
+                # Ensure that all objects and dataclasses have the same timestep.
+                self.data_source.MIN_TIMESTEP = timestep
+                self.data_source._timestep = timestep
 
-    def get_last_prices(self, assets, quote=None, exchange=None):
+                return self.data_source.get_last_price(asset,
+                                                       timestep=timestep,
+                                                       quote=quote,
+                                                       exchange=exchange)
+            else:
+                return self.data_source.get_last_price(asset,
+                                                       quote=quote,
+                                                       exchange=exchange)
+
+    def get_last_prices(self,
+                        assets,
+                        timestep: str="",
+                        quote=None,
+                        exchange=None):
         """
         Takes a list of assets and returns the last known prices
 
@@ -346,6 +369,8 @@ class Broker(ABC):
         ----------
         assets : list
             The assets to get the prices of.
+        timestep: str 
+            The time granularity (e.g., "minute").
         quote : Asset
             The quote asset to get the prices of.
         exchange : str
@@ -356,7 +381,19 @@ class Broker(ABC):
         dict
             The last known prices of the assets.
         """
-        return self.data_source.get_last_prices(assets=assets, quote=quote, exchange=exchange)
+        if timestep != "" and isinstance(self.data_source, AlpacaDataBacktesting):
+            # Ensure that all objects and dataclasses have the same timestep.
+            self.data_source.MIN_TIMESTEP = timestep
+            self.data_source._timestep = timestep
+
+            return self.data_source.get_last_prices(assets,
+                                                    timestep=timestep,
+                                                    quote=quote,
+                                                    exchange=exchange)
+        else:
+            return self.data_source.get_last_prices(assets,
+                                                    quote=quote,
+                                                    exchange=exchange)
 
     # =================================================================================
     # ================================ Common functions ================================

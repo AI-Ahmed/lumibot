@@ -2,8 +2,9 @@ import datetime
 import os
 import time
 from asyncio.log import logger
+from loguru import logger as log
 from decimal import Decimal
-from typing import Union, List, Type
+from typing import Union, List, Type, Literal
 
 import jsonpickle
 import matplotlib
@@ -339,22 +340,33 @@ class Strategy(_Strategy):
 
     # ======= Helper Methods =======================
 
-    def log_message(self, message: str, color: str = None, broadcast: bool = False):
-        """Logs an info message prefixed with the strategy name.
+    def log_message(self,
+                    message: str,
+                    color: str = None,
+                    broadcast: bool = False,
+                    show_in_terminal: bool = False,
+                    type_of_log: Literal['debug', 'info', 'warning', 'critical', 'error'] = 'info'):
+        """Logs a message prefixed with the strategy name.
 
-        Uses python logging to log the message at the `info` level.
-        Logging goes to the logging file, not the console.
+        Uses python logging to log the message at the specified level.
+        Logging goes to the logging file, and optionally to the terminal.
 
         Parameters
         ----------
         message : str
             String message for logging.
 
-        color : str
+        color : str, optional
             Color of the message. Eg. `"red"` or `"green"`.
 
-        broadcast : bool
+        broadcast : bool, optional
             If True, the message will be broadcasted to any connected message services.
+
+        show_in_terminal : bool, optional
+            If True, the message will be displayed in the terminal.
+
+        type_of_log : Literal['debug', 'info', 'warning', 'critical', 'error'], optional
+            The type of log message. Defaults to 'info'.
 
         Returns
         -------
@@ -365,7 +377,6 @@ class Strategy(_Strategy):
         --------
         >>> self.log_message('Sending a buy order')
         """
-
         if broadcast:
             # Send the message to Discord
             self.send_discord_message(message)
@@ -379,7 +390,22 @@ class Strategy(_Strategy):
             self.logger.info(colored_message)
         else:
             self.logger.info(message)
+        
+        # If show_in_terminal is True, print the message to the terminal
+        if show_in_terminal:
+            # Map the type_of_log to the corresponding logger method
+            log_methods = {
+                'debug': log.debug,
+                'info': log.info,
+                'warning': log.warning,
+                'critical': log.critical,
+                'error': log.error,
+            }
 
+            # Get the appropriate log method based on type_of_log
+            log_method = log_methods.get(type_of_log, log.info)
+            log_method(message)
+       
         return message
 
     # ====== Order Methods ===============
@@ -1693,7 +1719,10 @@ class Strategy(_Strategy):
         """
         self.broker.sell_all(self.name, cancel_open_orders=cancel_open_orders, strategy=self, is_multileg=is_multileg)
 
-    def get_last_price(self, asset: Union[Asset, str], quote=None, exchange=None) -> Union[float, Decimal, None]:
+    def get_last_price(self,
+                       asset: Union[Asset, str],
+                       timestep="",
+                       quote=None, exchange=None) -> Union[float, Decimal, None]:
         """Takes an asset and returns the last known price
 
         Makes an active call to the market to retrieve the last price.
@@ -1704,6 +1733,8 @@ class Strategy(_Strategy):
         asset : Asset object or str
             Asset object for which the last closed price will be
             retrieved.
+        timestep: str 
+                The time granularity (e.g., "minute").
         quote : Asset object
             Quote asset object for which the last closed price will be
             retrieved. This is required for cryptocurrency pairs.
@@ -1772,6 +1803,7 @@ class Strategy(_Strategy):
         try:
             return self.broker.get_last_price(
                 asset,
+                timestep=timestep,
                 quote=quote_asset,
                 exchange=exchange,
                 # should_use_last_close=should_use_last_close,
