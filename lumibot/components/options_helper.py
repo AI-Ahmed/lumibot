@@ -1,4 +1,4 @@
-from datetime import timedelta, date
+from datetime import timedelta, date, datetime
 from typing import Optional, List, Dict, Union, Tuple
 from lumibot.entities import Asset, Order
 
@@ -348,6 +348,40 @@ class OptionsHelper:
         }
         self.strategy.log_message(f"Order details: {details}", color="blue")
         return details
+    
+    def get_expiration_on_or_after_date(self, dt: date, chains: dict, call_or_put: str) -> date:
+        """
+        Get the expiration date that is on or after a given date.
+
+        Parameters
+        ----------
+        dt : date
+            The starting date.
+        chains : dict
+            A dictionary containing option chains.
+        call_or_put : str
+            One of "call" or "put".
+
+        Returns
+        -------
+        date
+            The adjusted expiration date.
+        """
+        
+        # Make it all caps and get the specific chain.
+        call_or_put_caps = call_or_put.upper()
+        specific_chain = chains["Chains"][call_or_put_caps]
+
+        # Get the list of expiration dates as strings.
+        expiration_dates = list(specific_chain.keys())
+
+        # Since dt is a date object and expiration_dates contains strings, dt won't be found.
+        # Find the closest expiration date (as a string) and convert it back to a date.
+        if dt not in expiration_dates:
+            closest_str = min(expiration_dates, key=lambda x: abs(datetime.strptime(x, "%Y-%m-%d").date() - dt))
+            dt = datetime.strptime(closest_str, "%Y-%m-%d").date()
+
+        return dt
 
     # ============================================================
     # Order Building Functions (Build orders without submission)
@@ -726,6 +760,18 @@ class OptionsHelper:
     # Order Execution Functions (Build then submit orders)
     # ============================================================
 
+    def _determine_multileg_order_type(self, limit_price: float) -> str:
+        """
+        Determine the Tradier multileg order type based on the limit price.
+        Returns "debit" if price > 0, "credit" if price < 0, "even" if price == 0.
+        """
+        if limit_price > 0:
+            return "debit"
+        elif limit_price < 0:
+            return "credit"
+        else:
+            return "even"
+
     def execute_orders(self, orders: List[Order], limit_type: Optional[str] = None) -> bool:
         """
         Submit a list of orders as a multi-leg order.
@@ -746,8 +792,16 @@ class OptionsHelper:
         self.strategy.log_message("Executing orders...", color="blue")
         if limit_type:
             limit_price = self.calculate_multileg_limit_price(orders, limit_type)
-            self.strategy.log_message(f"Submitting orders with limit price {limit_price}", color="blue")
-            self.strategy.submit_orders(orders, is_multileg=True, price=limit_price)
+            order_type = self._determine_multileg_order_type(limit_price)
+            self.strategy.log_message(
+                f"Submitting multileg order at price {limit_price} as {order_type}", color="blue"
+            )
+            self.strategy.submit_orders(
+                orders,
+                is_multileg=True,
+                order_type=order_type,
+                price=abs(limit_price)
+            )
         else:
             self.strategy.log_message("Submitting orders without a limit price.", color="blue")
             self.strategy.submit_orders(orders, is_multileg=True)
@@ -1047,7 +1101,7 @@ class OptionsHelper:
         self.strategy.log_message(f"Aggregated Greeks: {aggregated}", color="blue")
         return aggregated
 
-    def check_spread_profit(self, initial_cost: float, orders: List[Order]) -> Optional[float]:
+    def check_spread_profit(self, initial_cost: float, orders: List[Order], contract_multiplier: int = 100) -> Optional[float]:
         """
         Calculate the current profit or loss percentage of a spread based on updated market prices.
 
@@ -1057,6 +1111,8 @@ class OptionsHelper:
             The initial net cost (or credit) of establishing the spread.
         orders : List[Order]
             The list of orders that constitute the spread.
+        contract_multiplier : int, optional
+            The Option contract multiplier to use (default is 100) 
 
         Returns
         -------
@@ -1071,7 +1127,7 @@ class OptionsHelper:
                 self.strategy.log_message(f"Price unavailable for {order.asset.symbol}; cannot calculate spread profit.", color="red")
                 return None
             multiplier = -1 if order.side.lower() == "buy" else 1
-            current_value += price * order.quantity * 100  # Options standard multiplier
+            current_value += price * order.quantity * contract_multiplier 
         profit_pct = ((current_value - initial_cost) / initial_cost) * 100
         self.strategy.log_message(f"Spread profit percentage: {profit_pct:.2f}%", color="blue")
         return profit_pct

@@ -1,352 +1,764 @@
+import os
+from typing import Optional
+
 import pytz
-import datetime as dt
-from typing import Union, Literal, OrderedDict
+from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_HALF_EVEN
 
 import pandas as pd
-from pandas_market_calendars import get_calendar
-
+from alpaca.data.historical import CryptoHistoricalDataClient
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
-from alpaca.data.timeframe import TimeFrame
-from lumibot.data_sources import PandasData
-from lumibot.entities import Asset, Data
+from alpaca.data.requests import CryptoBarsRequest, StockBarsRequest
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
-from loguru import logger as logging
+from lumibot.tools.lumibot_logger import get_logger
+from lumibot.data_sources import DataSourceBacktesting, AlpacaData
+from lumibot.entities import Asset, Bars
+from lumibot import (
+    LUMIBOT_CACHE_FOLDER,
+)
+from lumibot.tools.helpers import (
+    date_n_trading_days_from_date,
+    get_trading_days,
+    get_trading_times,
+    get_timezone_from_datetime,
+    get_decimals,
+    quantize_to_num_decimals,
+)
+
+logger = get_logger(__name__)
+
+from lumibot.tools.alpaca_helpers import sanitize_base_and_quote_asset
 
 
-START_BUFFER = dt.timedelta(days=5)
+class AlpacaBacktesting(DataSourceBacktesting):
+    SOURCE = "ALPACA"
+    MIN_TIMESTEP = "minute"
+    TIMESTEP_MAPPING = [
+        {"timestep": "day", "representations": [TimeFrame.Day]},
+        {"timestep": "minute", "representations": [TimeFrame.Minute]},
+    ]
+    LUMIBOT_DEFAULT_QUOTE_ASSET = AlpacaData.LUMIBOT_DEFAULT_QUOTE_ASSET
 
-class AlpacaDataBacktesting(PandasData):
-    """
-    Backtesting implementation using Alpaca Markets API
-    """
-    
     def __init__(
-        self,
-        datetime_start,
-        datetime_end,
-        pandas_data=None,
-        alpaca_api_key=None,
-        alpaca_secret_key=None,
-        max_memory=None,
-        # TODO: Add more Alpaca-specific parameters (historical trades, etc.)
-        **kwargs,
+            self,
+            datetime_start: datetime | None = None,
+            datetime_end: datetime | None = None,
+            backtesting_started: datetime | None = None,
+            config: dict | None = None,
+            api_key: str | None = None,
+            show_progress_bar: bool = True,
+            delay: int | None = None,
+            pandas_data: dict | list = None,
+            **kwargs
     ):
+        """
+        Initializes a class instance for handling backtesting data and parameters. This initialization 
+        process involves setting up key configurations, verifying account types, and preparing backtesting 
+        timings, timezones, and historical data clients. Data caching and warm-up trading days are also 
+        appropriately configured.
+
+        Args:
+            datetime_start (tz aware datetime): The starting datetime for the backtesting process. Inclusive.
+            datetime_end (tz aware datetime): The ending datetime for the backtesting process. Inclusive.
+            backtesting_started (datetime | None): Represents the datetime when backtesting started. Defaults to None.
+            config (dict | None): Configuration dictionary containing required API keys and account details.
+                Cannot be None as it's critical for API connections.
+            api_key (str | None): API key for authorized data access. Optional as it can typically be found 
+                within the provided config.
+            show_progress_bar (bool): Indicates whether to show a progress bar during data operations. 
+                Defaults to True.
+            delay (int | None): Delay in seconds added between operations to simulate real-world activity. 
+                Defaults to None.
+            pandas_data (dict | list): Data to be loaded directly into pandas, allowing analysis or backtesting 
+                without requiring external API calls.
+            **kwargs: Additional keyword arguments, such as:
+                - timestep (str): Interval for data ("day" or "minute"). Defaults to "day".
+                - refresh_cache (bool): Whether to force cache refresh. Defaults to False.
+                - warm_up_trading_days (int): The number of trading days used for warm-up before processing 
+                  the primary dataset. Defaults to 0.
+                - market (str): Indicates the stock exchange or market (e.g., "NYSE"). Defaults to "NYSE".
+                - auto_adjust (bool): Determines whether to auto-adjust data, such as stock splits. Defaults 
+                  to True.
+                remove_incomplete_current_bar (bool): Whether to remove the incomplete current bar from the data.
+                  Alpaca includes incomplete bars for the current bar (ie: it gives you a daily bar for the current
+                  day even if the day isn't over yet). That's not how lumibot does it, but it is probably
+                  what most Alpaca users expect so the default is False (leave incomplete bar in the data).
+
+        Raises:
+            ValueError: If the `config` argument is None or lacks a valid paper account setup.
+
+        """
+        self._datetime = None
+
+        # Call the base class.
         super().__init__(
             datetime_start=datetime_start,
             datetime_end=datetime_end,
-            pandas_data=pandas_data,
-            **kwargs
+            backtesting_started=backtesting_started,
+            show_progress_bar=show_progress_bar,
+            delay=delay,
+            pandas_data=None,
         )
 
-        # Alpaca API configuration
-        self._api_key    = alpaca_api_key
-        self._secret_key = alpaca_secret_key
-
-        # Memory limit, off by default
-        self.MAX_STORAGE_BYTES = max_memory
-
-        # Initialize Alpaca clients
-        self.historical_client = StockHistoricalDataClient(
-            self._api_key, 
-            self._secret_key,
-            # url_override="https://data.sandbox.alpaca.markets"
+        self.market = (
+                kwargs.get("market", None)
+                or (config.get("MARKET") if config else None)
+                or os.environ.get("MARKET")
+                or "NASDAQ"
         )
 
-    def _enforce_storage_limit(pandas_data: OrderedDict):
-        storage_used = sum(data.df.memory_usage().sum() for data in pandas_data.values())
-        logging.info(f"{storage_used = :,} bytes for {len(pandas_data)} items")
-        while storage_used > AlpacaDataBacktesting.MAX_STORAGE_BYTES:
-            k, d = pandas_data.popitem(last=False)
-            mu = d.df.memory_usage().sum()
-            storage_used -= mu
-            logging.warning(f"Storage limit exceeded. Evicted LRU data: {k} used {mu:,} bytes")
+        self._timestep: str = kwargs.get('timestep', 'day')
+        warm_up_trading_days: int = kwargs.get('warm_up_trading_days', 0)
 
-    def _get_alpaca_timeframe(self, timestep):
-        """Convert Lumibot timestep to Alpaca TimeFrame"""
-        timeframe_map = {
-            'minute': TimeFrame.Minute,
-            'hour': TimeFrame.Hour,
-            'day': TimeFrame.Day
-        }
-        return timeframe_map.get(timestep, TimeFrame.Minute)
+        self._auto_adjust: bool = kwargs.get('auto_adjust', True)
+        self.CACHE_SUBFOLDER = 'alpaca'
+        self._data_store: dict[str, pd.DataFrame] = {}
+        self._refreshed_keys = {}
+        self._refresh_cache: bool = kwargs.get('refresh_cache', False)
+        self._remove_incomplete_current_bar = kwargs.get('remove_incomplete_current_bar', False)
 
-    def _update_pandas_data(self,
-                        asset,
-                        quote,
-                        length,
-                        timestep,
-                        start_dt=None,
-                        is_benchmark=False,
-                        history_type: Literal['bars', 'trades'] = "bars"):
-        """Fetch and update data from Alpaca API"""
-        if start_dt is None:
-            start_dt = self.datetime_start
+        if config is None:
+            raise ValueError("Config cannot be None. Please provide a valid configuration.")
+        if not config.get("PAPER", True):
+            raise ValueError("Backtesting is restricted to paper accounts. Pass in a paper account config.")
+
+        # Initialize clients based on available authentication method
+        oauth_token = config.get("OAUTH_TOKEN")
+        api_key = config.get("API_KEY")
+        api_secret = config.get("API_SECRET")
         
-        # Normalize asset and quote representation
-        search_asset = asset
-        quote_asset = quote if quote is not None else Asset("USD", "forex")
-
-        if isinstance(search_asset, tuple):
-            asset_separated, quote_asset = search_asset
+        if oauth_token:
+            self._crypto_client = CryptoHistoricalDataClient(oauth_token=oauth_token)
+            self._stock_client = StockHistoricalDataClient(oauth_token=oauth_token)
+        elif api_key and api_secret:
+            self._crypto_client = CryptoHistoricalDataClient(
+                api_key=api_key,
+                secret_key=api_secret
+            )
+            self._stock_client = StockHistoricalDataClient(
+                api_key=api_key,
+                secret_key=api_secret
+            )
         else:
-            search_asset = (search_asset, quote_asset)
+            raise ValueError("Either OAuth token or API key/secret must be provided for Alpaca authentication")
 
-        # Get appropriate start time with buffer
-        start_datetime, ts_unit = self.get_start_datetime_and_ts_unit(
-            length, timestep, start_dt, start_buffer=START_BUFFER
+        # Create an AlpacaData instance for internal use
+        self._alpaca_data = AlpacaData(config)
+
+        # Ensure datetime_start and datetime_end have the same tzinfo
+        if str(datetime_start.tzinfo) != str(datetime_end.tzinfo):
+            raise ValueError("datetime_start and datetime_end must have the same tzinfo.")
+
+        # Get timezone from datetime_start if it has one, otherwise use Lumibot default
+        self.tzinfo = get_timezone_from_datetime(datetime_start)
+
+        # We want self._data_datetime_start and self._data_datetime_end to be the start and end dates
+        # of the data for the entire backtest including the warmup dates.
+
+        # The start should be midnight.
+        start_dt = datetime(
+            year=datetime_start.year,
+            month=datetime_start.month,
+            day=datetime_start.day,
         )
-        
-        # Force not to update when called from `get_last_price`
-        # AND update when called `True` from `get_historical_prices_between_dates`
-        force_update = (length == 1) and not is_benchmark
-        
-        # Check if we have data for this asset and if it's recent enough
-        update_needed = True
-        if search_asset in self.pandas_data and not force_update:
-            asset_data = self.pandas_data[search_asset]
-            asset_data_df = asset_data.df
-            
-            # Get the earliest timestamp in our data
-            if isinstance(asset_data_df.index, pd.MultiIndex):
-                data_start_datetime = asset_data_df.index.levels[1].min()
-                data_end_datetime = asset_data_df.index.levels[1].max()
-            else:
-                data_start_datetime = asset_data_df.index.min()
-                data_end_datetime = asset_data_df.index.max()
+        start_dt = self.tzinfo.localize(start_dt)  # Use localize instead of tzinfo in constructor
 
-            data_timestep = asset_data.timestep
+        # The end should be the last minute of the day.
+        end_dt = datetime(
+            year=datetime_end.year,
+            month=datetime_end.month,
+            day=datetime_end.day,
+            hour=23,
+            minute=59,
+            second=59,
+        )
+        end_dt = self.tzinfo.localize(end_dt)  # Use localize instead of tzinfo in constructor
 
-            # Check if our data is fresh enough (within 1 minute of now)
-            current_time = self.get_datetime()
-            if (current_time - data_end_datetime).total_seconds() < 60 and data_timestep == ts_unit:
-                # If we have fresh data and sufficient history, no update needed
-                if (data_start_datetime <= start_datetime):
-                    update_needed = False
-        
-        # If update is not needed, return early
-        if not update_needed:
-            return
-            
+        if warm_up_trading_days > 0:
+            warm_up_start_dt = date_n_trading_days_from_date(
+                n_days=warm_up_trading_days,
+                start_datetime=start_dt,
+                market=self.market,
+            )
+            # Combine with a default time (midnight)
+            warm_up_start_dt = datetime.combine(warm_up_start_dt, datetime.min.time())
+            # Make it timezone-aware
+            warm_up_start_dt = self.tzinfo.localize(warm_up_start_dt)
+        else:
+            warm_up_start_dt = start_dt
+
+        self._data_datetime_start = warm_up_start_dt
+        self._data_datetime_end = end_dt
+
+        if self._timestep not in ['day', 'minute']:
+            raise ValueError("Invalid timestep passed. Must be 'day' or 'minute'.")
+
+        self._trading_days = get_trading_days(
+            self.market,
+            self._data_datetime_start,
+            self._data_datetime_end + timedelta(days=1),  # end_date is exclusive in this function
+            tzinfo=self.tzinfo
+        )
+
+        # I think lumibot's got a bug in the strategy_executor when backtesting daily strategies.
+        # After the backtest is over, it calls on_market_close() which calls get_last_price.
+        # So if you run the backtest until the last day of data, lumibot will crash when it tries to calculate
+        # the portfolio value. To avoid that crash (and because im avoiding dealing with people complaining about
+        # backtest behavior changing if i fix it) im just hacking this so the backtest ends before the data runs out.
+        if self._timestep == 'day':
+            end_shift = -3
+        else:
+            end_shift = -3
+
+        # stop backtesting before the last trading date of the backtest
+        # so there's one day of data the backtester has to calculate all its stuff.
+        last_trading_day = self._trading_days.iloc[end_shift]['market_open']
+        self.datetime_end = last_trading_day
+
+        self.datetime_start = start_dt
+        self._datetime = self.datetime_start
+
+    def _sanitize_base_and_quote_asset(self, base_asset, quote_asset) -> tuple[Asset, Asset]:
+        asset, quote = sanitize_base_and_quote_asset(base_asset, quote_asset)
+        return asset, quote
+
+    def get_last_price(
+            self,
+            asset: Asset,
+            quote: Asset | None = None,
+            exchange: str | None = None
+    ) -> float | Decimal | None:
+        """Returns the open price of the current bar."""
+
+        asset, quote = self._sanitize_base_and_quote_asset(asset, quote)
+
+        bars = self.get_historical_prices(
+            asset=asset,
+            length=1,  # Get one bar
+            timestep=self._timestep,
+            quote=quote,
+            remove_incomplete_current_bar=False  # We want the incomplete bar (aka current bar) for get_last_price
+        )
+
+        if bars is None or bars.df.empty:
+            return None
+
+        # The backtesting_broker, fills market orders using the open price of the current bar, so
+        # get_last_price should also return the open. (It would be weird to fill on the open but provide the close
+        # as the last price). This approach works for daily and minute bars. For daily bars, this returns the open
+        # price, even if now is 9:30 and the daily bar was indexed at 00:00. Thats the only weird thing. But it makes
+        # sense. The open of the daily bar for stocks was not at 00:00. It was at 9:30 anyway.
+        price = bars.df.iloc[0].open
+        num_decimals = get_decimals(price)
+        return quantize_to_num_decimals(price, num_decimals)
+
+    def get_historical_prices(
+            self,
+            asset: Asset,
+            length: int,
+            timestep: str | None = None,
+            timeshift: timedelta | None = None,
+            quote: Asset | None = None,
+            exchange: str | None = None,
+            include_after_hours: bool = True,
+            remove_incomplete_current_bar: Optional[bool] = None,
+    ) -> Bars | None:
+        """
+        Get bars for an asset by delegating to get_historical_prices_between_dates
+        for fetching the historical data, followed by additional processing.
+
+        Get bars for a given asset, going back in time from now, getting length number of bars by timestep.
+        For example, with a length of 10 and a timestep of "day", and now timeshift, this
+        would return the last 10 daily bars.
+
+        - Higher-level method that returns a `Bars` object
+        - Handles timezone conversions automatically
+        - Includes additional metadata and processing
+        - Preferred for strategy development and backtesting
+        - Returns normalized data with consistent format across data sources
+
+        Parameters
+        ----------
+        asset : Asset
+            The asset to get the bars for.
+        length : int
+            The number of bars to get.
+        timestep : str
+            The timestep to get the bars at. Accepts "day" or "minute".
+        timeshift : datetime.timedelta
+            The amount of time to shift the reference point (self._datetime).
+            If you want 10 daily bars from 1 week ago (not including the last week),
+            you'd use timeshift=timedelta(days=7)
+        quote : Asset
+            The quote asset to get the bars for.
+        exchange : str
+            The exchange to get the bars for.
+        include_after_hours : bool
+            Whether to include after hours data.
+
+        Returns
+        -------
+        Bars | None
+            The bars for the asset.
+        """
+        if length <= 0:
+            raise ValueError("Length must be positive.")
+
+        # Default values for arguments
+        if remove_incomplete_current_bar is None:
+            remove_incomplete_current_bar = self._remove_incomplete_current_bar
+
+        if timestep is None:
+            timestep = self._timestep
+
+        if quote is None:
+            quote = self.LUMIBOT_DEFAULT_QUOTE_ASSET
+
+        # Determine search target datetime
+        search_datetime = self._datetime
+        if timeshift:
+            search_datetime = self._datetime - timeshift
+
         try:
-            # Convert to Alpaca timeframe
-            alpaca_tf = self._get_alpaca_timeframe(timestep)
-            
-            # Always request the most recent data
-            if is_benchmark:
-                start_datetime = self.datetime_start
-                end_datetime = self.datetime_end
-            else:
-                end_datetime = self.datetime_end
-            
-            if history_type == "bars":
-                # Always request fresh data
-                bar_request = StockBarsRequest(
-                    symbol_or_symbols=asset.symbol,
-                    timeframe=alpaca_tf,
-                    adjustment='all',
-                    start=start_datetime,
-                    end=end_datetime,
-                    limit=length  # Request more data to ensure coverage
-                )
-                
-                bars = self.historical_client.get_stock_bars(bar_request).df
-            elif history_type == "trades":                            
-                raise NotImplementedError("Historical trades not implemented yet")
-
-            if not bars.empty:
-                # Normalize the timezone handling
-                if not isinstance(bars.index, pd.MultiIndex):
-                    raise ValueError("Expected a MultiIndex for bars DataFrame")
-                
-                # Ensure all timestamps are in the correct timezone (America/New_York)
-                timestamps = bars.index.get_level_values(1)
-                symbols = bars.index.get_level_values(0)
-                
-                # Normalize the timestamps to NY timezone
-                if timestamps.tz is None:
-                    timestamps = pd.to_datetime(timestamps, utc=True)
-                
-                if timestamps.tz != pytz.timezone('America/New_York'):
-                    timestamps = timestamps.tz_convert('America/New_York')
-                    
-                # Rebuild the index
-                bars.index = pd.MultiIndex.from_arrays(
-                    [symbols, timestamps],
-                    names=bars.index.names
-                )
-                
-                # Check existing data
-                current_key = (asset, quote_asset)
-                if current_key in self.pandas_data:
-                    existing_data = self.pandas_data[current_key]
-                    existing_df = existing_data.df
-                    
-                    # Ensure existing data has consistent timezone
-                    if isinstance(existing_df.index, pd.MultiIndex):
-                        existing_timestamps = existing_df.index.get_level_values(1)
-                        existing_symbols = existing_df.index.get_level_values(0)
-                        
-                        # Normalize the existing timestamps to NY timezone
-                        if existing_timestamps.tz != pytz.timezone('America/New_York'):
-                            existing_timestamps = existing_timestamps.tz_convert('America/New_York')
-                            
-                            # Rebuild the index
-                            existing_df.index = pd.MultiIndex.from_arrays(
-                                [existing_symbols, existing_timestamps],
-                                names=existing_df.index.names
-                            )
-                    
-                    # Concatenate and deduplicate
-                    combined_df = pd.concat([existing_df, bars])
-                    combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
-                    combined_df = combined_df.sort_index(level=1)  # Sort by timestamp
-                    bars = combined_df
-
-                # Create Data object with the updated dataframe
-                data = Data(asset, bars, timestep=timestep, quote=quote_asset)
-                
-                # Update pandas data store
-                pandas_data_update = self._set_pandas_data_keys([data])
-                self.pandas_data.update(pandas_data_update)
-                
-                # Manage storage limits
-                if hasattr(self, 'MAX_STORAGE_BYTES') and self.MAX_STORAGE_BYTES:
-                    self._enforce_storage_limit(self.pandas_data)
+            # Fetch historical prices during the backtest using the dedicated function
+            df = self.get_historical_prices_between_dates(
+                base_asset=asset,
+                quote_asset=quote,
+                timestep=timestep,
+                data_datetime_start=self._data_datetime_start,
+                data_datetime_end=self._data_datetime_end,
+                auto_adjust=self._auto_adjust
+            )
         except Exception as e:
-            logging.error(f"Error fetching Alpaca data: {str(e)}")
-            raise
+            # Handle errors if fetching data fails
+            raise RuntimeError(f"Unable to fetch historical prices during backtest: {e}")
 
-    def _pull_source_symbol_bars(
-        self,
-        asset: Asset,
-        length: int,
-        timestep: str = "minute",
-        timeshift: int = None,
-        quote: Asset = None,
-        exchange: str = None,
-        include_after_hours: bool = True,
-    ):
-        """Retrieve historical bars from Alpaca"""
-        # Get the current datetime and calculate the start datetime
-        current_dt = self.get_datetime()
+        # Ensure sufficient bars are available
+        if length > len(df):
+            raise ValueError(
+                f"Not enough historical data. Requested {length} bars but only {len(df)} available."
+            )
 
-        self._update_pandas_data(asset, quote, length, timestep, current_dt)
-        return super()._pull_source_symbol_bars(
-            asset, length, timestep, timeshift,
-            quote, exchange, include_after_hours
+        # Adjust the search based on timestep
+        if timestep == 'day':
+            # For daily bars
+            search_date = search_datetime.date()
+            dates = df.index.date
+            current_index = dates.searchsorted(search_date)
+
+            # Adjust for incomplete current bar
+            if remove_incomplete_current_bar and current_index > 0 and dates[current_index] == search_date:
+                current_index -= 1
+        else:
+            # For minute bars
+            current_index = df.index.searchsorted(search_datetime)
+
+            # Adjust for incomplete current bar
+            if remove_incomplete_current_bar and current_index > 0 and df.index[current_index] == search_datetime:
+                current_index -= 1
+
+        # Handle data retrieval and slicing
+        if current_index < 0:
+            raise ValueError(f"Datetime {search_datetime} not found in the dataset.")
+
+        if current_index >= len(df):
+            raise ValueError(f"Datetime {search_datetime} exceeds the dataset range.")
+
+        if length == 1:
+            result_df = df.iloc[[current_index]]
+        else:
+            result_df = df.iloc[max(0, current_index - length + 1): current_index + 1]
+
+        return Bars(result_df, self.SOURCE, asset=asset, quote=quote)
+
+    def get_chains(self, asset, quote=None):
+        """Mock implementation for getting option chains"""
+        return {}
+
+    def _get_asset_key(
+            self,
+            *,
+            base_asset: Asset,
+            quote_asset: Asset,
+            timestep: str = None,
+            market: str = None,
+            tzinfo: pytz.tzinfo = None,
+            data_datetime_start: datetime = None,
+            data_datetime_end: datetime = None,
+            auto_adjust: bool = None,
+    ) -> str:
+        """
+        Generate a unique key for an asset combination with specific parameters.
+
+        Parameters
+        ----------
+        base_asset: Asset - Base asset of the pair.
+        quote_asset: Asset - Quote asset of the pair.
+        market: str - Market or exchange identifier.
+        tzinfo: pytz.tzinfo - Timezone information.
+        timestep: str - Timestep of the source data. Accepts "day" or "minute".
+        data_datetime_start: datetime - The start date of the data in the backtest.
+        data_datetime_end: datetime - The end date of the data in the backtest. Inclusive.
+        auto_adjust: bool - Flag to indicate if auto-adjustment is applied.
+
+        Returns
+        -------
+        str - A unique key string.
+        """
+
+        if base_asset is None:
+            raise ValueError("Base asset must be provided.")
+
+        if quote_asset is None:
+            quote_asset = self.LUMIBOT_DEFAULT_QUOTE_ASSET
+
+        if market is None:
+            market = self.market
+
+        if data_datetime_start is None:
+            data_datetime_start = self._data_datetime_start
+
+        if data_datetime_end is None:
+            data_datetime_end = self._data_datetime_end
+
+        if tzinfo is None:
+            tzinfo = self.tzinfo
+
+        if auto_adjust is None:
+            auto_adjust = self._auto_adjust
+
+        if timestep is None:
+            timestep = self._timestep
+
+        if timestep not in ['day', 'minute']:
+            raise ValueError(f"Invalid timestep {timestep}. Must be 'day' or 'minute'.")
+
+        base_quote = f"{base_asset.symbol}-{base_asset.asset_type}_{quote_asset.symbol}-{quote_asset.asset_type}"
+        market = market
+        tzinfo_str = str(tzinfo).replace("_", "-")
+        start_date_str = data_datetime_start.strftime("%Y-%m-%d")
+        end_date_str = data_datetime_end.strftime("%Y-%m-%d")
+        auto_adjust_str = "AA" if auto_adjust else ""
+
+        key_parts = [
+            base_quote, market, timestep, tzinfo_str,
+            auto_adjust_str, start_date_str, end_date_str
+        ]
+        key = "_".join(part for part in key_parts if part).upper()
+        key = key.replace("/", "-")
+        return key
+
+    def _download_and_cache_ohlcv_data(
+            self,
+            *,
+            base_asset: Asset = None,
+            quote_asset: Asset = None,
+            timestep: str = None,
+            market: str = None,
+            tzinfo: pytz.tzinfo = None,
+            data_datetime_start: datetime = None,
+            data_datetime_end: datetime = None,
+            auto_adjust: bool = None,
+    ) -> pd.DataFrame:
+        if base_asset is None:
+            raise ValueError("The parameter 'base_asset' cannot be None.")
+        if quote_asset is None:
+            raise ValueError("The parameter 'quote_asset' cannot be None.")
+        if timestep is None:
+            raise ValueError("The parameter 'timestep' cannot be None.")
+        if market is None:
+            raise ValueError("The parameter 'market' cannot be None.")
+        if tzinfo is None:
+            raise ValueError("The parameter 'tzinfo' cannot be None.")
+        if data_datetime_start is None:
+            raise ValueError("The parameter 'data_datetime_start' cannot be None.")
+        if data_datetime_end is None:
+            raise ValueError("The parameter 'data_datetime_end' cannot be None.")
+        if auto_adjust is None:
+            raise ValueError("The parameter 'auto_adjust' cannot be None.")
+
+        key = self._get_asset_key(
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            timestep=timestep,
+            market=market,
+            tzinfo=tzinfo,
+            data_datetime_start=data_datetime_start,
+            data_datetime_end=data_datetime_end,
+            auto_adjust=auto_adjust,
         )
+
+        # Directory to save cached data.
+        cache_dir = os.path.join(LUMIBOT_CACHE_FOLDER, self.CACHE_SUBFOLDER)
+        os.makedirs(cache_dir, exist_ok=True)
+
+        # File path based on the unique key
+        filename = f"{key}.csv"
+        filepath = os.path.join(cache_dir, filename)
+
+        logger.info(f"Fetching and caching data for {key}")
+
+        if base_asset.asset_type == 'crypto':
+            client = self._crypto_client
+
+            symbol = base_asset.symbol + '/' + quote_asset.symbol
+
+            # noinspection PyArgumentList
+            request_params = CryptoBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=self._parse_source_timestep(timestep, reverse=True),
+                start=data_datetime_start,
+                end=data_datetime_end + timedelta(days=1),  # alpaca end dates are exclusive
+            )
+        else:
+            client = self._stock_client
+            adjustment = 'all' if auto_adjust else 'split'
+
+            # noinspection PyArgumentList
+            request_params = StockBarsRequest(
+                symbol_or_symbols=base_asset.symbol,
+                timeframe=self._parse_source_timestep(timestep, reverse=True),
+                start=data_datetime_start,
+                end=data_datetime_end + timedelta(days=1),  # alpaca end dates are exclusive,
+                adjustment=adjustment,
+            )
+
+        try:
+            if isinstance(request_params, CryptoBarsRequest):
+                bars = client.get_crypto_bars(request_params)
+            else:
+                bars = client.get_stock_bars(request_params)
+        except Exception as e:
+            raise RuntimeError(f"Failed to fetch data for {key}: {e}")
+
+        df = bars.df.reset_index()
+        if df.empty:
+            raise RuntimeError(f"No data fetched for {key}.")
+
+        # Ensure 'timestamp' is a pandas timestamp object
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        if df['timestamp'].dt.tz is None:
+            df['timestamp'] = df['timestamp'].dt.tz_localize(tzinfo)
+        else:
+            df['timestamp'] = df['timestamp'].dt.tz_convert(tzinfo)
+
+        df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+
+        trading_times = get_trading_times(
+            pcal=self._trading_days,
+            timestep=timestep,
+        )
+
+        # Reindex the dataframe with a row for each bar we should have a trading iteration for.
+        # Fill any empty bars with previous data.
+        df = self._reindex_and_fill(df=df, trading_times=trading_times, timestep=timestep)
+
+        # Filter data to include only rows between data_datetime_start and data_datetime_end
+        df = df[(df['timestamp'] >= data_datetime_start) & (df['timestamp'] <= data_datetime_end)]
+
+        # Save to cache
+        df.to_csv(filepath, index=False)
+
+        # Store in _data_store
+        df.set_index('timestamp', inplace=True)
+        self._data_store[key] = df
+        logger.info(f"Finished fetching and caching data for {key}")
+        return df
+
+    def _load_ohlcv_into_data_store(self, key: str) -> bool:
+        """
+        Loads OHLCV data from a cached file into the data store. If the loading is successful, returns True;
+        otherwise, returns False.
+    
+        Parameters
+        ----------
+        key : str
+            The unique key for the cached data file.
+    
+        Returns
+        -------
+        bool
+            True if data is successfully loaded into the _data_store, False otherwise.
+        """
+        # Directory to find the cached data file.
+        cache_dir = os.path.join(LUMIBOT_CACHE_FOLDER, self.CACHE_SUBFOLDER)
+        filename = f"{key}.csv"
+        filepath = os.path.join(cache_dir, filename)
+
+        # Check if the file exists
+        if not os.path.exists(filepath):
+            return False
+
+        try:
+            # Read CSV file with 'timestamp' column parsed as dates
+            df = pd.read_csv(filepath, parse_dates=['timestamp'])
+
+            # Convert timestamp column to datetime objects, interpreting them as UTC times
+            # utc=True ensures proper handling of timezone-aware data
+            df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+
+            # Convert timestamps from UTC to the timezone specified in self.tzinfo
+            # For example: if self.tzinfo is 'America/New_York', converts UTC times to NY time
+            df['timestamp'] = df['timestamp'].dt.tz_convert(self.tzinfo)
+
+            df.set_index('timestamp', inplace=True)
+            self._data_store[key] = df
+            logger.info(f"Loaded cached data for key: {key} from cache.")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load cached data for key: {key}. Error: {e}")
+            return False
 
     def get_historical_prices_between_dates(
-        self,
-        asset,
-        timestep="minute",
-        quote=None,
-        exchange=None,
-        include_after_hours=True,
-        start_date=None,
-        end_date=None,
-        is_benchmark_asset=False
-    ):
-        """Get historical prices within specific date range"""
-        try:
-            # If both start and end dates are provided, calculate appropriate length
-            if is_benchmark_asset:
-                # Calculate length based on timestep
-                if timestep == "minute":
-                    # Convert time difference to minutes
-                    length = int((end_date - start_date).total_seconds() / 60)
-                elif timestep == "hour":
-                    # Convert time difference to hours
-                    length = int((end_date - start_date).total_seconds() / 3600)
-                elif timestep == "day":
-                    # Calculate number of days
-                    length = (end_date - start_date).days
-                else:
-                    # Default to a reasonable value for unknown timesteps
-                    length = 100
-                    
-                # Ensure minimum length for sufficient data
-                length = max(length, 1)
+            self,
+            *,
+            base_asset: Asset = None,
+            quote_asset: Asset = None,
+            timestep: str = None,
+            market: str = None,
+            tzinfo: pytz.tzinfo = None,
+            data_datetime_start: datetime = None,
+            data_datetime_end: datetime = None,
+            auto_adjust: bool = None,
+    ) -> pd.DataFrame:
 
-                # Update pandas data with proper parameters
-                self._update_pandas_data(
-                    asset=asset,
-                    quote=quote,
-                    length=length,
-                    timestep=timestep,
-                    start_dt=start_date,
-                    is_benchmark=is_benchmark_asset
+        if base_asset is None:
+            raise ValueError("Base asset must be provided.")
 
-                )
-            else:
-            # If dates aren't provided, just get the latest data
-                self._update_pandas_data(
-                    asset=asset,
-                    quote=quote,
-                    length=1,  # Get just 1 bar for context
-                    timestep=timestep,
-                )
+        if quote_asset is None:
+            quote_asset = self.LUMIBOT_DEFAULT_QUOTE_ASSET
 
-            # Call the parent method to pull the data between dates
-            response = super()._pull_source_symbol_bars_between_dates(
-                asset, timestep, quote, exchange,
-                include_after_hours, start_date, end_date,
-                is_benchmark_asset=is_benchmark_asset
+        asset, quote = self._sanitize_base_and_quote_asset(base_asset, quote_asset)
+
+        if timestep is None:
+            timestep = self._timestep
+
+        if market is None:
+            market = self.market
+
+        if tzinfo is None:
+            tzinfo = self.tzinfo
+
+        if data_datetime_start is None:
+            data_datetime_start = self._data_datetime_start
+
+        if data_datetime_end is None:
+            data_datetime_end = self._data_datetime_end
+
+        if auto_adjust is None:
+            auto_adjust = self._auto_adjust
+
+        key = self._get_asset_key(base_asset=asset, quote_asset=quote, timestep=timestep)
+
+        if self._refresh_cache and key not in self._refreshed_keys:
+            # If we need are refreshing cache and we didn't refresh this key's cache yet, refresh it.
+            self._download_and_cache_ohlcv_data(
+                base_asset=asset,
+                quote_asset=quote,
+                timestep=timestep,
+                market=market,
+                tzinfo=tzinfo,
+                data_datetime_start=data_datetime_start,
+                data_datetime_end=data_datetime_end,
+                auto_adjust=auto_adjust
             )
-            
-            if response is None:
-                return None
+            self._refreshed_keys[key] = True
+        elif key not in self._data_store and not self._load_ohlcv_into_data_store(key):
+            # If not refreshing or already refreshed, try to load from cache or download
+            self._download_and_cache_ohlcv_data(
+                base_asset=asset,
+                quote_asset=quote,
+                timestep=timestep,
+                market=market,
+                tzinfo=tzinfo,
+                data_datetime_start=data_datetime_start,
+                data_datetime_end=data_datetime_end,
+                auto_adjust=auto_adjust
+            )
 
-            bars = self._parse_source_symbol_bars(response, asset, quote=quote)
-            return bars
-        except Exception as e:
-            logging.error(f"Error in get_historical_prices_between_dates: {e}")
-            # Return empty DataFrame with proper columns as fallback
-            return pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+        df = self._data_store[key]
+        return df
 
-    def get_last_price(self,
-                        asset,
-                        timestep=None,
-                        quote=None,
-                        exchange="NYSE") -> Union[float, float, None]:
-            """
-            Get the latest price from Alpaca, adjusted for trading days.
-            
-            Parameters
-            ----------
-            asset : Asset object or str
-                Asset object for which the last closed price will be
-                retrieved.
-            timestep: str 
-                The time granularity (e.g., "minute").
-            quote : Asset object
-                Quote asset object for which the last closed price will be
-                retrieved. This is required for cryptocurrency pairs.
-            exchange : str
-                Exchange name for which the last closed price will be
-                retrieved. This is required for some cryptocurrency pairs. Default is "NYSE".
-            
-            Returns
-            -------
-                float or None: The last price, or None if no price is available.
-            """
-            try:
-                dt = self.get_datetime()
+    def _reindex_and_fill(
+            self,
+            df: pd.DataFrame,
+            trading_times: pd.DatetimeIndex,
+            timestep: str
+    ) -> pd.DataFrame:
+        if df.index.name == 'timestamp':
+            df = df.reset_index()
 
-                if timestep is None and self.MIN_TIMESTEP is not None:
-                    timestep = self.MIN_TIMESTEP
+        # Check if all required columns are present
+        required_columns = {"timestamp", "open", "high", "low", "close", "volume"}
+        missing_columns = required_columns - set(df.columns)
+        if missing_columns:
+            raise ValueError(f"The dataframe is missing the following required columns: {', '.join(missing_columns)}")
 
-                # Use a buffer to ensure we have enough historical data
-                self._update_pandas_data(asset, quote, length=1, timestep=timestep, start_dt=dt)
+        if timestep not in ['day', 'minute']:
+            raise ValueError(f"The timestep must be 'day' or 'minute'.")
 
-                # Get closest available price
-                return super().get_last_price(
-                    asset=asset,
-                    # timestep=timestep,
-                    quote=quote,
-                    exchange=exchange
-                )
-            except Exception as e:
-                logging.error(f"Error in get_last_price: {e}")
-                return None
+        # For daily bars, we want to preserve original timestamps but add missing days
+        if timestep == 'day':
+            # Get just the dates from trading_times
+            trading_dates = trading_times.date
+            # Get dates from df timestamps
+            df_dates = df['timestamp'].dt.date
+
+            # Convert both to sets of dates for proper comparison
+            trading_dates_set = set(trading_dates)
+            df_dates_set = set(df_dates)
+
+            # Find truly missing dates
+            missing_dates = trading_dates_set - df_dates_set
+
+            # Add rows for missing dates (at midnight)
+            for date in missing_dates:
+                # Get timezone from the first timestamp in df
+                tz = df['timestamp'].iloc[0].tz
+
+                missing_row = pd.DataFrame({
+                    'timestamp': [pd.Timestamp(date).tz_localize(tz)],
+                    'open': [None],
+                    'high': [None],
+                    'low': [None],
+                    'close': [None],
+                    'volume': [0.0]
+                })
+
+                # Remove any all-NA columns from `missing_row`
+                missing_row = missing_row.dropna(axis=1, how='all')
+
+                # Proceed with the concatenation
+                df = pd.concat([df, missing_row], ignore_index=True)
+
+            # Sort by timestamp
+            df.sort_values('timestamp', inplace=True)
+        else:
+            # For non-daily bars, use the original reindexing logic
+            if df.index.name != "timestamp":
+                # Ensure timestamp is the index for reindexing
+                df = df.set_index("timestamp")
+            df = df.reindex(trading_times)
+            df.index.name = 'timestamp'  # Restore the index name
+            df.sort_values('timestamp', inplace=True)
+            df.reset_index(inplace=True)
+
+        # Fill missing volume values with 0.0
+        df['volume'] = df['volume'].fillna(0.0)
+
+        # Forward fill missing close prices
+        df['close'] = df['close'].ffill()
+
+        # Fill missing open, high, low with close prices
+        for column in ['open', 'high', 'low']:
+            df[column] = df[column].fillna(df['close'])
+
+        # Backward fill remaining missing open prices
+        df['open'] = df['open'].bfill()
+
+        # Fill any remaining missing high, low, close with open prices
+        for column in ['high', 'low', 'close']:
+            df[column] = df[column].fillna(df['open'])
+
+        return df

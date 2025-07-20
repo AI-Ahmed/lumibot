@@ -1,8 +1,10 @@
 import inspect
+import math
 import time
 import traceback
 import json
 from datetime import datetime, timedelta
+from decimal import Decimal
 from functools import wraps
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
@@ -14,6 +16,7 @@ from termcolor import colored
 
 from lumibot.entities import Asset, Order
 from lumibot.tools import append_locals, get_trading_days, staticdecorator
+from lumibot.constants import LUMIBOT_DEFAULT_PYTZ
 
 
 class StrategyExecutor(Thread):
@@ -22,6 +25,7 @@ class StrategyExecutor(Thread):
     CANCELED_ORDER = "canceled"
     FILLED_ORDER = "fill"
     PARTIALLY_FILLED_ORDER = "partial_fill"
+    ERROR_ORDER = "error"
 
     def __init__(self, strategy):
         super(StrategyExecutor, self).__init__()
@@ -35,6 +39,9 @@ class StrategyExecutor(Thread):
         self.broker = self.strategy.broker
         self.result = {}
         self._in_trading_iteration = False
+        
+        # Store any exception that occurs during execution
+        self.exception = None
 
         # Create a dictionary of job stores. A job store is where the scheduler persists its jobs. In this case,
         # we create an in-memory job store for "default" and "On_Trading_Iteration" which is the job store we will
@@ -64,6 +71,7 @@ class StrategyExecutor(Thread):
             "before_market_closes": None,
         }
 
+        self._market_closed_logged = False  # Track if closed message was logged
 
     @property
     def name(self):
@@ -153,6 +161,8 @@ class StrategyExecutor(Thread):
 
         # ORDERS
         orders_broker = self.broker._pull_all_orders(self.name, self.strategy)
+        # Filter out None orders to prevent crashes
+        orders_broker = [order for order in orders_broker if order is not None]
         if len(orders_broker) > 0:
             orders_lumi = self.broker.get_all_orders()
 
@@ -175,12 +185,58 @@ class StrategyExecutor(Thread):
                     for order_attr in order_attrs:
                         olumi = getattr(order_lumi, order_attr)
                         obroker = getattr(order, order_attr)
-                        if olumi != obroker:
+                        if olumi is not None and obroker is not None:  # Ensure both values are not None
+                            if isinstance(olumi, float) and isinstance(obroker, float):
+                                # check if both are floats
+                                if not math.isclose(olumi, obroker, abs_tol=1e-9):
+                                    setattr(order_lumi, order_attr, obroker)
+                                    self.strategy.logger.warning(
+                                        f"We are adjusting the {order_attr} of the order {order_lumi}, from {olumi} "
+                                        f"to be {obroker} because what we have in memory does not match the broker "
+                                        f"and both are floats"
+                                    )
+                            elif isinstance(olumi, (int, float, Decimal)) and isinstance(obroker, (int, float, Decimal)):
+                                # check if both are ints
+                                if isinstance(olumi, int) and isinstance(obroker, int):
+                                    if olumi != obroker:
+                                        setattr(order_lumi, order_attr, obroker)
+                                        self.strategy.logger.warning(
+                                            f"We are adjusting the {order_attr} of the order {order_lumi}, from {olumi} "
+                                            f"to be {obroker} because what we have in memory does not match the broker "
+                                            f"and both are ints."
+                                        )
+                                elif not math.isclose(float(olumi), float(obroker), abs_tol=1e-9):
+                                    # Convert to float for comparison
+                                    setattr(order_lumi, order_attr, obroker)
+                                    self.strategy.logger.warning(
+                                        f"We are adjusting the {order_attr} of the order {order_lumi}, from {olumi} "
+                                        f"to be {obroker} because what we have in memory does not match the broker "
+                                        f"and one is float and one is int."
+                                    )
+
+                            elif type(olumi) == type(obroker):  # Compare if types are the same
+                                if olumi != obroker:
+                                    setattr(order_lumi, order_attr, obroker)
+                                    self.strategy.logger.warning(
+                                        f"We are adjusting the {order_attr} of the order {order_lumi}, from {olumi} "
+                                        f"to be {obroker} because what we have in memory does not match the broker "
+                                        f"and they are both the same type: {type(olumi)}."
+                                    )
+                            else:
+                                setattr(order_lumi, order_attr, obroker)  # Update if types are different
+                                self.strategy.logger.warning(
+                                    f"We are adjusting the {order_attr} of the order {order_lumi}, from {olumi} "
+                                    f"to be {obroker} because what we have in memory does not match the broker "
+                                    f"and the types are different. olumi:{type(olumi)} obroker: {type(obroker)}."
+                                )
+                        elif olumi != obroker:  # Handle cases where one or both are None
                             setattr(order_lumi, order_attr, obroker)
                             self.strategy.logger.warning(
                                 f"We are adjusting the {order_attr} of the order {order_lumi}, from {olumi} "
-                                f"to be {obroker} because what we have in memory does not match the broker."
+                                f"to be {obroker} because what we have in memory does not match the broker "
+                                f" and one or both are none."
                             )
+
                 else:
                     # If it is the brokers first iteration then fully process the order because it is likely
                     # that the order was filled/canceled/etc before the strategy started. This is also a recovery
@@ -201,12 +257,23 @@ class StrategyExecutor(Thread):
                         # Add to order in lumibot.
                         self.broker._process_new_order(order)
 
+            broker_identifiers = self._get_all_order_identifiers(orders_broker)
             for order_lumi in orders_lumi:
                 # Remove lumibot orders if not in broker.
-                if order_lumi.identifier not in [order.identifier for order in orders_broker]:
+                # Check both main order IDs and child order IDs from broker
+                if order_lumi.identifier not in broker_identifiers:
                     # Filled or canceled orders can be dropped by the broker as they no longer have any effect.
                     # However, active orders should not be dropped as they are still in effect and if they can't
                     # be found in the broker, they should be canceled because something went wrong.
+                    
+                    # Skip auto-cancellation for orders that were synced from broker to prevent false cancellations
+                    if hasattr(order_lumi, '_synced_from_broker') and order_lumi._synced_from_broker:
+                        self.strategy.logger.debug(
+                            f"Skipping auto-cancellation for synced order {order_lumi} (id={order_lumi.identifier}) - "
+                            f"was synced from broker and may have been filled/canceled between sync and validation"
+                        )
+                        continue
+                    
                     if order_lumi.is_active():
                         self.strategy.logger.info(
                             f"Cannot find order {order_lumi} (id={order_lumi.identifier}) in broker "
@@ -216,6 +283,33 @@ class StrategyExecutor(Thread):
 
         self.broker._hold_trade_events = False
         self.broker.process_held_trades()
+
+    @staticmethod
+    def _get_all_order_identifiers(orders_broker: list[Order]) -> set:
+        """
+        Extract all order identifiers from a list of broker orders.
+
+        This function iterates through each order in orders_broker once,
+        collecting both the main order identifiers and their child order
+        identifiers into a single set.
+
+        Parameters
+        ----------
+        orders_broker : list
+            A list of Order objects from the broker
+
+        Returns
+        -------
+        set
+            A set containing all unique order identifiers
+        """
+        broker_identifiers = set()
+        for order in orders_broker:
+            if order is not None:  # Defensive check for None orders
+                broker_identifiers.add(order.identifier)
+                for child_order in order.child_orders:
+                    broker_identifiers.add(child_order.identifier)
+        return broker_identifiers
 
     def add_event(self, event_name, payload):
         self.queue.put((event_name, payload))
@@ -246,7 +340,7 @@ class StrategyExecutor(Thread):
 
         elif event == self.FILLED_ORDER:
             # Log that we are processing a filled order.
-            self.strategy.logger.info(f"Processing a filled order, payload: {payload}")
+            self.strategy.logger.debug(f"Processing a filled order, payload: {payload}")
 
             order = payload["order"]
             price = payload["price"]
@@ -262,7 +356,7 @@ class StrategyExecutor(Thread):
 
         elif event == self.PARTIALLY_FILLED_ORDER:
             # Log that we are processing a partially filled order.
-            self.strategy.logger.info(f"Processing a partially filled order, payload: {payload}")
+            self.strategy.logger.debug(f"Processing a partially filled order, payload: {payload}")
 
             order = payload["order"]
             price = payload["price"]
@@ -273,6 +367,10 @@ class StrategyExecutor(Thread):
                 self.strategy._update_cash(order.side, quantity, price, multiplier)
 
             self._on_partially_filled_order(**payload)
+
+        elif event == self.ERROR_ORDER:                             # <--- handle error
+            self.strategy.logger.error(f"Processing an error order, payload: {payload}")
+            self._on_error_order(**payload)
 
         else:
             self.strategy.logger.error(f"Event {event} not recognized. Payload: {payload}")
@@ -417,14 +515,19 @@ class StrategyExecutor(Thread):
 
         # Check if we are in market hours.
         if not self.broker.is_market_open():
-            self.strategy.log_message("The market is not currently open, skipping this trading iteration", color="blue")
+            if not self._market_closed_logged:
+                self.strategy.log_message("The market is not currently open, skipping this trading iteration", color="blue")
+                self._market_closed_logged = True
             return
+        else:
+            self._market_closed_logged = False  # Reset when market opens
 
         # Send the account summary to Discord
         self.strategy.send_account_summary_to_discord()
 
         self._strategy_context = None
-        start_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+        start_dt_tz = LUMIBOT_DEFAULT_PYTZ.localize(start_dt.replace(tzinfo=None))
+        start_str = start_dt_tz.strftime("%Y-%m-%d %I:%M:%S %p %Z")
         self.strategy.log_message(f"Bot is running. Executing the on_trading_iteration lifecycle method at {start_str}", color="green")
         on_trading_iteration = append_locals(self.strategy.on_trading_iteration)
 
@@ -441,7 +544,8 @@ class StrategyExecutor(Thread):
             self.process_queue()
 
             end_dt = datetime.now()
-            end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+            end_dt_tz = LUMIBOT_DEFAULT_PYTZ.localize(end_dt.replace(tzinfo=None))
+            end_str = end_dt_tz.strftime("%Y-%m-%d %I:%M:%S %p %Z")
             runtime = (end_dt - start_dt).total_seconds()
 
             # Variable Backup
@@ -454,7 +558,7 @@ class StrategyExecutor(Thread):
             next_run_time = self.get_next_ap_scheduler_run_time()
             if next_run_time is not None:
                 # Format the date to be used in the log message.
-                dt_str = next_run_time.strftime("%Y-%m-%d %H:%M:%S")
+                dt_str = next_run_time.strftime("%Y-%m-%d %I:%M:%S %p %Z")
                 self.strategy.log_message(
                     f"Trading iteration ended at {end_str}, next check in time is {dt_str}. Took {runtime:.2f}s", color="blue"
                 )
@@ -554,9 +658,9 @@ class StrategyExecutor(Thread):
         # Calculate the value of the position
         order_value = price * float(quantity)
 
-        # If option, multiply % of portfolio by 100
+        # If option, multiply % of portfolio by multiplier 
         if order.asset.asset_type == Asset.AssetType.OPTION:
-            order_value = order_value * 100
+            order_value = order_value * multiplier 
 
         # Calculate the percent of the portfolio that this position represents
         percent_of_portfolio = order_value / portfolio_value
@@ -589,9 +693,29 @@ class StrategyExecutor(Thread):
         if hasattr(self.strategy, "_filled_order_callback") and callable(self.strategy._filled_order_callback):
             self.strategy._filled_order_callback(self, position, order, price, quantity, multiplier)
 
+    @event_method
+    def _on_error_order(self, order, error=None):                 # <--- new handler
+        """
+        Use this lifecycle event to execute code
+        when an order error is reported
+        """
+        self.strategy.log_message("Executing the on_error_order event method", color="red")
+        if hasattr(self.strategy, "on_error_order"):
+            try:
+                self.strategy.on_error_order(order, error)
+            except TypeError:
+                try:
+                    self.strategy.on_error_order(order)
+                except Exception:
+                    self.strategy.logger.error("Error in on_error_order handler", exc_info=True)
+        else:
+            # no user handler defined—just log the error
+            self.strategy.logger.error(f"Unhandled order error: {order}, error: {error}")
+
     @staticmethod
     def _sleeptime_to_seconds(sleeptime):
         """Convert the sleeptime to seconds"""
+
         val_err_msg = ("You can set the sleep time as an integer which will be interpreted as minutes. "
                        "eg: sleeptime = 50 would be 50 minutes. Conversely, you can enter the time as a string "
                        "with the duration numbers first, followed by the time units: 'M' for minutes, 'S' for seconds "
@@ -604,7 +728,7 @@ class StrategyExecutor(Thread):
             time_raw = int(sleeptime[:-1])
             if unit.lower() == "s":
                 return time_raw
-            elif unit.lower() == "m":
+            elif unit.lower() == "m" or unit.lower() == "t":
                 return time_raw * 60
             elif unit.lower() == "h":
                 return time_raw * 60 * 60
@@ -633,14 +757,14 @@ class StrategyExecutor(Thread):
         """
         if unit.lower() == "s":
             return secounds
-        elif unit.lower() == "m":
+        elif unit.lower() == "m" or unit.lower() == "t":
             return secounds // 60
         elif unit.lower() == "h":
             return secounds // (60 * 60)
         elif unit.lower() == "d":
             return secounds / (60 * 60 * 24)
         else:
-            raise ValueError("The unit must be 'S', 'M', 'H', or 'D'")
+            raise ValueError("The unit must be 'S', 'M', 'T', 'H', or 'D'")
 
     # This method calculates the trigger for the strategy based on the 'sleeptime' attribute of the strategy.
     def calculate_strategy_trigger(self, force_start_immediately=False):
@@ -673,7 +797,7 @@ class StrategyExecutor(Thread):
             raise ValueError(sleeptime_err_msg)  # If it's neither, raise an error with the defined message.
 
         # Check if the units are valid (S for seconds, M for minutes, H for hours, D for days).
-        if units not in "SMHDsmhd":
+        if units not in "TSMHDsmhd":
             raise ValueError(sleeptime_err_msg)
 
         # Assign the raw time to the target count for cron jobs so that later we can compare the current count to the
@@ -684,7 +808,7 @@ class StrategyExecutor(Thread):
         kwargs = {}
         if units in "Ss":
             kwargs["second"] = "*"
-        elif units in "Mm":
+        elif units in "MmTt":
             kwargs["minute"] = "*"
         elif units in "Hh":
             kwargs["hour"] = "*"
@@ -790,7 +914,7 @@ class StrategyExecutor(Thread):
         else:
             raise ValueError(sleeptime_err_msg)
 
-        if units not in "SMHDsmhd":
+        if units not in "TSMHDsmhd":
             raise ValueError(sleeptime_err_msg)
 
         strategy_sleeptime = self._sleeptime_to_seconds(self.strategy.sleeptime)
@@ -925,7 +1049,7 @@ class StrategyExecutor(Thread):
             next_run_time = self.get_next_ap_scheduler_run_time()
             if next_run_time is not None:
                 # Format the date to be used in the log message.
-                dt_str = next_run_time.strftime("%Y-%m-%d %H:%M:%S")
+                dt_str = next_run_time.strftime("%Y-%m-%d %I:%M:%S %p %Z")
                 self.strategy.log_message(f"Strategy will check in again at: {dt_str}", color="blue")
 
             # Loop until the strategy should stop.
@@ -1032,58 +1156,66 @@ class StrategyExecutor(Thread):
         return next_run_time
 
     def run(self):
-        # Overloading the broker sleep method
-        self.broker.sleep = self.safe_sleep
+        try:
+            # Overloading the broker sleep method
+            self.broker.sleep = self.safe_sleep
 
-        # Set the strategy name at the broker
-        self.broker.set_strategy_name(self.strategy._name)
+            # Set the strategy name at the broker
+            self.broker.set_strategy_name(self.strategy._name)
 
-        self._initialize()
+            self._initialize()
 
-        # Get the trading days based on the market that the strategy is trading on
-        market = self.broker.market
+            # Get the trading days based on the market that the strategy is trading on
+            market = self.broker.market
 
-        # Get the trading days based on the market that the strategy is trading on
-        self.broker._trading_days = get_trading_days(market)
+            # Get the trading days based on the market that the strategy is trading on
+            self.broker._trading_days = get_trading_days(market)
 
-        # Sort the trading days by market close time so that we can search them faster
-        self.broker._trading_days.sort_values('market_close', inplace=True)  # Ensure sorted order
+            # Sort the trading days by market close time so that we can search them faster
+            self.broker._trading_days.sort_values('market_close', inplace=True)  # Ensure sorted order
 
-        # Set DataFrame index to market_close for fast lookups
-        self.broker._trading_days.set_index('market_close', inplace=True)
+            # Set DataFrame index to market_close for fast lookups
+            self.broker._trading_days.set_index('market_close', inplace=True)
 
-        #####
-        # The main loop for running any strategy
-        ####
-        while self.broker.should_continue() and self.should_continue:
+            #####
+            # The main loop for running any strategy
+            ####
+            while self.broker.should_continue() and self.should_continue:
+                try:
+                    self._run_trading_session()
+                except Exception as e:
+                    # The bot crashed so log the error, call the on_bot_crash method, and continue
+                    self.strategy.logger.error(e)
+                    self.strategy.logger.error(traceback.format_exc())
+                    try:
+                        self._on_bot_crash(e)
+                    except Exception as e1:
+                        self.strategy.logger.error(e1)
+                        self.strategy.logger.error(traceback.format_exc())
+
+                    # In BackTesting, we want to stop the bot if it crashes so there isn't an infinite loop
+                    if self.strategy.is_backtesting:
+                        raise e  # Re-raise original exception to preserve error message for tests
+
+                    # Only stop the strategy if it's time, otherwise keep running the bot
+                    if not self._strategy_sleep():
+                        self.result = self.strategy._analysis
+                        return False
             try:
-                self._run_trading_session()
+                self._on_strategy_end()
             except Exception as e:
-                # The bot crashed so log the error, call the on_bot_crash method, and continue
                 self.strategy.logger.error(e)
                 self.strategy.logger.error(traceback.format_exc())
-                try:
-                    self._on_bot_crash(e)
-                except Exception as e1:
-                    self.strategy.logger.error(e1)
-                    self.strategy.logger.error(traceback.format_exc())
+                self._on_bot_crash(e)
+                self.result = self.strategy._analysis
+                return False
 
-                # In BackTesting, we want to stop the bot if it crashes so there isn't an infinite loop
-                if self.strategy.is_backtesting:
-                    raise RuntimeError("Exception encountered, stopping BackTest.") from e
-
-                # Only stop the strategy if it's time, otherwise keep running the bot
-                if not self._strategy_sleep():
-                    self.result = self.strategy._analysis
-                    return False
-        try:
-            self._on_strategy_end()
-        except Exception as e:
-            self.strategy.logger.error(e)
-            self.strategy.logger.error(traceback.format_exc())
-            self._on_bot_crash(e)
             self.result = self.strategy._analysis
+            return True
+            
+        except Exception as e:
+            # Store the exception so the main thread can check it
+            self.exception = e
+            self.result = self.strategy._analysis if hasattr(self.strategy, '_analysis') else {}
+            # Don't re-raise - let the main thread handle it
             return False
-
-        self.result = self.strategy._analysis
-        return True

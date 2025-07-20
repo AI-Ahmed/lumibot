@@ -8,7 +8,11 @@ There are several different brokers that you can use to trade with Lumibot, and 
    :caption: Contents:
 
    brokers.alpaca
+   brokers.bitunix
+   brokers.ccxt
    brokers.interactive_brokers
    brokers.interactive_brokers_legacy
-   brokers.ccxt
+   brokers.projectx
+   brokers.schwab
    brokers.tradier
+   brokers.tradovate

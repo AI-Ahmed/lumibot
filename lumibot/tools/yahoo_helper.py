@@ -1,15 +1,18 @@
-import logging
 import os
 import pickle
 import time
+import random
 from datetime import datetime, timedelta
 
 import pandas as pd
 import yfinance as yf
+from fp.fp import FreeProxy
 
-from lumibot import LUMIBOT_CACHE_FOLDER, LUMIBOT_DEFAULT_PYTZ
-
+from ..constants import LUMIBOT_CACHE_FOLDER, LUMIBOT_DEFAULT_PYTZ
+from .lumibot_logger import get_logger
 from .helpers import get_lumibot_datetime
+
+logger = get_logger(__name__)
 
 INFO_DATA = "info"
 INVALID_SYMBOLS = set()
@@ -50,6 +53,8 @@ class YahooHelper:
     # =========Internal initialization parameters and methods============
 
     CACHING_ENABLED = False
+    # Temporarily disable FreeProxy by setting this to False
+    YAHOO_FREE_PROXY_ENABLED = False  # os.environ.get("YAHOO_FREE_PROXY_ENABLED", "True") == "True"
     LUMIBOT_YAHOO_CACHE_FOLDER = os.path.join(LUMIBOT_CACHE_FOLDER, "yahoo")
 
     if not os.path.exists(LUMIBOT_YAHOO_CACHE_FOLDER):
@@ -60,6 +65,18 @@ class YahooHelper:
             pass
     else:
         CACHING_ENABLED = True
+
+    @staticmethod
+    def sleep_and_get_proxy():
+        """
+        This sleeps and optionally returns a proxy if PROXY_ENABLED is True, otherwise returns None.
+        The most important thing this does is sleep. This prevents rate limiting by yahoo.
+        """
+        time.sleep(random.uniform(2, 5))
+
+        if YahooHelper.YAHOO_FREE_PROXY_ENABLED:
+            return FreeProxy(timeout=5).get()
+        return None
 
     # ====================Caching methods=================================
 
@@ -73,7 +90,7 @@ class YahooHelper:
                     with open(pickle_file_path, "rb") as f:
                         return pickle.load(f)
                 except Exception as e:
-                    logging.error("Error while loading pickle file %s: %s" % (pickle_file_path, e))
+                    logger.error("Error while loading pickle file %s: %s" % (pickle_file_path, e))
                     # Remove the file because it is corrupted.  This will enable re-download.
                     os.remove(pickle_file_path)
                     return None
@@ -96,9 +113,8 @@ class YahooHelper:
         # Check if df is empty
         if df is None or df.empty:
             return df
-        
+
         if auto_adjust:
-            del df["Adj Ratio"]
             del df["Close"]
             del df["Open"]
             del df["High"]
@@ -113,7 +129,7 @@ class YahooHelper:
                 inplace=True,
             )
         else:
-            for col in ["Adj Ratio", "Adj Open", "Adj High", "Adj Low"]:
+            for col in ["Adj Open", "Adj High", "Adj Low"]:
                 if col in df.columns:
                     del df[col]
 
@@ -127,8 +143,11 @@ class YahooHelper:
         if df.empty:
             return df
 
+        # Ensure data is sorted by index before any other processing
+        df.sort_index(inplace=True)
+
         if df.index.tzinfo is None:
-            df.index = df.index.tz_localize(LUMIBOT_DEFAULT_PYTZ)
+            df.index = pd.to_datetime(df.index).tz_localize(LUMIBOT_DEFAULT_PYTZ)
         else:
             df.index = df.index.tz_convert(LUMIBOT_DEFAULT_PYTZ)
 
@@ -138,13 +157,16 @@ class YahooHelper:
 
     @staticmethod
     def download_symbol_info(symbol):
+        proxy = YahooHelper.sleep_and_get_proxy()
+        if proxy:
+            yf.set_config(proxy=proxy)
         ticker = yf.Ticker(symbol)
 
         try:
             info = ticker.info
         except Exception as e:
-            logging.debug(f"Error while downloading symbol info for {symbol}, setting info to None for now.")
-            logging.debug(e)
+            logger.debug(f"Error while downloading symbol info for {symbol}, setting info to None for now.")
+            logger.debug(e)
             return {
                 "ticker": symbol,
                 "last_update": get_lumibot_datetime(),
@@ -161,11 +183,17 @@ class YahooHelper:
 
     @staticmethod
     def get_symbol_info(symbol):
+        proxy = YahooHelper.sleep_and_get_proxy()
+        if proxy:
+            yf.set_config(proxy=proxy)
         ticker = yf.Ticker(symbol)
         return ticker.info
 
     @staticmethod
     def get_symbol_last_price(symbol):
+        proxy = YahooHelper.sleep_and_get_proxy()
+        if proxy:
+            yf.set_config(proxy=proxy)
         ticker = yf.Ticker(symbol)
 
         # Get the last price from the history
@@ -186,7 +214,7 @@ class YahooHelper:
 
         # If we've already marked this symbol invalid, skip further calls
         if symbol in INVALID_SYMBOLS:
-            logging.debug(f"{symbol} is already marked invalid. Skipping yfinance calls.")
+            logger.debug(f"{symbol} is already marked invalid. Skipping yfinance calls.")
             return None
 
         ticker = yf.Ticker(symbol)
@@ -198,6 +226,9 @@ class YahooHelper:
 
         for attempt in range(1, max_retries + 1):
             try:
+                proxy = YahooHelper.sleep_and_get_proxy()
+                if proxy:
+                    yf.set_config(proxy=proxy)
                 if interval == "1m":
                     df = ticker.history(
                         interval=interval,
@@ -217,25 +248,25 @@ class YahooHelper:
                         auto_adjust=False
                     )
             except Exception as e:
-                logging.debug(f"{symbol}: Exception from ticker.history(): {e}")
+                logger.debug(f"{symbol}: Exception from ticker.history(): {e}")
                 if attempt < max_retries:
-                    logging.debug(f"{symbol}: Attempt {attempt} failed. Sleeping {sleep_sec}s, then retry.")
+                    logger.debug(f"{symbol}: Attempt {attempt} failed. Sleeping {sleep_sec}s, then retry.")
                     time.sleep(sleep_sec)
                     sleep_sec *= 2
                     continue
                 else:
-                    logging.debug(f"{symbol}: All {max_retries} attempts failed. Marking invalid.")
+                    logger.debug(f"{symbol}: All {max_retries} attempts failed. Marking invalid.")
                     INVALID_SYMBOLS.add(symbol)
                     return None
 
             if df is None or df.empty:
-                logging.debug(f"{symbol}: Attempt {attempt} returned empty or None data.")
+                logger.debug(f"{symbol}: Attempt {attempt} returned empty or None data.")
                 if attempt < max_retries:
-                    logging.debug(f"{symbol}: Sleeping {sleep_sec}s, then retry.")
+                    logger.debug(f"{symbol}: Sleeping {sleep_sec}s, then retry.")
                     time.sleep(sleep_sec)
                     sleep_sec *= 2
                 else:
-                    logging.debug(f"{symbol}: Data still empty after {max_retries} attempts. Marking invalid.")
+                    logger.debug(f"{symbol}: Data still empty after {max_retries} attempts. Marking invalid.")
                     INVALID_SYMBOLS.add(symbol)
                     return None
             else:
@@ -247,7 +278,7 @@ class YahooHelper:
         try:
             info = YahooHelper.get_symbol_info(symbol)
         except Exception as e:
-            logging.debug(f"{symbol}: Exception from get_symbol_info(): {e}")
+            logger.debug(f"{symbol}: Exception from get_symbol_info(): {e}")
 
         # If we have valid info, handle timezone adjustments.
         # Using sub_info to avoid accessing .get() on None.
@@ -284,12 +315,15 @@ class YahooHelper:
             return {symbols[0]: item}
 
         result = {}
+        proxy = YahooHelper.sleep_and_get_proxy()
+        if proxy:
+            yf.set_config(proxy=proxy)
         tickers = yf.Tickers(" ".join(symbols))
         df_yf = tickers.history(
             period="max",
             group_by="ticker",
             auto_adjust=False,
-            progress=False,
+            progress=False
         )
 
         for i in df_yf.columns.levels[0]:
@@ -364,7 +398,7 @@ class YahooHelper:
         symbol,
         interval="1d",
         caching=True,
-        auto_adjust=False,
+        auto_adjust=False, # Keep parameter name consistent
         last_needed_datetime=None,
         debug: bool = False
     ):
@@ -375,9 +409,8 @@ class YahooHelper:
                 caching=caching,
                 last_needed_datetime=last_needed_datetime,
             )
-            if debug:
-                import pdb; pdb.set_trace()
-            return YahooHelper.format_df(df, False)
+            # Pass the received auto_adjust value to format_df
+            return YahooHelper.format_df(df, auto_adjust)
         else:
             raise ValueError("Unknown interval %s" % interval)
 
@@ -477,7 +510,7 @@ class YahooHelper:
 
         risk_free_rate = irx_price / 100
         if with_logging:
-            logging.info(f"Risk Free Rate {risk_free_rate * 100:0.2f}%")
+            logger.info(f"Risk Free Rate {risk_free_rate * 100:0.2f}%")
 
         return risk_free_rate
 

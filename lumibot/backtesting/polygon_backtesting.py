@@ -1,20 +1,20 @@
-import logging
 import traceback
-from collections import OrderedDict, defaultdict
-from datetime import date, timedelta
+from collections import OrderedDict
+from datetime import timedelta
 from decimal import Decimal
 from typing import Union
 
 from polygon.exceptions import BadResponse
 from termcolor import colored
 
+from lumibot.tools.lumibot_logger import get_logger
 from lumibot.data_sources import PandasData
 from lumibot.entities import Asset, Data
 from lumibot.tools import polygon_helper
 from lumibot.tools.polygon_helper import PolygonClient
 
+logger = get_logger(__name__)
 START_BUFFER = timedelta(days=5)
-
 
 class PolygonDataBacktesting(PandasData):
     """
@@ -36,18 +36,20 @@ class PolygonDataBacktesting(PandasData):
 
         # Memory limit, off by default
         self.MAX_STORAGE_BYTES = max_memory
+        
+        # Store errors CSV path for use in data retrieval
 
         # RESTClient API for Polygon.io polygon-api-client
         self.polygon_client = PolygonClient.create(api_key=api_key)
 
     def _enforce_storage_limit(pandas_data: OrderedDict):
         storage_used = sum(data.df.memory_usage().sum() for data in pandas_data.values())
-        logging.info(f"{storage_used = :,} bytes for {len(pandas_data)} items")
+        logger.info(f"{storage_used = :,} bytes for {len(pandas_data)} items")
         while storage_used > PolygonDataBacktesting.MAX_STORAGE_BYTES:
             k, d = pandas_data.popitem(last=False)
             mu = d.df.memory_usage().sum()
             storage_used -= mu
-            logging.info(f"Storage limit exceeded. Evicted LRU data: {k} used {mu:,} bytes")
+            logger.info(f"Storage limit exceeded. Evicted LRU data: {k} used {mu:,} bytes")
 
     def _update_pandas_data(self, asset, quote, length, timestep, start_dt=None):
         """
@@ -131,7 +133,7 @@ class PolygonDataBacktesting(PandasData):
                 start_datetime,
                 self.datetime_end,
                 timespan=ts_unit,
-                quote_asset=quote_asset,
+                quote_asset=quote_asset
             )
         except BadResponse as e:
             # Assuming e.message or similar attribute contains the error message
@@ -161,11 +163,11 @@ class PolygonDataBacktesting(PandasData):
                 raise Exception(error_message) from e
             else:
                 # Handle other BadResponse exceptions not related to plan limitations
-                logging.error(traceback.format_exc())
+                logger.error(traceback.format_exc())
                 raise
         except Exception as e:
             # Handle all other exceptions
-            logging.error(traceback.format_exc())
+            logger.error(traceback.format_exc())
             raise Exception("Error getting data from Polygon") from e
 
         if (df is None) or df.empty:
@@ -279,7 +281,7 @@ class PolygonDataBacktesting(PandasData):
         This function simply calls :func:`get_chains_cached` from polygon_helper,
         which may reuse recent chain data to speed up backtests.
         """
-        logging.debug(f"polygon_backtesting.get_chains called for {asset.symbol}")
+        logger.debug(f"polygon_backtesting.get_chains called for {asset.symbol}")
 
         # Call the caching helper
         option_contracts = polygon_helper.get_chains_cached(

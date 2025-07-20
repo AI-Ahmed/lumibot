@@ -1,4 +1,4 @@
-import logging
+import os
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -6,14 +6,18 @@ import traceback
 import time
 from decimal import Decimal
 from typing import Union
+import pytz
 
 import pandas as pd
 
 from lumibot import LUMIBOT_DEFAULT_PYTZ, LUMIBOT_DEFAULT_TIMEZONE
-from lumibot.entities import Asset, AssetsMapping, Bars
+from lumibot.tools.lumibot_logger import get_logger
+from lumibot.entities import Asset, AssetsMapping, Bars, Quote
 from lumibot.tools import black_scholes, create_options_symbol
 
 from .exceptions import UnavailabeTimestep
+
+logger = get_logger(__name__)
 
 
 class DataSource(ABC):
@@ -24,7 +28,13 @@ class DataSource(ABC):
     DEFAULT_TIMEZONE = LUMIBOT_DEFAULT_TIMEZONE
     DEFAULT_PYTZ = LUMIBOT_DEFAULT_PYTZ
 
-    def __init__(self, api_key=None, delay=None):
+    def __init__(
+            self,
+            api_key: str | None = None,
+            delay: int | None = None,
+            tzinfo=None,
+            **kwargs
+    ):
         """
 
         Parameters
@@ -38,7 +48,25 @@ class DataSource(ABC):
         self.name = "data_source"
         self._timestep = None
         self._api_key = api_key
-        self._delay = timedelta(minutes=delay) if delay else None
+
+        # Use DATA_SOURCE_DELAY environment variable if it exists and delay is not explicitly provided
+        if delay is None:
+            env_delay = os.environ.get("DATA_SOURCE_DELAY")
+            if env_delay is not None:
+                try:
+                    delay = int(env_delay)
+                except ValueError:
+                    # If the environment variable is not a valid integer, ignore it
+                    pass
+            else:
+                # Default to 0 if no environment variable is set
+                delay = 0
+
+        self._delay = timedelta(minutes=delay) if delay is not None else None
+
+        if tzinfo is None:
+            tzinfo = pytz.timezone(self.DEFAULT_TIMEZONE)
+        self.tzinfo = tzinfo
 
     # ========Required Implementations ======================
     @abstractmethod
@@ -74,8 +102,14 @@ class DataSource(ABC):
     ) -> Bars:
         """
         Get bars for a given asset, going back in time from now, getting length number of bars by timestep.
-        For example, with a length of 10 and a timestep of "1day", and now timeshift, this
+        For example, with a length of 10 and a timestep of "day", and no timeshift, this
         would return the last 10 daily bars.
+
+        - Higher-level method that returns a `Bars` object
+        - Handles timezone conversions automatically
+        - Includes additional metadata and processing
+        - Preferred for strategy development and backtesting
+        - Returns normalized data with consistent format across data sources
 
         Parameters
         ----------
@@ -84,7 +118,7 @@ class DataSource(ABC):
         length : int
             The number of bars to get.
         timestep : str
-            The timestep to get the bars at. For example, "1minute" or "1hour" or "1day".
+            The timestep to get the bars at. Accepts "day" "hour" or "minute".
         timeshift : datetime.timedelta
             The amount of time to shift the bars by. For example, if you want the bars from 1 hour ago to now,
             you would set timeshift to 1 hour.
@@ -205,16 +239,14 @@ class DataSource(ABC):
         start_date = end_date - period_length
         return start_date, end_date
 
-    @classmethod
-    def localize_datetime(cls, dt):
+    def localize_datetime(self, dt):
         if dt.tzinfo is not None and dt.tzinfo.utcoffset(dt) is not None:
-            return cls.to_default_timezone(dt)
+            return self.to_default_timezone(dt)
         else:
-            return cls.DEFAULT_PYTZ.localize(dt, is_dst=None)
+            return self.tzinfo.localize(dt, is_dst=None)
 
-    @classmethod
-    def to_default_timezone(cls, dt):
-        return dt.astimezone(cls.DEFAULT_PYTZ)
+    def to_default_timezone(self, dt):
+        return dt.astimezone(self.tzinfo)
 
     def get_timestep(self):
         return self._timestep if self._timestep else self.MIN_TIMESTEP
@@ -317,17 +349,25 @@ class DataSource(ABC):
         include_after_hours=True,
     ):
         """Get bars for the list of assets"""
+        if not isinstance(assets, list):
+            assets = [assets]
 
         def process_chunk(chunk):
             chunk_result = {}
             for asset in chunk:
+                if isinstance(asset, tuple):
+                    base_asset = asset[0]
+                    quote_asset = asset[1]
+                else:
+                    base_asset = asset
+                    quote_asset = quote
                 try:
                     chunk_result[asset] = self.get_historical_prices(
-                        asset,
-                        length,
+                        asset=base_asset,
+                        length=length,
                         timestep=timestep,
                         timeshift=timeshift,
-                        quote=quote,
+                        quote=quote_asset,
                         exchange=exchange,
                         include_after_hours=include_after_hours,
                     )
@@ -336,9 +376,9 @@ class DataSource(ABC):
                     time.sleep(0.1)
                 except Exception as e:
                     # Log once per asset to avoid spamming with a huge traceback
-                    logging.warning(f"Error retrieving data for {asset.symbol}: {e}")
+                    logger.warning(f"Error retrieving data for {base_asset.symbol}: {e}")
                     tb = traceback.format_exc()
-                    logging.warning(tb)  # This prints the traceback
+                    logger.warning(tb)  # This prints the traceback
                     chunk_result[asset] = None
             return chunk_result
 
@@ -480,7 +520,7 @@ class DataSource(ABC):
                 row.update({f"greeks.{col}": val for col, val in greeks.items()})
                 rows.append(row)
 
-        logging.info(f"Chain Full Info Query Total: {query_total:.2f}s. "
+        logger.info(f"Chain Full Info Query Total: {query_total:.2f}s. "
                      f"Total Time: {time.perf_counter() - start_t:.2f}s, "
                      f"Rows: {len(rows)}")
         return pd.DataFrame(rows).sort_values("strike") if rows else pd.DataFrame()
@@ -506,8 +546,8 @@ class DataSource(ABC):
 
         # Convert the expiration to be a datetime with 4pm New York time
         expiration = datetime.combine(expiration, datetime.min.time())
-        expiration = self.DEFAULT_PYTZ.localize(expiration)
-        expiration = expiration.astimezone(self.DEFAULT_PYTZ)
+        expiration = self.tzinfo.localize(expiration)
+        expiration = expiration.astimezone(self.tzinfo)
         expiration = expiration.replace(hour=16, minute=0, second=0, microsecond=0)
 
         # Calculate the days to expiration, but allow for fractional days
@@ -548,6 +588,27 @@ class DataSource(ABC):
 
     def query_greeks(self, asset):
         """Query for the Greeks as it can be more accurate than calculating locally."""
-        logging.info(f"Querying Options Greeks for {asset.symbol} is not supported for this "
+        logger.info(f"Querying Options Greeks for {asset.symbol} is not supported for this "
                      f"data source {self.__class__}.")
         return {}
+
+    def get_quote(self, asset: Asset, quote: Asset = None, exchange: str = None) -> Quote:
+        """
+        Get the latest quote for an asset (stock, option, or crypto).
+        Returns a Quote object with bid, ask, last, and other fields if available.
+
+        Parameters
+        ----------
+        asset : Asset object
+            The asset for which the quote is needed.
+        quote : Asset object, optional
+            The quote asset for cryptocurrency pairs.
+        exchange : str, optional
+            The exchange to get the quote from.
+
+        Returns
+        -------
+        Quote
+            A Quote object with the quote information, eg. bid, ask, etc.
+        """
+        raise NotImplementedError("get_quote method not implemented")

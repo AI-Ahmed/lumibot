@@ -1,12 +1,14 @@
-import logging
+import logging  # Needed for logging infrastructure setup
 import os
 import signal
 import sys
 from pathlib import Path
 
+from lumibot.tools.lumibot_logger import get_logger
+
 # Overloading time.sleep to warn users against using it
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class Trader:
@@ -32,13 +34,9 @@ class Trader:
             if not isinstance(logfile, str):
                 raise ValueError("logfile must be a string")
 
-        # Setting debug and _logfile parameters and setting global log format
+        # Setting debug and _logfile parameters
         self.debug = debug
         self.backtest = backtest
-        std_format = "%(asctime)s: %(levelname)s: %(message)s"
-        debug_format = "%(asctime)s: %(name)s: %(levelname)s: %(message)s"
-        log_format = std_format if not self.debug else debug_format
-        self.log_format = logging.Formatter(log_format)
         self.quiet_logs = quiet_logs  # Turns off all logging execpt for error messages in backtesting
 
         if logfile:
@@ -146,15 +144,17 @@ class Trader:
         if self.is_backtest_broker:
             logger.setLevel(logging.INFO)
             logger.info("Backtesting finished")
-            strat.backtest_analysis(
-                logdir=self.logdir,
-                show_plot=show_plot,
-                show_tearsheet=show_tearsheet,
-                save_tearsheet=save_tearsheet,
-                show_indicators=show_indicators,
-                tearsheet_file=tearsheet_file,
-                base_filename=base_filename,
-            )
+
+            if strat._analyze_backtest:
+                strat.backtest_analysis(
+                    logdir=self.logdir,
+                    show_plot=show_plot,
+                    show_tearsheet=show_tearsheet,
+                    save_tearsheet=save_tearsheet,
+                    show_indicators=show_indicators,
+                    tearsheet_file=tearsheet_file,
+                    base_filename=base_filename,
+                )
 
         return result
 
@@ -165,54 +165,37 @@ class Trader:
         return self._strategies
 
     def stop_all(self):
-        logging.info("Stopping all strategies for this trader")
+        logger.info("Stopping all strategies for this trader")
         self._stop_pool()
 
     def _set_logger(self):
         """Setting Logging to both console and a file if logfile is specified"""
-        logging.getLogger("urllib3").setLevel(logging.ERROR)
-        logging.getLogger("requests").setLevel(logging.ERROR)
-        logging.getLogger("apscheduler.scheduler").setLevel(logging.ERROR)
-        logging.getLogger("apscheduler.executors.default").setLevel(logging.ERROR)
-        logging.getLogger("lumibot.data_sources.yahoo_data").setLevel(logging.ERROR)
-        logger = logging.getLogger()
+        # Import here to avoid circular imports
+        from lumibot.tools.lumibot_logger import set_log_level, add_file_handler
+        
+        # Set external library log levels to reduce noise
+        get_logger("urllib3").setLevel(logging.ERROR)
+        get_logger("requests").setLevel(logging.ERROR)
+        get_logger("apscheduler.scheduler").setLevel(logging.ERROR)
+        get_logger("apscheduler.executors.default").setLevel(logging.ERROR)
+        get_logger("lumibot.data_sources.yahoo_data").setLevel(logging.ERROR)
 
-        for handler in logger.handlers:
-            if handler.__class__.__name__ == "StreamHandler":
-                logger.removeHandler(handler)
-
-        stream_handler = logging.StreamHandler(stream=sys.stdout)
-        stream_handler.setLevel(logging.INFO)
-        logger.addHandler(stream_handler)
-
+        # Configure global log level based on trader settings
         if self.debug:
-            logger.setLevel(logging.DEBUG)
+            set_log_level("DEBUG")
         elif self.is_backtest_broker:
-            logger.setLevel(logging.INFO)
-
             # Quiet logs turns off all backtesting logging except for error messages
             if self.quiet_logs:
-                logger.setLevel(logging.ERROR)
-
-            # Ensure console has minimal logging to keep things clean during backtesting
-            stream_handler.setLevel(logging.ERROR)
-
+                set_log_level("ERROR")
+            else:
+                set_log_level("INFO")
         else:
             # Live trades should always have full logging.
-            logger.setLevel(logging.INFO)
+            set_log_level("INFO")
 
-        # Setting file logging
+        # Setting file logging if specified
         if self.logfile:
-            dir = os.path.dirname(os.path.abspath(self.logfile))
-            if not os.path.exists(dir):
-                os.mkdir(dir)
-            fileHandler = logging.FileHandler(self.logfile, mode="w", encoding="utf-8")
-            logger.addHandler(fileHandler)
-
-        for handler in logger.handlers:
-            handler.setFormatter(self.log_format)
-
-        logger.propagate = True
+            add_file_handler(str(self.logfile), level="DEBUG" if self.debug else "INFO")
 
         # Disable Interactive Brokers logs
         for log_name, log_obj in logging.Logger.manager.loggerDict.items():
@@ -231,6 +214,13 @@ class Trader:
     def _join_pool(self):
         for strategy_thread in self._pool:
             strategy_thread.join()
+            
+        # For backtesting, check if any strategy failed and raise exception
+        if self.is_backtest_broker:
+            for strategy_thread in self._pool:
+                # Check if the thread stored an exception
+                if hasattr(strategy_thread, 'exception') and strategy_thread.exception is not None:
+                    raise strategy_thread.exception
 
     def _stop_pool(self, sig=None, frame=None):
         """Run all strategies on_abrupt_closing
@@ -238,12 +228,12 @@ class Trader:
         needs two positional arguments, the signal
         and the frame"""
 
-        logging.debug(f"Received signal number {sig}.")
-        logging.debug(f"Closing Trader in {frame} frame.")
+        logger.debug(f"Received signal number {sig}.")
+        logger.debug(f"Closing Trader in {frame} frame.")
         for strategy_thread in self._pool:
             if not strategy_thread.abrupt_closing:
                 strategy_thread.stop()
-                logging.info(f"Trading finished for {strategy_thread.strategy._name}")
+                logger.info(f"Trading finished for {strategy_thread.strategy._name}")
 
     def _collect_analysis(self):
         result = {}

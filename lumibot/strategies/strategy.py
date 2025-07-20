@@ -1,10 +1,10 @@
-import datetime
 import os
 import time
-from asyncio.log import logger
-from loguru import logger as log
+import datetime
 from decimal import Decimal
-from typing import Union, List, Type, Literal
+import uuid
+from typing import Union, List, Type, Callable
+from loguru import logger
 
 import jsonpickle
 import matplotlib
@@ -12,8 +12,9 @@ import numpy as np
 import pandas as pd
 import pandas_market_calendars as mcal
 from termcolor import colored
+from apscheduler.triggers.cron import CronTrigger
 
-from ..entities import Asset, Order, Position, Data, TradingFee
+from ..entities import Asset, Order, Position, Data, TradingFee, Quote
 from ..tools import get_risk_free_rate
 from ..traders import Trader
 from ..data_sources import DataSource
@@ -116,11 +117,6 @@ class Strategy(_Strategy):
 
         The lifecycle method on_trading_iteration is executed inside a loop that stops only when there is only minutes_before_closing minutes remaining before market closes. By default equals to 5 minutes.
 
-        Parameters
-        ----------
-        minutes_before_closing : int
-            The number of minutes before market closes that the strategy will stop executing.
-
         Returns
         -------
         minutes_before_closing : int
@@ -180,8 +176,8 @@ class Strategy(_Strategy):
 
         By default, equals 1 minute. You can set the sleep time as an integer which will be interpreted as
         minutes. eg: sleeptime = 50 would be 50 minutes. Conversely, you can enter the time as a string with
-        the duration numbers first, followed by the time units: ‘M’ for minutes, ‘S’ for seconds
-        eg: ‘"300S"’ is 300 seconds, ‘"10M"’ is 10 minutes.
+        the duration numbers first, followed by the time units: 'M' for minutes, 'S' for seconds
+        eg: '300S' is 300 seconds, '10M' is 10 minutes.
 
         Returns
         -------
@@ -296,6 +292,8 @@ class Strategy(_Strategy):
 
         if type(quantity) is Decimal:
             quantity = float(quantity)
+        elif quantity is None:
+            quantity = 0.0
 
         return quantity
 
@@ -772,6 +770,11 @@ class Strategy(_Strategy):
             order_class=order_class,
             custom_params=custom_params,
         )
+
+        # Add debug logging for custom_params
+        if custom_params:
+            self.log_message(f"🔧 ORDER CREATED with custom_params: {custom_params} for {asset} {side} {quantity}")
+
         return order
 
     # ======= Broker Methods ============
@@ -799,7 +802,7 @@ class Strategy(_Strategy):
         """
 
         if not self.is_backtesting:
-            # Sleep for the the sleeptime in seconds.
+            # Sleep for the sleeptime in seconds.
             time.sleep(sleeptime)
 
         return self.broker.sleep(sleeptime)
@@ -998,6 +1001,20 @@ class Strategy(_Strategy):
         if market not in markets:
             raise ValueError(f"Valid market entries are: {markets}. You entered {market}. Please adjust.")
 
+        # Check if broker is None before setting market
+        if self.broker is None:
+            from termcolor import colored
+            error_msg = colored(
+                "No broker is set. Cannot set market. Please set a broker using environment variables, "
+                "secrets or by passing it as an argument to the strategy constructor.", 
+                "red"
+            )
+            self.logger.error(error_msg)
+            raise ValueError(
+                "No broker is set. Cannot set market. Please ensure your broker credentials are properly "
+                "configured in environment variables or passed to the strategy constructor."
+            )
+
         self.broker.market = market
 
     def await_market_to_open(self, timedelta: int = None):
@@ -1124,7 +1141,7 @@ class Strategy(_Strategy):
         float
             The current portfolio value, which is the sum of the cash and net equity. This is the total value of your account, which is the amount of money you would have if you sold all your assets and closed all your positions. For crypto assets, this is the total value of your account in the quote asset (eg. USDT if that is your quote asset).
         """
-        return self.portfolio_value
+        return self._portfolio_value
 
     def get_cash(self):
         """Get the current cash value in your account.
@@ -1196,7 +1213,7 @@ class Strategy(_Strategy):
 
     @property
     def positions(self):
-        return self.get_tracked_positions()
+        return self.get_positions()
 
     def _get_contract_details(self, asset: Asset):
         """Convert an asset into a IB Contract.
@@ -1444,7 +1461,7 @@ class Strategy(_Strategy):
         >>> order2 = self.create_order((asset_ETH, asset_quote), 10, "buy")
         >>> self.submit_order([order1, order2])
         """
-        
+
         if isinstance(order, list):
             # Submit multiple orders
             # Validate orders
@@ -1453,10 +1470,10 @@ class Strategy(_Strategy):
             for o in order:
                 if not self._validate_order(o):
                     return
-                
+
                 if o.asset.asset_type != "option":
                     default_multileg = False
-            
+
             if 'is_multileg' not in kwargs:
                 kwargs['is_multileg'] = default_multileg
 
@@ -1539,7 +1556,6 @@ class Strategy(_Strategy):
         >>> order1 = self.create_order((asset_BTC, asset_quote), 0.1, "buy")
         >>> order2 = self.create_order((asset_ETH, asset_quote), 10, "buy")
         >>> self.submit_orders([order1, order2])
-
         """
         #self.log_message("Warning: `submit_orders` is deprecated, please use `submit_order` instead.")
         return self.submit_order(orders, **kwargs)
@@ -1747,7 +1763,12 @@ class Strategy(_Strategy):
         if not order.identifier:
             raise ValueError("Order identifier is not set, unable to modify order. Did you remember to submit it?")
 
-        return self.broker.modify_order(order, limit_price=limit_price, stop_price=stop_price)
+        result = self.broker.modify_order(order, limit_price=limit_price, stop_price=stop_price)
+        if limit_price is not None:
+            order.limit_price = limit_price
+        if stop_price is not None:
+            order.stop_price = stop_price
+        return result
 
     def sell_all(self, cancel_open_orders: bool = True, is_multileg: bool = False):
         """Sell all strategy positions.
@@ -1777,10 +1798,50 @@ class Strategy(_Strategy):
         """
         self.broker.sell_all(self.name, cancel_open_orders=cancel_open_orders, strategy=self, is_multileg=is_multileg)
 
-    def get_last_price(self,
-                       asset: Union[Asset, str],
-                       timestep="",
-                       quote=None, exchange=None) -> Union[float, Decimal, None]:
+    def close_position(self, asset, fraction: float = 1.0):
+        """
+        Close a single position for the specified asset.
+
+        This method attempts to close an open position for the given asset. For most brokers, this is done by submitting a market sell order for the open position. For crypto futures brokers (such as Bitunix), this may use a broker-specific fast-close or "flash close" endpoint to close the position immediately at market price.
+
+        Args:
+            asset (str or Asset): The symbol or Asset object identifying the position to close.
+
+        Returns:
+            Any: The broker.close_position result, or None if no action was taken.
+
+        Notes:
+            - For crypto futures (e.g., Bitunix), this will use the broker's flash close endpoint if available.
+            - For spot/stock/futures brokers, this will submit a market sell order for the open position.
+            - If no open position exists, this method does nothing.
+        """
+        asset_obj = self._sanitize_user_asset(asset)
+        result = self.broker.close_position(self.name, asset_obj, fraction)
+        if result is not None:
+            return result
+
+    def close_positions(self, assets):
+        """
+        Close multiple positions for the specified assets.
+
+        Iterates over the provided list of assets and attempts to close each open position. See `close_position` for details on how each position is closed.
+
+        Args:
+            assets (list[str or Asset]): Symbols or Asset objects identifying the positions to close.
+
+        Returns:
+            list: Results from each `close_position` call, or None if no action was taken.
+
+        Notes:
+            - For crypto futures (e.g., Bitunix), this will use the broker's flash close endpoint if available.
+            - For spot/stock/futures brokers, this will submit a market sell order for each open position.
+        """
+        results = []
+        for asset in assets:
+            results.append(self.close_position(asset))
+        return results
+
+    def get_last_price(self, asset: Union[Asset, str], quote=None, exchange=None) -> Union[float, Decimal, None]:
         """Takes an asset and returns the last known price
 
         Makes an active call to the market to retrieve the last price.
@@ -1791,8 +1852,6 @@ class Strategy(_Strategy):
         asset : Asset object or str
             Asset object for which the last closed price will be
             retrieved.
-        timestep: str 
-                The time granularity (e.g., "minute").
         quote : Asset object
             Quote asset object for which the last closed price will be
             retrieved. This is required for cryptocurrency pairs.
@@ -1861,7 +1920,6 @@ class Strategy(_Strategy):
         try:
             return self.broker.get_last_price(
                 asset,
-                timestep=timestep,
                 quote=quote_asset,
                 exchange=exchange,
                 # should_use_last_close=should_use_last_close,
@@ -1871,33 +1929,34 @@ class Strategy(_Strategy):
             self.log_message(f"{e}")
             return None
 
-    def get_quote(self, asset: Asset):
+    def get_quote(self, asset: Asset, quote: Asset = None, exchange: str = None) -> Quote:
         """Get a quote for the asset.
-
-        NOTE: This currently only works with Tradier and IB REST. It does not work with backtetsing or other brokers.
 
         Parameters
         ----------
         asset : Asset object
             The asset for which the quote is needed.
+        quote : Asset object, optional
+            The quote asset for cryptocurrency pairs.
+        exchange : str, optional
+            The exchange to get the quote from.
 
         Returns
         -------
-        dict
-            A dictionary with the quote information, eg. bid, ask, etc.
+        Quote
+            A Quote object with the quote information, eg. bid, ask, etc.
         """
 
         asset = self._sanitize_user_asset(asset)
 
-        # Check if the broker has the get_quote method (not all brokers do)
-        if not hasattr(self.broker.data_source, "get_quote"):
-            self.log_message("Broker does not have a get_quote method.")
-            return None
-
-        if self.broker.option_source and asset.asset_type == "option":
-            return self.broker.option_source.get_quote(asset)
-        else:
-            return self.broker.data_source.get_quote(asset)
+        try:
+            if self.broker.option_source and asset.asset_type == "option":
+                return self.broker.option_source.get_quote(asset, quote=quote, exchange=exchange)
+            else:
+                return self.broker.data_source.get_quote(asset, quote=quote, exchange=exchange)
+        except Exception as e:
+            self.log_message(f"Error getting quote from data source: {e}", color="red")
+            return Quote(asset=asset)
 
     def get_tick(self, asset: Union[Asset, str]):
         """Takes an Asset and returns the last known price"""
@@ -2064,10 +2123,10 @@ class Strategy(_Strategy):
         return self.broker.get_chain(chains)
 
     def get_chain_full_info(
-            self, 
+            self,
             asset: Asset,
-            expiry: Union[str, datetime.datetime, datetime.date], 
-            chains: dict = None, 
+            expiry: Union[str, datetime.datetime, datetime.date],
+            chains: dict = None,
             underlying_price: float = None,
             risk_free_rate: float = None,
             strike_min: float = None,
@@ -2230,7 +2289,7 @@ class Strategy(_Strategy):
         timestamp : datetime.datetime | pd.Timestamp
             The timestamp for which the first Friday of the month is
             needed.
-        
+
         Returns
         -------
         datetime.datetime
@@ -2445,7 +2504,7 @@ class Strategy(_Strategy):
         >>> pytz = self.pytz
         >>> self.log_message(f"pytz: {pytz}")
         """
-        return self.broker.data_source.DEFAULT_PYTZ
+        return self.broker.data_source.tzinfo
 
     def get_datetime(self, adjust_for_delay: bool = False):
         """Returns the current datetime according to the data source. In a backtest this will be the current bar's datetime. In live trading this will be the current datetime on the exchange.
@@ -2483,6 +2542,52 @@ class Strategy(_Strategy):
         >>> self.log_message(f"The current timestamp is {timestamp}")
         """
         return self.broker.data_source.get_timestamp()
+
+    def register_cron_callback(self, cron_schedule: str, callback_function: Callable) -> str:
+        """Register a callback function to be executed according to a cron schedule.
+
+        Parameters
+        ----------
+        cron_schedule : str
+            A cron schedule string (e.g., "0 9 * * 1-5" for 9:00 AM Monday through Friday)
+        callback_function : callable
+            The function to call on the schedule
+
+        Returns
+        -------
+        str
+            The job ID that can be used to remove the job later
+
+        Example
+        -------
+        >>> self.register_cron_callback("0 9 * * 1-5", self.morning_update)
+
+        Notes
+        -----
+        This method does nothing in backtesting mode.
+        """
+        # Generate a unique job ID
+        job_id = f"cron_callback_{uuid.uuid4().hex}"
+
+        # Do nothing in backtesting mode
+        if self.is_backtesting:
+            self.log_message(f"Skipping registration of cron callback {callback_function.__name__} in backtesting mode")
+            return job_id
+
+        # Create a CronTrigger from the schedule string using the broker's timezone
+        trigger = CronTrigger.from_crontab(cron_schedule, timezone=self.pytz)
+
+        # Add the job to the scheduler
+        self._executor.scheduler.add_job(
+            callback_function,
+            trigger,
+            id=job_id,
+            name=f"Cron Callback: {callback_function.__name__}",
+            jobstore="default"
+        )
+
+        self.log_message(f"Registered cron callback {callback_function.__name__} with schedule: {cron_schedule} in {self.timezone} timezone")
+        return job_id
 
     def get_round_minute(self, timeshift: int = 0):
         """Returns the current minute rounded to the nearest minute. In a backtest this will be the current bar's timestamp. In live trading this will be the current timestamp on the exchange.
@@ -2696,14 +2801,15 @@ class Strategy(_Strategy):
         )
 
     def add_marker(
-            self, 
-            name: str, 
+            self,
+            name: str,
             value: float = None,
-            color: str = "blue", 
+            color: str = "blue",
             symbol: str = "circle",
             size: int = None,
             detail_text: str = None,
-            dt: Union[datetime.datetime, pd.Timestamp] = None
+            dt: Union[datetime.datetime, pd.Timestamp] = None,
+            plot_name: str = "default_plot"
             ):
         """Adds a marker to the indicators plot that loads after a backtest. This can be used to mark important events on the graph, such as price crossing a certain value, marking a support level, marking a resistance level, etc.
 
@@ -2723,6 +2829,8 @@ class Strategy(_Strategy):
             The text to display when the marker is hovered over.
         dt : datetime.datetime or pandas.Timestamp
             The datetime of the marker. Default is the current datetime.
+        plot_name : str
+            The name of the subplot to add the marker to. If "default_plot" (the default value) or None, the marker will be added to the main plot.
 
         Example
         -------
@@ -2745,8 +2853,8 @@ class Strategy(_Strategy):
 
         if value is not None and not isinstance(value, (float, int, np.float64)):
             raise ValueError(
-                f"Invalid value parameter in add_marker() method. Value must be a float or int but instead "
-                f"got {value}, which is a type {type(value)}."
+                f"Invalid value parameter in add_marker() method. Value must be a float or int but instead got {value}, "
+                f"which is a type {type(value)}."
             )
 
         if color is not None and not isinstance(color, str):
@@ -2785,7 +2893,12 @@ class Strategy(_Strategy):
         if len(self._chart_markers_list) > 0:
             timestamp = dt.timestamp()
             for marker in self._chart_markers_list:
-                if marker["timestamp"] == timestamp and marker["name"] == name and marker["symbol"] == symbol:
+                if (
+                        marker["timestamp"] == timestamp
+                        and marker["name"] == name
+                        and marker["symbol"] == symbol
+                        and marker['plot_name'] == plot_name
+                ):
                     return None
 
         new_marker = {
@@ -2797,6 +2910,7 @@ class Strategy(_Strategy):
             "size": size,
             "value": value,
             "detail_text": detail_text,
+            "plot_name": plot_name,
         }
 
         self._chart_markers_list.append(new_marker)
@@ -2817,14 +2931,15 @@ class Strategy(_Strategy):
         return df
 
     def add_line(
-            self, 
-            name: str, 
-            value: float, 
+            self,
+            name: str,
+            value: float,
             color: str = None,
             style: str = "solid",
             width: int = None,
             detail_text: str = None,
-            dt: Union[datetime.datetime, pd.Timestamp] = None
+            dt: Union[datetime.datetime, pd.Timestamp] = None,
+            plot_name: str = "default_plot"
             ):
         """Adds a line data point to the indicator chart. This can be used to add lines such as bollinger bands, prices for specific assets, or any other line you want to add to the chart.
 
@@ -2844,6 +2959,8 @@ class Strategy(_Strategy):
             The text to display when the line is hovered over.
         dt : datetime.datetime or pandas.Timestamp
             The datetime of the line. Default is the current datetime.
+        plot_name : str
+            The name of the subplot to add the line to. If "default_plot" (the default value) or None, the line will be added to the main plot.
 
         Example
         -------
@@ -2908,6 +3025,7 @@ class Strategy(_Strategy):
                 "style": style,
                 "width": width,
                 "detail_text": detail_text,
+                "plot_name": plot_name,
             }
         )
 
@@ -2926,12 +3044,12 @@ class Strategy(_Strategy):
 
     def write_backtest_settings(self, settings_file: str):
         """Writes the backtest settings to a file.
-        
+
         Parameters
         ----------
         settings_file : str
             The file path to write the settings to.
-            
+
         Returns
         -------
         None
@@ -2957,7 +3075,7 @@ class Strategy(_Strategy):
             "quote_asset": self.quote_asset,
             "benchmark_asset": self._benchmark_asset,
             "starting_positions": self.starting_positions,
-            "parameters": self.parameters,
+            "parameters": {k: v for k, v in self.parameters.items() if k != 'pandas_data'}
         }
         os.makedirs(os.path.dirname(settings_file), exist_ok=True)
         with open(settings_file, "w") as outfile:
@@ -3070,13 +3188,17 @@ class Strategy(_Strategy):
         if quote is None:
             quote = self.quote_asset
 
-        self.logger.info(f"Getting historical prices for {asset}, {length} bars, {timestep}")
+        # Only log once per asset to reduce noise
+        asset_key = f"{asset}_{length}_{timestep}"
+        if asset_key not in self._logged_get_historical_prices_assets:
+            self.logger.info(f"Getting historical prices for {asset}, {length} bars, {timestep}")
+            self._logged_get_historical_prices_assets.add(asset_key)
 
         asset = self._sanitize_user_asset(asset)
 
         asset = self.crypto_assets_to_tuple(asset, quote)
         if not timestep:
-            timestep = self.broker.data_source.MIN_TIMESTEP
+            timestep = self.broker.data_source.get_timestep()
         if self.broker.option_source and asset.asset_type == "option":
             return self.broker.option_source.get_historical_prices(
                 asset,
@@ -3111,7 +3233,7 @@ class Strategy(_Strategy):
         This method is deprecated and will be removed in a future version.
         Please use self.get_historical_prices() instead.
         """
-        logger.warning(
+        self.logger.warning(
             "The get_bars method is deprecated and will be removed in a future version. "
             "Please use self.get_historical_prices() instead."
         )
@@ -3127,7 +3249,7 @@ class Strategy(_Strategy):
 
     def get_historical_prices_for_assets(
         self,
-        assets: List[Union[Asset, str]],
+        assets: List[Asset | str | tuple],
         length: int,
         timestep: str = "minute",
         timeshift: datetime.timedelta = None,
@@ -3147,7 +3269,7 @@ class Strategy(_Strategy):
 
         Parameters
         ----------
-        assets : list(str/asset)
+        assets : list(str/asset,tuple)
             The symbol string representation (e.g. AAPL, GOOG, ...) or asset
             objects.
             Cryptocurrencies must specify the quote asset. Use tuples with the two asset
@@ -3178,13 +3300,13 @@ class Strategy(_Strategy):
 
         >>> # Get the data for SPY and TLT for the last 2 days
         >>> bars =  self.get_historical_prices_for_assets(["SPY", "TLT"], 2, "day")
-        >>> for asset in bars:
-        >>>     self.log_message(asset.df)
+        >>> for asset_bars in bars_list:
+        >>>     self.log_message(asset_bars.df)
 
         >>> # Get the data for AAPL and GOOG for the last 30 minutes
         >>> bars =  self.get_historical_prices_for_assets(["AAPL", "GOOG"], 30, "minute")
-        >>> for asset in bars:
-        >>>     self.log_message(asset.df)
+        >>> for asset_bars in bars_list:
+        >>>     self.log_message(asset_bars.df)
 
         >>> # Get the price data for EURUSD for the last 2 days
         >>> from lumibot.entities import Asset
@@ -3194,7 +3316,11 @@ class Strategy(_Strategy):
         >>> df = bars.df
         """
 
-        self.logger.info(f"Getting historical prices for {assets}, {length} bars, {timestep}")
+        # Only log once per asset list to reduce noise
+        assets_key = f"{assets}_{length}_{timestep}"
+        if assets_key not in self._logged_get_historical_prices_assets:
+            self.logger.info(f"Getting historical prices for {assets}, {length} bars, {timestep}")
+            self._logged_get_historical_prices_assets.add(assets_key)
 
         assets = [self._sanitize_user_asset(asset) for asset in assets]
         return self.broker.data_source.get_bars(
@@ -3220,7 +3346,7 @@ class Strategy(_Strategy):
         """
         This method is deprecated and will be removed in a future version.
         Please use self.get_historical_prices_for_assets() instead."""
-        logger.warning(
+        self.logger.warning(
             "The get_bars method is deprecated and will be removed in a future version. "
             "Please use self.get_historical_prices_for_assets() instead."
         )
@@ -3743,10 +3869,10 @@ class Strategy(_Strategy):
         pass
 
     def on_partially_filled_order(
-            self, 
-            position: Position, 
-            order: Order, 
-            price: float, 
+            self,
+            position: Position,
+            order: Order,
+            price: float,
             quantity: Union[float, int],
             multiplier: float
             ):
@@ -3860,7 +3986,7 @@ class Strategy(_Strategy):
 
         trader.add_strategy(self)
         trader.run_all()
-    
+
     @classmethod
     def backtest(
         self,
@@ -3901,7 +4027,7 @@ class Strategy(_Strategy):
         show_progress_bar: bool = True,
         quiet_logs: bool = True,
         trader_class: Type[Trader] = Trader,
-        include_cash_positions=False,
+        save_stats_file: bool = True,
         **kwargs,
     ):
         """Backtest a strategy.
@@ -4063,7 +4189,7 @@ class Strategy(_Strategy):
             show_progress_bar=show_progress_bar,
             quiet_logs=quiet_logs,
             trader_class=trader_class,
-            include_cash_positions=include_cash_positions,
+            save_stats_file=save_stats_file,
             **kwargs,
         )
         return results

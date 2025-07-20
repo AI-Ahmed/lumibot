@@ -1,5 +1,4 @@
 import contextlib
-import logging
 import math
 import os
 import webbrowser
@@ -12,13 +11,14 @@ import pytz
 import quantstats_lumi as qs
 from plotly.subplots import make_subplots
 
-from lumibot import LUMIBOT_DEFAULT_TIMEZONE
+from ..constants import LUMIBOT_DEFAULT_TIMEZONE
 from lumibot.tools import to_datetime_aware
 from plotly.subplots import make_subplots
 
 from .yahoo_helper import YahooHelper as yh
 
-logger = logging.getLogger(__name__)
+from lumibot.tools.lumibot_logger import get_logger
+logger = get_logger(__name__)
 
 
 def total_return(_df):
@@ -185,6 +185,9 @@ def get_symbol_returns(symbol, start=datetime(1900, 1, 1), end=datetime.now()):
                                     last_needed_datetime=end,
                                     debug=False)
 
+    if returns_df is None:
+        return None
+
     # Make sure we are working with a copy to avoid SettingWithCopyWarning
     returns_df = returns_df.copy()
 
@@ -229,7 +232,45 @@ def plot_indicators(
 
     logger.info("\nCreating indicators plot...")
 
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    # Assign "default_plot" as plot_name for markers and lines that don't have one
+    if chart_markers_df is not None and not chart_markers_df.empty:
+        chart_markers_df = chart_markers_df.copy()
+        if "plot_name" not in chart_markers_df.columns:
+            chart_markers_df["plot_name"] = "default_plot"
+        else:
+            chart_markers_df["plot_name"] = chart_markers_df["plot_name"].fillna("default_plot")
+
+    if chart_lines_df is not None and not chart_lines_df.empty:
+        chart_lines_df = chart_lines_df.copy()
+        if "plot_name" not in chart_lines_df.columns:
+            chart_lines_df["plot_name"] = "default_plot"
+        else:
+            chart_lines_df["plot_name"] = chart_lines_df["plot_name"].fillna("default_plot")
+
+    # Get unique plot_names from markers and lines
+    plot_names = set()
+
+    if chart_markers_df is not None and not chart_markers_df.empty:
+        plot_names.update(chart_markers_df["plot_name"].unique())
+
+    if chart_lines_df is not None and not chart_lines_df.empty:
+        plot_names.update(chart_lines_df["plot_name"].unique())
+
+    # Convert to sorted list to ensure consistent order
+    plot_names = sorted(list(plot_names))
+
+    # Ensure num_subplots is at least 1 to avoid ValueError in make_subplots
+    num_subplots = max(1, len(plot_names))
+    subplot_titles = plot_names if num_subplots > 0 else ["default_plot"]
+
+    # Create subplots without shared x-axes
+    fig = make_subplots(
+        rows=num_subplots,
+        cols=1,
+        subplot_titles=subplot_titles,
+        shared_xaxes=False,  # Do not use shared x-axes
+        vertical_spacing=0.15,  # Increase spacing between subplots to prevent range slider overlap,
+    )
 
     has_chart_data = False
 
@@ -245,38 +286,41 @@ def plot_indicators(
 
     # Plot the chart markers
     if chart_markers_df is not None and not chart_markers_df.empty:
-        chart_markers_df = chart_markers_df.copy()
         chart_markers_df["detail_text"] = chart_markers_df.apply(generate_marker_plotly_text, axis=1)
 
-        # Loop over the marker names and create a new trace for each one
-        for marker_name in chart_markers_df["name"].unique():
-            # Get the marker data for this marker name
-            marker_df = chart_markers_df.loc[chart_markers_df["name"] == marker_name]
+        # Group by plot_name first, then by name
+        for plot_name, plot_df in chart_markers_df.groupby("plot_name"):
+            # Loop over the marker names for this plot_name
+            for marker_name, group_df in plot_df.groupby("name"):
+                # Get the marker symbol
+                marker_symbol = group_df["symbol"].iloc[0]
 
-            # Get the marker symbol
-            marker_symbol = marker_df["symbol"].iloc[0]
+                # Get the marker size
+                marker_size = group_df["size"].iloc[0]
+                marker_size = marker_size if marker_size else 25
 
-            # Get the marker size
-            marker_size = marker_df["size"].iloc[0]
-            marker_size = marker_size if marker_size else 25
+                # If color is not set, set it to white
+                group_df.loc[:, "color"] = group_df["color"].fillna("white")
 
-            # If color is not set, set it to black
-            marker_df.loc[:, "color"] = marker_df["color"].fillna("white")
+                # Determine which subplot to use
+                row = plot_names.index(plot_name) + 1
 
-            # Create a new trace for this marker name
-            fig.add_trace(
-                go.Scatter(
-                    x=marker_df["datetime"],
-                    y=marker_df["value"],
-                    mode="markers",
-                    name=marker_name,
-                    marker_color=marker_df["color"],
-                    marker_size=marker_size,
-                    marker_symbol=marker_symbol,
-                    hovertemplate=f"{marker_name}<br>%{{text}}<br>%{{x|%b %d %Y %I:%M:%S %p}}<extra></extra>",
-                    text=marker_df["detail_text"],
+                # Create a new trace for this marker name
+                fig.add_trace(
+                    go.Scatter(
+                        x=group_df["datetime"],
+                        y=group_df["value"],
+                        mode="markers",
+                        name=marker_name,
+                        marker_color=group_df["color"],
+                        marker_size=marker_size,
+                        marker_symbol=marker_symbol,
+                        hovertemplate=f"{marker_name}<br>%{{text}}<br>%{{x|%b %d %Y %I:%M:%S %p}}<extra></extra>",
+                        text=group_df["detail_text"],
+                    ),
+                    row=row,
+                    col=1
                 )
-            )
 
         has_chart_data = True
 
@@ -292,29 +336,32 @@ def plot_indicators(
 
     # Plot the chart lines
     if chart_lines_df is not None and not chart_lines_df.empty:
-        chart_lines_df = chart_lines_df.copy()
         chart_lines_df["detail_text"] = chart_lines_df.apply(generate_line_plotly_text, axis=1)
 
-        # Loop over the line names and create a new trace for each one
-        for line_name in chart_lines_df["name"].unique():
-            # Get the line data for this line name
-            line_df = chart_lines_df.loc[chart_lines_df["name"] == line_name]
+        # Group by plot_name first, then by name
+        for plot_name, plot_df in chart_lines_df.groupby("plot_name"):
+            # Loop over the line names for this plot_name
+            for line_name, group_df in plot_df.groupby("name"):
+                # Get the color for this line name
+                color = group_df["color"].iloc[0]
 
-            # Get the color for this line name
-            color = line_df["color"].iloc[0]
+                # Determine which subplot to use
+                row = plot_names.index(plot_name) + 1
 
-            # Create a new trace for this line name
-            fig.add_trace(
-                go.Scatter(
-                    x=line_df["datetime"],
-                    y=line_df["value"],
-                    mode="lines",
-                    name=line_name,
-                    line_color=color,
-                    hovertemplate=f"{line_name}<br>%{{text}}<br>%{{x|%b %d %Y %I:%M:%S %p}}<extra></extra>",
-                    text=line_df["detail_text"],
+                # Create a new trace for this line name
+                fig.add_trace(
+                    go.Scatter(
+                        x=group_df["datetime"],
+                        y=group_df["value"],
+                        mode="lines",
+                        name=line_name,
+                        line_color=color,
+                        hovertemplate=f"{line_name}<br>%{{text}}<br>%{{x|%b %d %Y %I:%M:%S %p}}<extra></extra>",
+                        text=group_df["detail_text"],
+                    ),
+                    row=row,
+                    col=1
                 )
-            )
 
         has_chart_data = True
 
@@ -324,32 +371,55 @@ def plot_indicators(
 
     if has_chart_data:
         # Set title and layout
+        # Calculate height based on number of subplots
+        # 400px per subplot
+        height = max(800, num_subplots * 400)
+
         fig.update_layout(
             title_text=f"Indicators for {strategy_name}",
             title_font_size=30,
             template="plotly_dark",
-            xaxis_rangeselector_font_color="black",
-            xaxis_rangeselector_activecolor="grey",
-            xaxis_rangeselector_bgcolor="white",
+            height=height,  # Dynamic height based on number of subplots
+            margin=dict(t=150)  # Add more space between title and first subplot
         )
 
-        # Set y-axes titles
-        fig.update_yaxes(title_text="Axis 1", secondary_y=False)
-        fig.update_yaxes(title_text="Axis 2", secondary_y=True)
-        fig.update_xaxes(
-            rangeslider_visible=True,
-            rangeselector=dict(
-                buttons=list(
-                    [
-                        dict(count=1, label="1m", step="month", stepmode="backward"),
-                        dict(count=6, label="6m", step="month", stepmode="backward"),
-                        dict(count=1, label="YTD", step="year", stepmode="todate"),
-                        dict(count=1, label="1y", step="year", stepmode="backward"),
-                        dict(step="all"),
-                    ]
-                )
-            ),
-        )
+        # Range selector buttons
+        rangeselector_buttons = list([
+            dict(count=1, label="1m", step="month", stepmode="backward"),
+            dict(count=6, label="6m", step="month", stepmode="backward"),
+            dict(count=1, label="YTD", step="year", stepmode="todate"),
+            dict(count=1, label="1y", step="year", stepmode="backward"),
+            dict(step="all"),
+        ])
+
+        # Update axes for all subplots
+        for i in range(1, num_subplots + 1):
+            # Get the plot name for this subplot
+            plot_title = plot_names[i - 1]
+
+            # Set y-axes titles for each subplot
+            fig.update_yaxes(
+                title_text=plot_title,
+                secondary_y=False,
+                row=i,
+                col=1
+            )
+
+            # Add range selector and range slider to each subplot
+            fig.update_xaxes(
+                rangeselector=dict(
+                    buttons=rangeselector_buttons,
+                    font=dict(color="black"),
+                    activecolor="grey",
+                    bgcolor="white",
+                ),
+                rangeslider=dict(
+                    visible=True,
+                    thickness=0.02  # Make the range slider height shorter to make line graph appear taller
+                ),
+                row=i,
+                col=1
+            )
 
         # Create graph
         fig.write_html(plot_file_html, auto_open=show_indicators)
@@ -357,8 +427,31 @@ def plot_indicators(
         # Get the file name for the CSV file by removing the .html extension and adding .csv
         csv_file = plot_file_html.replace(".html", ".csv")
 
-        # Export chart markers and lines to CSV
-        chart_markers_df.to_csv(csv_file, mode="a")
+        # Export chart markers and lines to CSV - combine them and sort by datetime
+        if chart_markers_df is not None and not chart_markers_df.empty and chart_lines_df is not None and not chart_lines_df.empty:
+            # Add type column to both dataframes
+            chart_markers_df = chart_markers_df.copy()
+            chart_markers_df["type"] = "marker"
+
+            chart_lines_df = chart_lines_df.copy()
+            chart_lines_df["type"] = "line"
+
+            # Both markers and lines exist - combine them and sort by datetime
+            combined_df = pd.concat([chart_markers_df, chart_lines_df], ignore_index=True)
+            combined_df = combined_df.sort_values(by="datetime")
+            combined_df.to_csv(csv_file, index=False)
+        elif chart_markers_df is not None and not chart_markers_df.empty:
+            # Only markers exist
+            chart_markers_df = chart_markers_df.copy()
+            chart_markers_df["type"] = "marker"
+            chart_markers_df = chart_markers_df.sort_values(by="datetime")
+            chart_markers_df.to_csv(csv_file, index=False)
+        elif chart_lines_df is not None and not chart_lines_df.empty:
+            # Only lines exist
+            chart_lines_df = chart_lines_df.copy()
+            chart_lines_df["type"] = "line"
+            chart_lines_df = chart_lines_df.sort_values(by="datetime")
+            chart_lines_df.to_csv(csv_file, index=False)
 
 
 def plot_returns(
@@ -375,10 +468,37 @@ def plot_returns(
 ):
     # If show plot is False, then we don't want to open the plot in the browser
     if not show_plot:
-        logging.info("show_plot is False, not creating the plot file.")
+        logger.info("show_plot is False, not creating the plot file or CSV.")
         return
 
-    logging.info("\nCreating trades plot...")
+    logger.info("\nCreating trades plot and CSV...")
+
+    # --- Start: CSV Generation for trades_df ---
+    trades_csv_file = plot_file_html.replace(".html", ".csv")
+    # Define standard columns for trades data
+    standard_trade_columns = [
+        "time", "side", "status", "filled_quantity", "symbol", "asset.asset_type",
+        "asset.right", "asset.strike", "asset.expiration", "price", "type",
+        "asset.multiplier", "trade_cost"
+    ]
+
+    if trades_df is None or trades_df.empty:
+        logger.info(f"No trades provided. Empty trades CSV file will be created: {trades_csv_file}")
+        # Create an empty DataFrame with standard headers for the CSV
+        empty_trades_for_csv = pd.DataFrame(columns=standard_trade_columns)
+        empty_trades_for_csv.to_csv(trades_csv_file, index=False)
+    else:
+        # Prepare a copy of trades_df for CSV export, ensuring standard columns
+        trades_df_for_csv = trades_df.copy()
+        # Add any missing standard columns (filled with NA)
+        for col in standard_trade_columns:
+            if col not in trades_df_for_csv.columns:
+                trades_df_for_csv[col] = pd.NA
+        # Select and reorder to standard columns, dropping any non-standard ones
+        trades_df_for_csv = trades_df_for_csv[standard_trade_columns]
+        trades_df_for_csv.to_csv(trades_csv_file, index=False)
+        logger.info(f"Trades data saved to CSV: {trades_csv_file}")
+    # --- End: CSV Generation for trades_df ---
 
     dfs_concat = []
 
@@ -415,12 +535,45 @@ def plot_returns(
     df_final["High"] = benchmark_df["high"] * high_ratio
     df_final["Low"] = benchmark_df["low"] * low_ratio
 
+    # Prepare trades data for merging into df_final for the plot
+    # `processed_trades_for_merge` will be indexed by 'time' and contain standard trade columns (excluding 'time')
     if trades_df is None or trades_df.empty:
-        logging.info("There were no trades in this backtest.")
-        return
+        logger.info("There were no trades in this backtest. Plot will not show trade markers.")
+        # Create a DataFrame with standard trade columns (all NaN) and df_final's index (if any)
+        # This ensures df_final gets all standard trade columns for consistent plotting.
+        _columns_for_merge = [col for col in standard_trade_columns if col != "time"]
+        if not df_final.index.empty:
+            processed_trades_for_merge = pd.DataFrame(index=df_final.index, columns=_columns_for_merge)
+        else: # df_final is empty, create an empty df with columns and time index
+            processed_trades_for_merge = pd.DataFrame(columns=_columns_for_merge)
+            processed_trades_for_merge.index = pd.to_datetime(processed_trades_for_merge.index) # ensure datetimeindex
+        processed_trades_for_merge.index.name = "time"
     else:
-        trades_df = trades_df.set_index("time")
-        df_final = df_final.merge(trades_df, how="outer", left_index=True, right_index=True)
+        # We have trades, prepare a copy
+        processed_trades_for_merge = trades_df.copy()
+        if 'time' in processed_trades_for_merge.columns:
+            processed_trades_for_merge['time'] = pd.to_datetime(processed_trades_for_merge['time'])
+            processed_trades_for_merge = processed_trades_for_merge.set_index('time')
+            
+            # Ensure all standard columns (excluding 'time') are present, filling missing ones with NA
+            _columns_to_ensure_in_merge = [col for col in standard_trade_columns if col != "time"]
+            for col in _columns_to_ensure_in_merge:
+                if col not in processed_trades_for_merge.columns:
+                    processed_trades_for_merge[col] = pd.NA
+            # Select only the standard columns for merging
+            processed_trades_for_merge = processed_trades_for_merge[[col for col in _columns_to_ensure_in_merge if col in processed_trades_for_merge.columns]]
+        else:
+            logger.warning("Trades data provided but 'time' column is missing. Cannot merge trades for plotting. Plot will not show trade markers.")
+            # Fallback to empty trades for merge to avoid errors and ensure consistent columns in df_final
+            _columns_for_merge = [col for col in standard_trade_columns if col != "time"]
+            if not df_final.index.empty:
+                processed_trades_for_merge = pd.DataFrame(index=df_final.index, columns=_columns_for_merge)
+            else:
+                processed_trades_for_merge = pd.DataFrame(columns=_columns_for_merge)
+                processed_trades_for_merge.index = pd.to_datetime(processed_trades_for_merge.index)
+            processed_trades_for_merge.index.name = "time"
+
+    df_final = df_final.merge(processed_trades_for_merge, how="outer", left_index=True, right_index=True)
 
     # Fix for minute timeframe backtests plotting
     # Converted to DatetimeIndex because index becomes Index type and UTC timezone in pd.concat
@@ -692,14 +845,14 @@ def create_tearsheet(
     # If show tearsheet is False, then we don't want to open the tearsheet in the browser
     # IMS create the tearsheet even if we are not showinbg it
     if not save_tearsheet:
-        logging.info("save_tearsheet is False, not creating the tearsheet file.")
+        logger.info("save_tearsheet is False, not creating the tearsheet file.")
         return
 
-    logging.info("\nCreating tearsheet...")
+    logger.info("\nCreating tearsheet...")
 
     # Check if df1 or df2 are empty and return if they are
     if strategy_df is None or benchmark_df is None or strategy_df.empty or benchmark_df.empty:
-        logging.error("No data to create tearsheet, skipping")
+        logger.error("No data to create tearsheet, skipping")
         return
 
     _strategy_df = strategy_df.copy()
@@ -733,7 +886,7 @@ def create_tearsheet(
 
     # Check if df_final is empty and return if it is
     if df_final.empty or df_final["benchmark"].isnull().all() or df_final["strategy"].isnull().all():
-        logging.warning("No data to create tearsheet, skipping")
+        logger.warning("No data to create tearsheet, skipping")
         return
 
     # Uncomment for debugging
@@ -744,17 +897,18 @@ def create_tearsheet(
 
     bm_text = f"Compared to {benchmark_asset}" if benchmark_asset else ""
     title = f"{strat_name} {bm_text}"
-
+    
+    '''
     # Check if all the values are equal to 0
     if df_final["benchmark"].sum() == 0:
-        logging.error("Not enough data to create a tearsheet, at least 2 days of data are required. Skipping")
+        logger.error("Not enough data to create a tearsheet, at least 2 days of data are required. Skipping")
         return
 
     # Check if all the values are equal to 0
     if df_final["strategy"].sum() == 0:
-        logging.error("Not enough data to create a tearsheet, at least 2 days of data are required. Skipping")
+        logger.error("Not enough data to create a tearsheet, at least 2 days of data are required. Skipping")
         return
-
+    '''
     # Set the name of the benchmark column so that quantstats can use it in the report
     df_final["benchmark"].name = str(benchmark_asset)
 
@@ -781,7 +935,7 @@ def get_risk_free_rate(dt: datetime = None):
     try:
         result = yh.get_risk_free_rate(dt=dt)
     except Exception as e:
-        logging.error(f"Error getting the risk free rate: {e}")
+        logger.error(f"Error getting the risk free rate: {e}")
         result = 0
 
     return result

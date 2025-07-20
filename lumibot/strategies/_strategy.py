@@ -1,8 +1,10 @@
 import datetime
 import logging
+from typing import Union, List, Dict
+
 from termcolor import colored
-from asyncio.log import logger
 from decimal import Decimal
+from lumibot.tools.lumibot_logger import get_logger, get_strategy_logger
 import os
 import string
 import random
@@ -10,7 +12,6 @@ import traceback
 import math
 import time
 from sqlalchemy.exc import OperationalError
-import pytz
 import requests
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -23,14 +24,8 @@ from sqlalchemy import create_engine, inspect, text
 import pandas as pd
 
 from lumibot import LUMIBOT_DEFAULT_PYTZ
-
-from ..entities import Data
-
-from ..backtesting import (BacktestingBroker,
-                           PolygonDataBacktesting,
-                           AlpacaDataBacktesting,
-                           ThetaDataBacktesting)
-from ..entities import Asset, Position, Order, Bars
+from ..backtesting import BacktestingBroker, PolygonDataBacktesting, ThetaDataBacktesting, AlpacaBacktesting, InteractiveBrokersRESTBacktesting
+from ..entities import Asset, Position, Order, Data, Bars
 from ..tools import (
     create_tearsheet,
     day_deduplicate,
@@ -45,7 +40,8 @@ from .strategy_executor import StrategyExecutor
 from ..credentials import (
     THETADATA_CONFIG, 
     STRATEGY_NAME, 
-    BROKER, 
+    BROKER,
+    DATA_SOURCE,
     POLYGON_API_KEY, 
     DISCORD_WEBHOOK_URL, 
     DB_CONNECTION_STR,
@@ -62,6 +58,10 @@ from ..credentials import (
     ALPACA_CONFIG,
     BACKTESTING_START,
     BACKTESTING_END,
+    LOG_BACKTEST_PROGRESS_TO_FILE,
+    INTERACTIVE_BROKERS_REST_CONFIG,
+    BACKTESTING_SHOW_PROGRESS_BAR,
+    BACKTESTING_QUIET_LOGS
 )
 # Set the stats table name for when storing stats in a database, defined by db_connection_str
 STATS_TABLE_NAME = "strategy_tracker"
@@ -94,17 +94,6 @@ class SafeJSONEncoder(json.JSONEncoder):
             
         return super().default(obj)
 
-class CustomLoggerAdapter(logging.LoggerAdapter):
-    def __init__(self, logger, extra):
-        super().__init__(logger, extra)
-        self.prefix = f'[{self.extra["strategy_name"]}] '
-
-    def process(self, msg, kwargs):
-        try:
-            return self.prefix + msg, kwargs
-        except Exception as e:
-            return msg, kwargs
-
 class Vars:
     def __init__(self):
         super().__setattr__('_vars_dict', {})
@@ -121,6 +110,10 @@ class Vars:
     def set(self, name, value):
         self._vars_dict[name] = value
 
+    def get(self, name, default=None):
+        """Gets the value of a variable, returning a default value if it doesn't exist."""
+        return self._vars_dict.get(name, default)
+
     def all(self):
         return self._vars_dict.copy()
 
@@ -132,13 +125,15 @@ class _Strategy:
     def __init__(
         self,
         broker=None,
+        data_source=None,
         minutes_before_closing=1,
         minutes_before_opening=60,
         minutes_after_closing=0,
         sleeptime="1M",
         stats_file=None,
         risk_free_rate=None,
-        benchmark_asset="SPY",
+        benchmark_asset: str | Asset | None = "SPY",
+        analyze_backtest: bool = True,
         backtesting_start=None,
         backtesting_end=None,
         quote_asset=Asset(symbol="USD", asset_type="forex"),
@@ -169,7 +164,7 @@ class _Strategy:
         broker : Broker
             The broker to use for the strategy. Required. For backtesting, use the BacktestingBroker class.
         data_source : DataSource
-            The data source to use for the strategy. Required.
+            The data source to use for the strategy. If not specified, uses the broker's default data source.
         minutes_before_closing : int
             The number of minutes before closing that the before_market_closes lifecycle method will be called and the
             strategy will be stopped.
@@ -183,9 +178,11 @@ class _Strategy:
             The file name to save the stats to.
         risk_free_rate : float
             The risk-free rate to use for calculating the Sharpe ratio.
-        benchmark_asset : Asset or str
+        benchmark_asset : Asset or str or None
             The asset to use as the benchmark for the strategy. Defaults to "SPY". Strings are converted to
-            Asset objects with an asset_type="stock".
+            Asset objects with an asset_type="stock". None, means don't benchmark the strategy.
+        analyze_backtest: bool
+            Run the backtest_analysis function at the end.
         backtesting_start : datetime.datetime
             The date and time to start backtesting from. Required for backtesting.
         backtesting_end : datetime.datetime
@@ -262,7 +259,6 @@ class _Strategy:
         self.backtest_end = backtesting_end
 
         # initialize cash variables
-        self._cash = None
         self._position_value = None
         self._portfolio_value = None
 
@@ -277,13 +273,29 @@ class _Strategy:
 
         # Create an adapter with 'strategy_name' set to the instance's name
         if not hasattr(self, "logger") or self.logger is None:
-            self.logger = CustomLoggerAdapter(logger, {'strategy_name': self._name})
+            self.logger = get_strategy_logger(__name__, self._name)
 
         # Set the log level to INFO so that all logs INFO and above are displayed
         self.logger.setLevel(logging.INFO)
         
+        # Track which assets we've logged "Getting historical prices" for to reduce noise
+        self._logged_get_historical_prices_assets = set()
+        
         if self.broker == None:
             self.broker = BROKER
+
+        # Handle data source initialization
+        self._data_source = data_source
+        if self._data_source is None:
+            self._data_source = DATA_SOURCE
+            
+        # If we have a custom data source, attach it to the broker
+        if self._data_source is not None and self.broker is not None:
+            # Store the original data source for reference
+            self._original_broker_data_source = self.broker.data_source
+            
+            # Set the custom data source
+            self.broker.data_source = self._data_source
 
         self.hide_positions = HIDE_POSITIONS
         self.hide_trades = HIDE_TRADES
@@ -301,7 +313,7 @@ class _Strategy:
         
         if account_history_db_connection_str: 
             self.db_connection_str = account_history_db_connection_str  
-            logging.warning("account_history_db_connection_str is deprecated and will be removed in future versions, please use db_connection_str instead") 
+            get_logger(__name__).warning("account_history_db_connection_str is deprecated and will be removed in future versions, please use db_connection_str instead") 
         elif db_connection_str:
             self.db_connection_str = db_connection_str
         else:
@@ -321,7 +333,7 @@ class _Strategy:
         else:
             self.strategy_id = strategy_id
 
-        self._quote_asset = quote_asset
+        self._quote_asset = quote_asset if self.broker.name != "bitunix" else Asset("USDT", Asset.AssetType.CRYPTO)
 
         # Check if self.broker is set
         if self.broker is None:
@@ -341,6 +353,7 @@ class _Strategy:
             self.is_backtesting = self.broker.IS_BACKTESTING_BROKER
 
         self._benchmark_asset = benchmark_asset
+        self._analyze_backtest = analyze_backtest
 
         # Get the backtesting start and end dates from the broker data source if we are backtesting
         if self.is_backtesting:
@@ -390,20 +403,18 @@ class _Strategy:
             # Set initial positions if live trading.
             self.broker._set_initial_positions(self)
         else:
-            if budget is None:
-                if self.cash is None:
-                    # Default to $100,000 if no budget is set.
-                    budget = 100000
-                    self._set_cash_position(budget)
-                else:
-                    budget = self.cash
-            else:
-                self._set_cash_position(budget)
+            # If budget is not provided to run_backtest, default it
+            effective_budget = budget
+            if effective_budget is None:
+                effective_budget = 100000  # Default budget
+            
+            self._set_cash_position(effective_budget)
+            self._initial_budget = effective_budget # Store the budget used
 
-            # #############################################
             # ## TODO: Should all this just use _update_portfolio_value()?
             # ## START
-            self._portfolio_value = self.cash
+            # Portfolio value should start with the cash set by the budget
+            self._portfolio_value = self.cash # Calls property, should reflect effective_budget now
 
             store_assets = list(self.broker.data_source._data_store.keys())
             if len(store_assets) > 0:
@@ -426,7 +437,6 @@ class _Strategy:
             # END
             ##############################################
 
-        self._initial_budget = budget
         self._minutes_before_closing = minutes_before_closing
         self._minutes_before_opening = minutes_before_opening
         self._minutes_after_closing = minutes_after_closing
@@ -515,7 +525,14 @@ class _Strategy:
                 f"Order must be an Order object. You entered {order}."
             )
             return False
-        
+
+        # Check if the order quantity is None
+        if order.quantity is None:
+            self.logger.error(
+                f"Order quantity cannot be None. Please provide a valid quantity value."
+            )
+            return False
+
         # Check if the order does not have a quantity of zero
         if order.quantity == 0:
             self.logger.error(
@@ -604,11 +621,12 @@ class _Strategy:
                 return False
 
             if broker_balances is not None:
-                (
-                    self._cash,
-                    self._position_value,
-                    self._portfolio_value,
-                ) = broker_balances
+                cash, position_value, portfolio_value = broker_balances
+                
+                # Update cash position instead of setting _cash directly
+                self._set_cash_position(cash)
+                self._position_value = position_value
+                self._portfolio_value = portfolio_value
 
                 self.last_broker_balances_update = datetime.datetime.now()
                 return True
@@ -709,27 +727,35 @@ class _Strategy:
                     multiplier = 1
                 else:
                     multiplier = asset.multiplier if asset.asset_type in ["option", "future"] else 1
-                portfolio_value += float(quantity) * price * multiplier
+                portfolio_value += float(quantity) * float(price) * multiplier
             self._portfolio_value = portfolio_value
         return portfolio_value
 
     def _update_cash(self, side, quantity, price, multiplier):
         """update the self.cash"""
         with self._executor.lock:
-            cash = self.cash
-            if cash is None:
-                cash = 0
+            cash_val = self.cash # Calls property
+            if cash_val is None: # Handle if property somehow still returns None despite the fix in its getter
+                # self.logger.warning("_update_cash: self.cash (property) returned None. Defaulting to 0.0 for calculation.")
+                cash_val = 0.0
+            
+            current_cash = Decimal(str(cash_val)) # Convert to Decimal robustly
+
+            # Ensure all operands are Decimal for precision
+            quantity_dec = Decimal(str(quantity))
+            price_dec = Decimal(str(price))
+            multiplier_dec = Decimal(str(multiplier))
 
             if side == "buy":
-                cash -= float(quantity) * price * multiplier
+                current_cash -= quantity_dec * price_dec * multiplier_dec
             if side == "sell":
-                cash += float(quantity) * price * multiplier
+                current_cash += quantity_dec * price_dec * multiplier_dec
 
-            self._set_cash_position(cash)
+            self._set_cash_position(float(current_cash)) # _set_cash_position expects float
 
             # Todo also update the cash asset in positions?
 
-            return self.cash
+            return self.cash # Return the updated cash by calling the property again
 
     def _update_cash_with_dividends(self):
         with self._executor.lock:
@@ -761,12 +787,13 @@ class _Strategy:
         self._stats = pd.DataFrame(self._stats_list)
         if "datetime" in self._stats.columns:
             self._stats = self._stats.set_index("datetime")
+            self._stats = self._stats.sort_index()
         self._stats["return"] = self._stats["portfolio_value"].pct_change()
 
         return self._stats
 
     def _dump_stats(self):
-        logger = logging.getLogger()
+        logger = get_logger(__name__)
         current_level = logging.getLevelName(logger.level)
         for handler in logger.handlers:
             if handler.__class__.__name__ == "StreamHandler":
@@ -798,7 +825,7 @@ class _Strategy:
         logger.setLevel(current_level)
 
     def _dump_benchmark_stats(self):
-        if not self.is_backtesting:
+        if not self.is_backtesting or not self._benchmark_asset:
             return
         if self._backtesting_start is not None and self._backtesting_end is not None:
             # Need to adjust the backtesting end date because the data from Yahoo
@@ -806,8 +833,8 @@ class _Strategy:
             # for other timeframes as well
             backtesting_end_adjusted = self._backtesting_end
 
-            # If we are using the polygon data source, then get the benchmark returns from polygon
-            if type(self.broker.data_source) in (PolygonDataBacktesting, AlpacaDataBacktesting):
+            # If we are using the polgon data source, then get the benchmark returns from polygon
+            if type(self.broker.data_source) == PolygonDataBacktesting:
                 benchmark_asset = self._benchmark_asset
                 # If the benchmark asset is a string, then convert it to an Asset object
                 if isinstance(benchmark_asset, str):
@@ -826,7 +853,6 @@ class _Strategy:
                     start_date=self._backtesting_start,
                     end_date=backtesting_end_adjusted,
                     quote=self._quote_asset,
-                    is_benchmark_asset=True
                 )
     
                 if isinstance(bars, (Data, Bars)):
@@ -871,6 +897,21 @@ class _Strategy:
                 # Add the symbol_cumprod column
                 df["symbol_cumprod"] = (1 + df["return"]).cumprod()
 
+                self._benchmark_returns_df = df
+
+            elif type(self.broker.data_source) == AlpacaBacktesting:
+                benchmark_asset = self._benchmark_asset
+
+                df = self.broker.data_source.get_historical_prices_between_dates(
+                    base_asset=benchmark_asset
+                )
+
+                if df is None or df.empty:
+                    self.logger.error(f"Couldn't get_historical_prices_between_dates: {benchmark_asset}")
+                    return
+                df = df.loc[self._backtesting_start:self._backtesting_end].copy()
+                df["return"] = df["close"].pct_change(fill_method=None)
+                df["symbol_cumprod"] = (1 + df["return"]).cumprod()
                 self._benchmark_returns_df = df
 
             # If we are using any other data source, then get the benchmark returns from yahoo
@@ -971,11 +1012,12 @@ class _Strategy:
         auto_adjust = False,
         name = None,
         budget = None,
-        benchmark_asset = "SPY",
+        benchmark_asset: str | Asset | None="SPY",
+        analyze_backtest: bool = True,
         plot_file_html = None,
         trades_file = None,
         settings_file = None,
-        pandas_data = None,
+        pandas_data: Union[List, Dict[Asset, Data]] = None,
         quote_asset = Asset(symbol="USD", asset_type="forex"),
         starting_positions = None,
         show_plot = None,
@@ -997,6 +1039,7 @@ class _Strategy:
         quiet_logs = False,
         trader_class = Trader,
         include_cash_positions=False,
+        save_stats_file = True,
         **kwargs,
     ):
         """Backtest a strategy.
@@ -1030,9 +1073,11 @@ class _Strategy:
             The name of the strategy.
         budget : float
             The initial budget to use for the backtest.
-        benchmark_asset : str or Asset
+        benchmark_asset : str or Asset or None
             The benchmark asset to use for the backtest to compare to. If it is a string then it will be converted
-            to a stock Asset object.
+            to a stock Asset object. If it is None, no benchmarking will occur.
+        analyze_backtest: bool = True
+            Run the backtest_analysis method on the strategy.
         plot_file_html : str
             The file to write the plot html to.
         trades_file : str
@@ -1120,32 +1165,39 @@ class _Strategy:
             name = self.__name__
 
         self._name = name
+        self._analyze_backtest = analyze_backtest
 
-        # If backtesting_start is None, then check the BACKTESTING_START environment variable
-        if backtesting_start is None and BACKTESTING_START is not None:
+        # Set backtesting_start: priority 1 - BACKTESTING_START env var, 2 - passed argument, 3 - default to 1 year ago
+        if BACKTESTING_START is not None:
             backtesting_start = BACKTESTING_START
-        # If backtesting_start is None, and BACKTESTING_START is not set, then set it to one year ago by default
-        elif backtesting_start is None:
+        elif backtesting_start is not None:
+            pass
+        else:
             backtesting_start = datetime.datetime.now() - datetime.timedelta(days=365)
-            # Warn the user that the backtesting_start is set to one year ago
-            logging.warning(
-                colored(f"backtesting_start is set to one year ago by default. You can set it to a specific date by passing in the backtesting_start parameter or by setting the BACKTESTING_START environment variable.", "yellow")
+            get_logger(__name__).warning(
+            colored(
+                "backtesting_start is set to one year ago by default. You can set it to a specific date by passing in the backtesting_start parameter or by setting the BACKTESTING_START environment variable.",
+                "yellow"
+            )
             )
 
-        # If backtesting_end is None, then check the BACKTESTING_END environment variable
-        if backtesting_end is None and BACKTESTING_END is not None:
+        # Set backtesting_end: priority 1 - BACKTESTING_END env var, 2 - passed argument, 3 - default to yesterday
+        if BACKTESTING_END is not None:
             backtesting_end = BACKTESTING_END
-        # If backtesting_end is None, and BACKTESTING_END is not set, then set it to the current date minus one day by default
-        elif backtesting_end is None:
+        elif backtesting_end is not None:
+            pass
+        else:
             backtesting_end = datetime.datetime.now() - datetime.timedelta(days=1)
-            # Warn the user that the backtesting_end is set to the current date
-            logging.warning(
-                colored(f"backtesting_end is set to the current date by default. You can set it to a specific date by passing in the backtesting_end parameter or by setting the BACKTESTING_END environment variable.", "yellow")
+            get_logger(__name__).warning(
+            colored(
+                "backtesting_end is set to the current date by default. You can set it to a specific date by passing in the backtesting_end parameter or by setting the BACKTESTING_END environment variable.",
+                "yellow"
+            )
             )
 
         # Create an adapter with 'strategy_name' set to the instance's name
         if not hasattr(self, "logger") or self.logger is None:
-            self.logger = CustomLoggerAdapter(logger, {'strategy_name': self._name})
+            self.logger = get_strategy_logger(__name__, self._name)
 
         # If show_plot is None, then set it to True
         if show_plot is None:
@@ -1181,7 +1233,7 @@ class _Strategy:
         logdir = "logs"
         if logfile is None and save_logfile:
             logfile = f"{logdir}/{base_filename}_logs.csv"
-        if stats_file is None:
+        if stats_file is None and save_stats_file:
             stats_file = f"{logdir}/{base_filename}_stats.csv"
 
         # #############################################
@@ -1209,10 +1261,10 @@ class _Strategy:
 
         alpaca_api_key = kwargs.get('alpaca_api_key', None) if kwargs.get('alpaca_api_key', None) is not None else ALPACA_CONFIG["API_KEY"]
         alpaca_secret_key = kwargs.get('alpaca_secret_key', None) if kwargs.get('alpaca_secret_key', None) is not None else ALPACA_CONFIG["API_SECRET"]
-        if datasource_class == AlpacaDataBacktesting and (alpaca_api_key is None and alpaca_secret_key is None):
+        if datasource_class == AlpacaBacktesting and (alpaca_api_key is None and alpaca_secret_key is None):
             raise ValueError(
                 "Please set `ALPACA_API_KEY`, `ALPACA_API_SECRET`, and `ALPACA_IS_PAPER` to your API key from alpaca.markets "
-                "as an environment variable if you are using AlpacaDataBacktesting. If you don't have one, you can get a free API key "
+                "as an environment variable if you are using AlpacaBacktesting. If you don't have one, you can get a free API key "
                 "from https://alpaca.markets/."
             )            
         # Make sure thetadata_username and thetadata_password are set if using ThetaDataBacktesting
@@ -1230,20 +1282,26 @@ class _Strategy:
                 )
 
         if not self.IS_BACKTESTABLE:
-            logging.warning(f"Strategy {name + ' ' if name is not None else ''}cannot be " f"backtested at the moment")
+            get_logger(__name__).warning(f"Strategy {name + ' ' if name is not None else ''}cannot be " f"backtested at the moment")
             return None
 
         try:
             backtesting_start = to_datetime_aware(backtesting_start)
             backtesting_end = to_datetime_aware(backtesting_end)
         except AttributeError:
-            logging.error(
+            get_logger(__name__).error(
                 "`backtesting_start` and `backtesting_end` must be datetime objects. \n"
                 "You are receiving this error most likely because you are using \n"
                 "the original positional arguments for backtesting. \n\n"
             )
             return None
+        
+        if BACKTESTING_QUIET_LOGS is not None:
+            quiet_logs = BACKTESTING_QUIET_LOGS
 
+        if BACKTESTING_SHOW_PROGRESS_BAR is not None:
+            show_progress_bar = BACKTESTING_SHOW_PROGRESS_BAR
+        
         self._trader = trader_class(logfile=logfile, backtest=True, quiet_logs=quiet_logs)
 
         if datasource_class == PolygonDataBacktesting:
@@ -1256,9 +1314,10 @@ class _Strategy:
                 pandas_data=pandas_data,
                 show_progress_bar=show_progress_bar,
                 max_memory=POLYGON_MAX_MEMORY_BYTES,
+                log_backtest_progress_to_file=LOG_BACKTEST_PROGRESS_TO_FILE,
                 **kwargs,
             )
-        elif datasource_class == AlpacaDataBacktesting:
+        elif datasource_class == AlpacaBacktesting:
             if all(k in kwargs.keys() for k in ["alpaca_api_key", "alpaca_secret_key"]):
                 api_key = kwargs.pop('alpaca_api_key')
                 secret_key =  kwargs.pop("alpaca_secret_key")
@@ -1289,16 +1348,29 @@ class _Strategy:
                 pandas_data=pandas_data,
                 use_quote_data=use_quote_data,
                 show_progress_bar=show_progress_bar,
+                log_backtest_progress_to_file=LOG_BACKTEST_PROGRESS_TO_FILE,
+                **kwargs,
+            )
+        elif datasource_class == InteractiveBrokersRESTBacktesting:
+            data_source = datasource_class(
+                backtesting_start,
+                backtesting_end,
+                config=INTERACTIVE_BROKERS_REST_CONFIG,
+                auto_adjust=auto_adjust,
+                pandas_data=pandas_data,
+                show_progress_bar=show_progress_bar,
+                log_backtest_progress_to_file=LOG_BACKTEST_PROGRESS_TO_FILE,
                 **kwargs,
             )
         else:
             data_source = datasource_class(
-                backtesting_start,
-                backtesting_end,
+                datetime_start=backtesting_start,
+                datetime_end=backtesting_end,
                 config=config,
                 auto_adjust=auto_adjust,
                 pandas_data=pandas_data,
                 show_progress_bar=show_progress_bar,
+                log_backtest_progress_to_file=LOG_BACKTEST_PROGRESS_TO_FILE,
                 **kwargs,
             )
 
@@ -1326,6 +1398,7 @@ class _Strategy:
             risk_free_rate=risk_free_rate,
             stats_file=stats_file,
             benchmark_asset=benchmark_asset,
+            analyze_backtest=analyze_backtest,
             backtesting_start=backtesting_start,
             backtesting_end=backtesting_end,
             pandas_data=pandas_data,
@@ -1342,7 +1415,7 @@ class _Strategy:
         )
         self._trader.add_strategy(strategy)
 
-        logger.info("Starting backtest...")
+        self.logger.info("Starting backtest...")
         start = datetime.datetime.now()
 
         result = self._trader.run_all(
@@ -1357,7 +1430,7 @@ class _Strategy:
         end = datetime.datetime.now()
         backtesting_length = backtesting_end - backtesting_start
         backtesting_run_time = end - start
-        logger.info(
+        self.logger.info(
             f"Backtest took {backtesting_run_time} for a speed of {backtesting_run_time / backtesting_length:,.3f}"
         )
 
@@ -1382,9 +1455,13 @@ class _Strategy:
         settings_file=None,
         indicators_file=None,
         tearsheet_csv_file=None,
-        base_filename="",  # This is the base filename for the backtest
+        base_filename=None
     ):
-        name = self._name
+        if not self._analyze_backtest:
+            return
+
+        if not base_filename:
+            base_filename = self._name
 
         # Filename defaults
         if not logdir:
@@ -1469,6 +1546,13 @@ class _Strategy:
                 f"{backtesting_end} and {backtesting_start}"
             )
 
+        # Check that backtesting_end is not in the future
+        now = datetime.datetime.now(backtesting_end.tzinfo) if backtesting_end.tzinfo else datetime.datetime.now()
+        if backtesting_end > now:
+            raise ValueError(
+                f"`backtesting_end` cannot be in the future. You passed in {backtesting_end}, now is {now}"
+            )
+
     def send_update_to_cloud(self):
         """
         Sends an update to the LumiWealth cloud server with the current portfolio value, cash, positions, and any outstanding orders.
@@ -1543,7 +1627,7 @@ class _Strategy:
 
         # Check if the message was sent successfully
         if response.status_code == 200:
-            self.logger.info("Update sent to the cloud successfully")
+            self.logger.debug("Update sent to the cloud successfully")
             return True
         else:
             self.logger.error(
@@ -1561,7 +1645,7 @@ class _Strategy:
 
         if self.db_connection_str is None or self.db_connection_str == "":
             # Log that we are not sending the account summary to Discord
-            self.logger.info("Not sending account summary to Discord because db_connection_str is not set")
+            self.logger.debug("Not sending account summary to Discord because db_connection_str is not set")
             return False
 
         # Check if discord_webhook_url has been set, if not, return False
@@ -1838,10 +1922,12 @@ class _Strategy:
                 )
 
         # Create a message to send to Discord (round the values to 2 decimal places)
+        cash_str = f"{cash:,.2f}" if cash is not None else "N/A"
+        portfolio_value_str = f"{portfolio_value:,.2f}" if portfolio_value is not None else "N/A"
         message = f"""
                 **Update for {self._name}**
-                **Account Value:** ${portfolio_value:,.2f}
-                **Cash:** ${cash:,.2f}
+                **Account Value:** ${portfolio_value_str}
+                **Cash:** ${cash_str}
                 {returns_text}
                 **Positions:**
                 {positions_text}
@@ -2050,12 +2136,12 @@ class _Strategy:
                             })
 
                 self._last_backup_state = current_state
-                logger.info("Variables backed up successfully")
+                self.logger.info("Variables backed up successfully")
             else:
-                logger.info("No variables to back up")
+                self.logger.info("No variables to back up")
 
         except Exception as e:
-            logger.error(f"Error backing up variables to DB: {e}", exc_info=True)
+            self.logger.error(f"Error backing up variables to DB: {e}", exc_info=True)
 
     def load_variables_from_db(self):
         if self.is_backtesting:
@@ -2071,7 +2157,7 @@ class _Strategy:
             # Check if backup table exists
             inspector = inspect(self.db_engine)
             if not inspector.has_table(self.backup_table_name):
-                logger.info(f"Backup for {self._name} does not exist in the database. Not restoring")
+                self.logger.info(f"Backup for {self._name} does not exist in the database. Not restoring")
                 return
 
              # Query the latest entry from the backup table
@@ -2082,7 +2168,7 @@ class _Strategy:
             df = pd.read_sql_query(query, self.db_engine, params=params)
 
             if df.empty:
-                logger.debug("No data found in the backup") 
+                self.logger.debug("No data found in the backup") 
             else:
                 # Parse the JSON data
                 json_data = df['variables'].iloc[0]
@@ -2102,10 +2188,10 @@ class _Strategy:
                 current_state = json.dumps(self.vars.all(), sort_keys=True, cls=SafeJSONEncoder)
                 self._last_backup_state = current_state
 
-                logger.info("Variables loaded successfully from database")
+                self.logger.info("Variables loaded successfully from database")
 
         except Exception as e:
-            logger.error(f"Error loading variables from database: {e}", exc_info=True)
+            self.logger.error(f"Error loading variables from database: {e}", exc_info=True)
 
     def calculate_returns(self):
         # Check if we are in backtesting mode, if so, don't send the message
@@ -2212,6 +2298,7 @@ class _Strategy:
                 if stats_past_7_days.shape[0] > 0:
                     # Get the portfolio value 7 days ago
                     portfolio_value_7_days_ago = stats_past_7_days.iloc[0]["portfolio_value"]
+                    return_7_days = None
                     if float(portfolio_value_7_days_ago) != 0.0:
                         # Calculate the return over the past 7 days
                         return_7_days = ((portfolio_value / portfolio_value_7_days_ago) - 1) * 100
@@ -2220,7 +2307,7 @@ class _Strategy:
 
                     # If we are up more than pct_up_threshold over the past 7 days, send a message to Discord
                     PERCENT_UP_THRESHOLD = 3
-                    if return_7_days > PERCENT_UP_THRESHOLD:
+                    if return_7_days and return_7_days > PERCENT_UP_THRESHOLD:
                         # Create a message to send to Discord
                         message = f"""
                                 🚀 {self._name} is up {return_7_days:,.2f}% in 7 days.
@@ -2268,3 +2355,41 @@ class _Strategy:
 
         else:
             return "Not enough data to calculate returns", stats_df
+
+    @property
+    def cash(self):
+        """Returns the current cash. This is the money that is not used for positions or
+        orders (in other words, the money that is available to buy new assets, or cash).
+
+        This property is updated whenever a transaction was filled by the broker or when dividends
+        are paid.
+
+        Crypto currencies are a form of cash. Therefore cash will always be zero.
+
+        Returns
+        -------
+        cash : float
+            The current cash.
+
+        Example
+        -------
+        >>> # Get the current cash available in the account
+        >>> self.log_message(self.cash)
+        """
+
+        self.update_broker_balances(force_update=False)
+
+        cash_position = self.get_position(self._quote_asset)
+        quantity = cash_position.quantity if cash_position else None
+
+        # This is not really true:
+        # if quantity is None:
+        #     self._set_cash_position(0)
+        #     quantity = 0
+
+        if type(quantity) is Decimal:
+            quantity = float(quantity)
+        elif quantity is None: # Ensure we return a float if cash position doesn't exist
+            quantity = 0.0
+
+        return quantity

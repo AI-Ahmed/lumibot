@@ -289,6 +289,43 @@ Tradier is great because they can trade stocks, options, and soon futures. Tradi
      - **Set to "True"** to use the paper trading API, **set to "False"** to use the real money trading API. Defaults to True.
      - True
 
+Tradovate Configuration
+------------------------
+
+Tradovate is a futures broker that provides access to CME Group markets. **Important: Tradovate does not provide market data, so you must configure a separate data source** (such as DataBento or ProjectX). To create an account, visit the `Tradovate <https://www.tradovate.com/>`_ website.
+
+.. list-table:: Tradovate Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - TRADOVATE_USERNAME
+     - Your Tradovate username
+     - your_username
+   * - TRADOVATE_DEDICATED_PASSWORD
+     - Your dedicated API password (not your login password)
+     - your_api_password
+   * - TRADOVATE_CID
+     - Your Client ID from Tradovate API dashboard
+     - 6889
+   * - TRADOVATE_SECRET
+     - Your Secret from Tradovate API dashboard
+     - x4078409-db42-4d6a-8469-a468a8b94ok8
+   * - TRADOVATE_IS_PAPER
+     - **Set to "True"** for demo trading, **set to "False"** for live trading. Defaults to True.
+     - True
+   * - TRADOVATE_APP_ID
+     - Application identifier (optional, defaults to "Lumibot")
+     - Lumibot
+   * - TRADOVATE_APP_VERSION
+     - Application version (optional, defaults to "1.0")
+     - 1.0
+
+.. note::
+   
+   Since Tradovate doesn't provide market data, you must also configure a separate data source. Set ``TRADING_BROKER=tradovate`` and ``DATA_SOURCE`` to one of: ``databento``, ``projectx``, ``ibrest`` (Interactive Brokers REST), or ``ib`` (Interactive Brokers Legacy).
 Alpaca Configuration
 --------------------
 
@@ -323,12 +360,15 @@ Coinbase is a cryptocurrency broker that is easy to set up and operates across a
    * - **Secret**
      - **Description**
      - **Example**
-   * - COINBASE_API_KEY
-     - Your API key for Coinbase. **Required** if you are using Coinbase as your broker.
-     - STeea9fhIsznTMpIHQjUdEqOliTJ0JAvZ
-   * - COINBASE_API_SECRET
-     - Your API secret for Coinbase. **Required** if you are using Coinbase as your broker.
-     - NUzcnprsXjxxOUxRhQE5k2K1XnqLPcKH2XCUTIfkCw==
+   * - COINBASE_API_KEY_NAME
+     - Your API key name/identifier for Coinbase. **Required** if you are using Coinbase as your broker.
+     - organizations/a7df3e75-5gg5-4b0d-805c-e91c02fd63b8/apiKeys/1abb999e-8442-4607-lkc7-423eb8d478e3
+   * - COINBASE_PRIVATE_KEY
+     - Your private key for Coinbase. **Required** if you are using Coinbase as your broker.  
+     - -----BEGIN EC PRIVATE KEY-----\nPLjCAQEEIFOxfolkj7JmTkEUyctOqAq0hQt02SRBy7GnJHGQyb56jToAoGCCqGSM49\nAwEHoUQDQgAEg1VBKEVkqhy+9eHxeao7b7cMsbXXeB/Ggm2sYKEm2Ebrhq67Nobj\n5ze8ddf78UFICjOcooHovd+1oFcZZ+RLQ==\n-----END EC PRIVATE KEY-----\n"
+   * - COINBASE_API_PASSPHRASE
+     - Your API passphrase for Coinbase. **Optional** if you are using Coinbase as your broker.
+     - 123456
    * - COINBASE_IS_SANDBOX
      - **Set to "True"** to use the Coinbase sandbox (paper trading) API, **set to "False"** to use the Coinbase real money trading API. Defaults to False.
      - False
@@ -351,6 +391,107 @@ Kraken is an excellent cryptocurrency broker offering very low fees and a wide r
    * - KRAKEN_API_SECRET
      - Your API secret for Kraken. **Required** if you are using Kraken as your broker.
      - abcdef1234567890abcdef1234567890abcdef1234
+
+Kucoin Configuration
+--------------------
+
+Kucoin is a popular global cryptocurrency exchange offering a wide variety of cryptocurrencies and trading pairs. To create an account, visit the `Kucoin <https://www.kucoin.com/>`_ website.
+
+.. list-table:: Kucoin Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - KUCOIN_API_KEY
+     - Your Kucoin API key. **Required** if you are using Kucoin as your broker.
+     - 5f6a7b8c9d0e1f2a3b4c
+   * - KUCOIN_SECRET
+     - Your Kucoin secret. **Required** if you are using Kucoin as your broker.
+     - abcdef1234567890abcdef1234567890abcdef12
+   * - KUCOIN_PASSPHRASE
+     - Your Kucoin passphrase. **Required** if you are using Kucoin as your broker.
+     - mypassphrase456
+
+Binance Configuration
+---------------------
+
+Binance is the world's largest cryptocurrency exchange by trading volume, offering extensive cryptocurrency trading options. To create an account, visit the `Binance <https://www.binance.com/>`_ website.
+
+.. list-table:: Binance Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - BINANCE_API_KEY
+     - Your Binance API key. **Required** if you are using Binance as your broker.
+     - 9a8b7c6d5e4f3g2h1i0j
+   * - BINANCE_SECRET
+     - Your Binance secret key. **Required** if you are using Binance as your broker.
+     - abcdef1234567890abcdef1234567890abcdef12
+
+Bitmex Configuration
+--------------------
+
+Bitmex is a cryptocurrency derivatives exchange specializing in futures and perpetual contracts. To create an account, visit the `Bitmex <https://www.bitmex.com/>`_ website.
+
+.. list-table:: Bitmex Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - BITMEX_API_KEY
+     - Your Bitmex API key. **Required** if you are using Bitmex as your broker.
+     - 1a2b3c4d5e6f7g8h9i0j
+   * - BITMEX_SECRET
+     - Your Bitmex secret. **Required** if you are using Bitmex as your broker.
+     - abcdef1234567890abcdef1234567890abcdef12
+
+Bybit Configuration
+-------------------
+
+Bybit is a popular derivatives exchange offering futures and perpetual contracts for cryptocurrency trading. To create an account, visit the `Bybit <https://www.bybit.com/>`_ website.
+
+.. list-table:: Bybit Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - BYBIT_API_KEY
+     - Your Bybit API key. **Required** if you are using Bybit as your broker.
+     - 2b3c4d5e6f7g8h9i0j1k
+   * - BYBIT_SECRET
+     - Your Bybit secret. **Required** if you are using Bybit as your broker.
+     - abcdef1234567890abcdef1234567890abcdef12
+
+OKX Configuration
+-----------------
+
+OKX is a major global cryptocurrency exchange offering spot, futures, and options trading. To create an account, visit the `OKX <https://www.okx.com/>`_ website.
+
+.. list-table:: OKX Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - OKX_API_KEY
+     - Your OKX API key. **Required** if you are using OKX as your broker.
+     - 3c4d5e6f7g8h9i0j1k2l
+   * - OKX_SECRET
+     - Your OKX secret key. **Required** if you are using OKX as your broker.
+     - abcdef1234567890abcdef1234567890abcdef12
+   * - OKX_PASSPHRASE
+     - Your OKX passphrase. **Required** if you are using OKX as your broker.
+     - mypassphrase789
 
 Interactive Brokers Configuration
 ---------------------------------
@@ -402,6 +543,448 @@ This is the legacy version of our Interactive Brokers implementation, which uses
      - Subaccount for Interactive Brokers. **Required** if you are using Interactive Brokers as your broker.
      - Subaccount1
 
+Schwab Configuration
+--------------------
+
+Charles Schwab provides API access for automated trading and market data through its developer platform. To create an account, visit the `Charles Schwab <https://www.schwab.com/>`_ website and follow the instructions to register for a developer account at `developer.schwab.com <https://developer.schwab.com>`_.
+
+.. list-table:: Schwab Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - SCHWAB_API_KEY
+     - Your Schwab API key obtained from the developer dashboard.
+     - your_api_key_here
+   * - SCHWAB_SECRET
+     - Your Schwab API secret obtained from the developer dashboard.
+     - your_api_secret_here
+   * - SCHWAB_ACCOUNT_NUMBER
+     - Your Schwab account number used for trading.
+     - 123456789
+
+Bitunix Configuration
+---------------------
+
+Bitunix is a cryptocurrency derivatives exchange that supports perpetual futures trading. To create an account, visit the `Bitunix <https://www.bitunix.com/>`_ website.
+
+.. list-table:: Bitunix Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - BITUNIX_API_KEY
+     - Your Bitunix API key. **Required** if you are using Bitunix as your broker.
+     - your_api_key_here
+   * - BITUNIX_API_SECRET
+     - Your Bitunix API secret. **Required** if you are using Bitunix as your broker.
+     - your_api_secret_here
+
+DataBento Configuration
+-----------------------
+
+DataBento provides high-quality market data for stocks, futures, and options. This is primarily used as a data source for backtesting and live trading with futures. To create an account, visit the `DataBento <https://databento.com/>`_ website.
+
+.. list-table:: DataBento Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - DATABENTO_API_KEY
+     - Your API key from DataBento. **Required** if you are using DataBento as your data source.
+     - db-xxxxxxxxxxxxxxxxxxxxxxxx
+
+ProjectX Configuration
+----------------------
+
+ProjectX is a futures-only broker that connects to multiple prop trading firms and futures brokers. Each broker requires its own specific environment variables. Choose the section below that matches your broker.
+
+TopstepX
+^^^^^^^^
+
+.. list-table:: TopstepX Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - PROJECTX_TOPSTEPX_API_KEY
+     - Your API key from TopstepX
+     - your_api_key
+   * - PROJECTX_TOPSTEPX_USERNAME
+     - Your TopstepX username
+     - your_username
+   * - PROJECTX_TOPSTEPX_PREFERRED_ACCOUNT_NAME
+     - (Optional) Preferred account name
+     - Practice Account 1
+
+Top One Futures
+^^^^^^^^^^^^^^^
+
+.. list-table:: Top One Futures Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - PROJECTX_TOPONE_API_KEY
+     - Your API key from Top One Futures
+     - your_api_key
+   * - PROJECTX_TOPONE_USERNAME
+     - Your Top One Futures username
+     - your_username
+   * - PROJECTX_TOPONE_PREFERRED_ACCOUNT_NAME
+     - (Optional) Preferred account name
+     - Practice Account 1
+
+TickTickTrader
+^^^^^^^^^^^^^^
+
+.. list-table:: TickTickTrader Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - PROJECTX_TICKTICKTRADER_API_KEY
+     - Your API key from TickTickTrader
+     - your_api_key
+   * - PROJECTX_TICKTICKTRADER_USERNAME
+     - Your TickTickTrader username
+     - your_username
+   * - PROJECTX_TICKTICKTRADER_PREFERRED_ACCOUNT_NAME
+     - (Optional) Preferred account name
+     - Practice Account 1
+
+AlphaTicks
+^^^^^^^^^^
+
+.. list-table:: AlphaTicks Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - PROJECTX_ALPHATICKS_API_KEY
+     - Your API key from AlphaTicks
+     - your_api_key
+   * - PROJECTX_ALPHATICKS_USERNAME
+     - Your AlphaTicks username
+     - your_username
+   * - PROJECTX_ALPHATICKS_PREFERRED_ACCOUNT_NAME
+     - (Optional) Preferred account name
+     - Practice Account 1
+
+Aqua Futures
+^^^^^^^^^^^^
+
+.. list-table:: Aqua Futures Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - PROJECTX_AQUAFUTURES_API_KEY
+     - Your API key from Aqua Futures
+     - your_api_key
+   * - PROJECTX_AQUAFUTURES_USERNAME
+     - Your Aqua Futures username
+     - your_username
+   * - PROJECTX_AQUAFUTURES_PREFERRED_ACCOUNT_NAME
+     - (Optional) Preferred account name
+     - Practice Account 1
+
+Blue Guardian Futures
+^^^^^^^^^^^^^^^^^^^^^^
+
+.. list-table:: Blue Guardian Futures Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - PROJECTX_BLUEGUARDIANFUTURES_API_KEY
+     - Your API key from Blue Guardian Futures
+     - your_api_key
+   * - PROJECTX_BLUEGUARDIANFUTURES_USERNAME
+     - Your Blue Guardian Futures username
+     - your_username
+   * - PROJECTX_BLUEGUARDIANFUTURES_PREFERRED_ACCOUNT_NAME
+     - (Optional) Preferred account name
+     - Practice Account 1
+
+Blusky
+^^^^^^
+
+.. list-table:: Blusky Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - PROJECTX_BLUSKY_API_KEY
+     - Your API key from Blusky
+     - your_api_key
+   * - PROJECTX_BLUSKY_USERNAME
+     - Your Blusky username
+     - your_username
+   * - PROJECTX_BLUSKY_PREFERRED_ACCOUNT_NAME
+     - (Optional) Preferred account name
+     - Practice Account 1
+
+Bulenox
+^^^^^^^
+
+.. list-table:: Bulenox Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - PROJECTX_BULENOX_API_KEY
+     - Your API key from Bulenox
+     - your_api_key
+   * - PROJECTX_BULENOX_USERNAME
+     - Your Bulenox username
+     - your_username
+   * - PROJECTX_BULENOX_PREFERRED_ACCOUNT_NAME
+     - (Optional) Preferred account name
+     - Practice Account 1
+
+E8 Futures
+^^^^^^^^^^
+
+.. list-table:: E8 Futures Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - PROJECTX_E8X_API_KEY
+     - Your API key from E8 Futures
+     - your_api_key
+   * - PROJECTX_E8X_USERNAME
+     - Your E8 Futures username
+     - your_username
+   * - PROJECTX_E8X_PREFERRED_ACCOUNT_NAME
+     - (Optional) Preferred account name
+     - Practice Account 1
+
+Funding Futures
+^^^^^^^^^^^^^^^
+
+.. list-table:: Funding Futures Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - PROJECTX_FUNDINGFUTURES_API_KEY
+     - Your API key from Funding Futures
+     - your_api_key
+   * - PROJECTX_FUNDINGFUTURES_USERNAME
+     - Your Funding Futures username
+     - your_username
+   * - PROJECTX_FUNDINGFUTURES_PREFERRED_ACCOUNT_NAME
+     - (Optional) Preferred account name
+     - Practice Account 1
+
+The Futures Desk
+^^^^^^^^^^^^^^^^
+
+.. list-table:: The Futures Desk Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - PROJECTX_THEFUTURESDESK_API_KEY
+     - Your API key from The Futures Desk
+     - your_api_key
+   * - PROJECTX_THEFUTURESDESK_USERNAME
+     - Your Futures Desk username
+     - your_username
+   * - PROJECTX_THEFUTURESDESK_PREFERRED_ACCOUNT_NAME
+     - (Optional) Preferred account name
+     - Practice Account 1
+
+Futures Elite
+^^^^^^^^^^^^^
+
+.. list-table:: Futures Elite Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - PROJECTX_FUTURESELITE_API_KEY
+     - Your API key from Futures Elite
+     - your_api_key
+   * - PROJECTX_FUTURESELITE_USERNAME
+     - Your Futures Elite username
+     - your_username
+   * - PROJECTX_FUTURESELITE_PREFERRED_ACCOUNT_NAME
+     - (Optional) Preferred account name
+     - Practice Account 1
+
+FXIFY Futures
+^^^^^^^^^^^^^
+
+.. list-table:: FXIFY Futures Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - PROJECTX_FXIFYFUTURES_API_KEY
+     - Your API key from FXIFY Futures
+     - your_api_key
+   * - PROJECTX_FXIFYFUTURES_USERNAME
+     - Your FXIFY Futures username
+     - your_username
+   * - PROJECTX_FXIFYFUTURES_PREFERRED_ACCOUNT_NAME
+     - (Optional) Preferred account name
+     - Practice Account 1
+
+Goat Funded Futures
+^^^^^^^^^^^^^^^^^^^
+
+.. list-table:: Goat Funded Futures Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - PROJECTX_GOATFUNDEDFUTURES_API_KEY
+     - Your API key from Goat Funded Futures
+     - your_api_key
+   * - PROJECTX_GOATFUNDEDFUTURES_USERNAME
+     - Your Goat Funded Futures username
+     - your_username
+   * - PROJECTX_GOATFUNDEDFUTURES_PREFERRED_ACCOUNT_NAME
+     - (Optional) Preferred account name
+     - Practice Account 1
+
+Hola Prime
+^^^^^^^^^^
+
+.. list-table:: Hola Prime Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - PROJECTX_HOLAPRIME_API_KEY
+     - Your API key from Hola Prime
+     - your_api_key
+   * - PROJECTX_HOLAPRIME_USERNAME
+     - Your Hola Prime username
+     - your_username
+   * - PROJECTX_HOLAPRIME_PREFERRED_ACCOUNT_NAME
+     - (Optional) Preferred account name
+     - Practice Account 1
+
+Nexgen Futures
+^^^^^^^^^^^^^^
+
+.. list-table:: Nexgen Futures Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - PROJECTX_NEXGEN_API_KEY
+     - Your API key from Nexgen Futures
+     - your_api_key
+   * - PROJECTX_NEXGEN_USERNAME
+     - Your Nexgen Futures username
+     - your_username
+   * - PROJECTX_NEXGEN_PREFERRED_ACCOUNT_NAME
+     - (Optional) Preferred account name
+     - Practice Account 1
+
+TX3 Funding
+^^^^^^^^^^^
+
+.. list-table:: TX3 Funding Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - PROJECTX_TX3FUNDING_API_KEY
+     - Your API key from TX3 Funding
+     - your_api_key
+   * - PROJECTX_TX3FUNDING_USERNAME
+     - Your TX3 Funding username
+     - your_username
+   * - PROJECTX_TX3FUNDING_PREFERRED_ACCOUNT_NAME
+     - (Optional) Preferred account name
+     - Practice Account 1
+
+DayTraders
+^^^^^^^^^^
+
+.. list-table:: DayTraders Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - PROJECTX_DAYTRADERS_API_KEY
+     - Your API key from DayTraders
+     - your_api_key
+   * - PROJECTX_DAYTRADERS_USERNAME
+     - Your DayTraders username
+     - your_username
+   * - PROJECTX_DAYTRADERS_PREFERRED_ACCOUNT_NAME
+     - (Optional) Preferred account name
+     - Practice Account 1
+
+Demo/Testing
+^^^^^^^^^^^^
+
+.. list-table:: Demo Configuration
+   :widths: 25 50 25
+   :header-rows: 1
+
+   * - **Secret**
+     - **Description**
+     - **Example**
+   * - PROJECTX_DEMO_API_KEY
+     - Your API key for demo/testing
+     - your_api_key
+   * - PROJECTX_DEMO_USERNAME
+     - Your demo username
+     - your_username
+   * - PROJECTX_DEMO_PREFERRED_ACCOUNT_NAME
+     - (Optional) Preferred account name
+     - Practice Account 1
+
 General Environment Variables
 =============================
 
@@ -443,10 +1026,19 @@ In addition to broker-specific secrets, the following environment variables are 
      - My Strategy
    * - MARKET
      - **(Optional)** The market you want the bot to think it is. Eg. "24/7" will make the bot think it is trading in a 24/7 market.
-     - 24/7
+     - NYSE
    * - POLYGON_MAX_MEMORY_BYTES
      - **(Optional)** The maximum memory in bytes that the Polygon API can use. This is useful for limiting memory usage during backtesting.
      - 512000000
+   * - TRADING_BROKER
+     - **(Optional)** For live trading, specify the broker to use for executing trades. If not set, the default broker configuration will be used for both trading and data. Valid options (case insensitive): "alpaca", "tradier", "ccxt", "coinbase", "kraken", "ib" (or "interactivebrokers"), "ibrest" (or "interactivebrokersrest"), "tradovate", "schwab", "bitunix", "projectx"
+     - tradier
+   * - DATA_SOURCE
+     - **(Optional)** For live trading, specify a separate data source for market data. If not set, the same broker as trading will be used for data. This allows you to use one broker for trading and a different data provider for market data. Valid options (case insensitive): "alpaca", "tradier", "ccxt", "coinbase", "kraken", "ib" (or "interactivebrokers"), "ibrest" (or "interactivebrokersrest"), "yahoo", "schwab", "databento", "bitunix", "projectx"
+     - databento
+   * - DATA_SOURCE_DELAY
+     - **(Optional)** Sets a delay parameter to control how many minutes to delay non-crypto data for. For example, the AlpacaData source uses a 16 minute delay by default. Override this to 0 if you have the paid SIP plan with not delayed data.
+     - 0
 
 .. tip::
 

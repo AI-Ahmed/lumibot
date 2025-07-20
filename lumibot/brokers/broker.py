@@ -1,7 +1,6 @@
-import logging
+import os
 import time
 from abc import ABC, abstractmethod
-from asyncio.log import logger
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -14,25 +13,46 @@ import pandas_market_calendars as mcal
 from dateutil import tz
 from termcolor import colored
 
+from lumibot.tools.lumibot_logger import get_logger
+
+logger = get_logger(__name__)
+
+from lumibot.tools.lumibot_logger import get_logger, get_strategy_logger
 from ..data_sources import DataSource
-from ..entities import Asset, Order, Position
+from ..entities import Asset, Order, Position, Quote
 from ..trading_builtins import SafeList
 
-from ..backtesting import AlpacaDataBacktesting
+DEFAULT_CLEANUP_CONFIG = {
+    "enabled": True,
+    "cleanup_interval_iterations": 100,  # Clean up every 100 trading iterations
+    "retention_policies": {
+        "filled_orders": {
+            "max_age_days": 30,      # Keep orders for 30 days
+            "max_count": 10000,      # Keep max 10,000 orders
+            "min_keep": 100          # Always keep at least 100 recent orders
+        },
+        "canceled_orders": {
+            "max_age_days": 7,       # Keep canceled orders for 7 days
+            "max_count": 1000,       # Keep max 1,000 canceled orders  
+            "min_keep": 50           # Always keep at least 50 recent orders
+        },
+        "error_orders": {
+            "max_age_days": 30,      # Keep error orders for 30 days
+            "max_count": 1000,       # Keep max 1,000 error orders
+            "min_keep": 50           # Always keep at least 50 recent orders
+        },
+        "filled_positions": {
+            "max_age_days": 30,      # Keep positions for 30 days
+            "max_count": 5000,       # Keep max 5,000 positions
+            "min_keep": 100          # Always keep at least 100 recent positions
+        }
+    }
+}
 
-class CustomLoggerAdapter(logging.LoggerAdapter):
-    def process(self, msg, kwargs):
-        # Check if the level is enabled to avoid formatting costs if not necessary
-        if self.logger.isEnabledFor(kwargs.get('level', logging.INFO)):
-            # Lazy formatting of the message
-            return f'[{self.extra["strategy_name"]}] {msg}', kwargs
-        else:
-            return msg, kwargs
-
-    def update_strategy_name(self, new_strategy_name):
-        self.extra['strategy_name'] = new_strategy_name
-        # Pre-format part of the log message that's static or changes infrequently
-        self.formatted_prefix = f'[{new_strategy_name}]'
+# Consolidate errors from different brokers into a single class that can be easily caught even
+# if the user decides to switch brokers.
+class LumibotBrokerAPIError(Exception):
+    pass
 
 
 class Broker(ABC):
@@ -50,7 +70,7 @@ class Broker(ABC):
     PLACEHOLDER_ORDER = "placeholder"
 
     def __init__(self, name="", connect_stream=True, data_source: DataSource = None, option_source: DataSource = None,
-                 config=None, max_workers=20, extended_trading_minutes=0):
+                 config=None, max_workers=20, extended_trading_minutes=0, cleanup_config=None):
         """Broker constructor"""
         # Shared Variables between threads
         self.name = name
@@ -82,8 +102,19 @@ class Broker(ABC):
         # Set the state of first iteration to True. This will later be updated to False by the strategy executor
         self._first_iteration = True
 
+        # Initialize cleanup configuration and tracking
+        self._cleanup_config = self._initialize_cleanup_config(cleanup_config)
+        self._iteration_counter = 0
+        self._last_cleanup_time = None
+
         # Create an adapter with 'strategy_name' set to the instance's name
-        self.logger = CustomLoggerAdapter(logger, {'strategy_name': "unknown"})
+        self.logger = get_strategy_logger(__name__, "unknown")
+
+        # --- Market calendar setting ---
+        # StrategyExecutor relies on broker.market to decide whether trading is
+        # 24/7 or should follow an exchange calendar.  Derive it from config or
+        # env, else default to "NASDAQ" which is compatible with pandas-market-calendars.
+        self.market = (config.get("MARKET") if config else None) or os.environ.get("MARKET") or "NASDAQ"
 
         if self.data_source is None:
             raise ValueError("Broker must have a data source")
@@ -109,6 +140,145 @@ class Broker(ABC):
             attr = "is_paper" if "paper" in key.lower() else key.lower()
             if hasattr(self, attr):
                 setattr(self, attr, config[key])
+
+    # =================================================================================
+    # ================================ Cleanup Methods ===============================
+
+    def _initialize_cleanup_config(self, cleanup_config):
+        """Initialize cleanup configuration with defaults."""
+        if cleanup_config is None:
+            return DEFAULT_CLEANUP_CONFIG.copy()
+        
+        # Start with defaults and merge user config
+        import copy
+        config = copy.deepcopy(DEFAULT_CLEANUP_CONFIG)
+        
+        if cleanup_config:
+            # Update top-level settings
+            for key in ["enabled", "cleanup_interval_iterations"]:
+                if key in cleanup_config:
+                    config[key] = cleanup_config[key]
+            
+            # Merge retention policies
+            if "retention_policies" in cleanup_config:
+                for policy_name, policy_config in cleanup_config["retention_policies"].items():
+                    if policy_name in config["retention_policies"]:
+                        # Merge individual policy settings, preserving defaults
+                        config["retention_policies"][policy_name].update(policy_config)
+                    else:
+                        config["retention_policies"][policy_name] = policy_config
+        
+        return config
+
+    def _cleanup_old_tracking_data(self):
+        """Perform cleanup of old orders and positions based on configured policies."""
+        if not self._cleanup_config.get("enabled", True):
+            return
+            
+        current_time = self.data_source.get_datetime()
+        cleanup_stats = {}
+        
+        # Clean up each type of tracking data
+        for list_name, policy in self._cleanup_config["retention_policies"].items():
+            list_obj = getattr(self, f"_{list_name}", None)
+            if list_obj is None:
+                continue
+                
+            initial_count = len(list_obj)
+            removed_count = self._cleanup_tracking_list(list_obj, policy, current_time)
+            cleanup_stats[list_name] = {
+                "initial_count": initial_count,
+                "removed_count": removed_count, 
+                "final_count": len(list_obj)
+            }
+        
+        # Log cleanup results if any items were removed
+        if any(stats["removed_count"] > 0 for stats in cleanup_stats.values()):
+            self.logger.info(f"Memory cleanup completed: {cleanup_stats}")
+        
+        self._last_cleanup_time = current_time
+
+    def _cleanup_tracking_list(self, safe_list, policy, current_time):
+        """Clean up a specific SafeList based on retention policy."""
+        items = safe_list.get_list()
+        if len(items) <= policy.get("min_keep", 0):
+            return 0  # Don't clean up if below minimum threshold
+        
+        items_to_remove = []
+        max_age_days = policy.get("max_age_days")
+        max_count = policy.get("max_count")
+        min_keep = policy.get("min_keep", 0)
+        
+        # Sort items by age (newest first) to preserve recent items
+        sorted_items = sorted(items, key=self._get_item_timestamp, reverse=True)
+        
+        for i, item in enumerate(sorted_items):
+            should_remove = False
+            
+            # Always keep minimum number of recent items
+            if i < min_keep:
+                continue
+                
+            # Remove by age
+            if max_age_days and self._is_item_too_old(item, current_time, max_age_days):
+                should_remove = True
+                
+            # Remove by count (keep most recent)
+            if max_count and i >= max_count:
+                should_remove = True
+                
+            if should_remove:
+                items_to_remove.append(item)
+        
+        # Remove items (thread-safe)
+        for item in items_to_remove:
+            try:
+                safe_list.remove(item)
+            except ValueError:
+                # Item might have been removed by another thread
+                pass
+        
+        return len(items_to_remove)
+
+    def _get_item_timestamp(self, item):
+        """Get the timestamp to use for age-based cleanup."""
+        if hasattr(item, 'broker_update_date') and item.broker_update_date:
+            return item.broker_update_date
+        elif hasattr(item, 'broker_create_date') and item.broker_create_date:
+            return item.broker_create_date
+        elif hasattr(item, '_date_created') and item._date_created:
+            return item._date_created
+        else:
+            # Fallback to current time (won't be cleaned up)
+            return self.data_source.get_datetime()
+
+    def _is_item_too_old(self, item, current_time, max_age_days):
+        """Check if an item is too old based on retention policy."""
+        item_time = self._get_item_timestamp(item)
+        if item_time is None:
+            return False
+        
+        age_delta = current_time - item_time
+        return age_delta.days >= max_age_days
+
+    def _trigger_periodic_cleanup(self):
+        """Trigger cleanup based on iteration counter."""
+        self._iteration_counter += 1
+        cleanup_interval = self._cleanup_config.get("cleanup_interval_iterations", 100)
+        
+        if self._iteration_counter % cleanup_interval == 0:
+            try:
+                self._cleanup_old_tracking_data()
+            except Exception as e:
+                self.logger.warning(f"Memory cleanup failed: {e}")
+
+    def force_cleanup(self):
+        """Force immediate cleanup of old tracking data (for testing or manual cleanup)."""
+        try:
+            self._cleanup_old_tracking_data()
+            self.logger.info("Manual cleanup completed successfully")
+        except Exception as e:
+            self.logger.error(f"Manual cleanup failed: {e}")
 
     # =================================================================================
     # ================================ Required Implementations========================
@@ -321,7 +491,6 @@ class Broker(ABC):
 
     def get_last_price(self,
                        asset: Asset,
-                       timestep: str ="",
                        quote=None,
                        exchange=None) -> Union[float, Decimal, None]:
         """
@@ -331,8 +500,6 @@ class Broker(ABC):
         ----------
         asset : Asset
             The asset to get the price of.
-        timestep: str 
-            The time granularity (e.g., "minute").
         quote : Asset
             The quote asset to get the price of.
         exchange : str
@@ -346,23 +513,12 @@ class Broker(ABC):
         if self.option_source and asset.asset_type == "option":
             return self.option_source.get_last_price(asset, quote=quote, exchange=exchange)
         else:
-            if timestep != "" and isinstance(self.data_source, AlpacaDataBacktesting):
-                # Ensure that all objects and dataclasses have the same timestep.
-                self.data_source.MIN_TIMESTEP = timestep
-                self.data_source._timestep = timestep
-
-                return self.data_source.get_last_price(asset,
-                                                       timestep=timestep,
-                                                       quote=quote,
-                                                       exchange=exchange)
-            else:
-                return self.data_source.get_last_price(asset,
-                                                       quote=quote,
-                                                       exchange=exchange)
+            return self.data_source.get_last_price(asset,
+                                                    quote=quote,
+                                                    exchange=exchange)
 
     def get_last_prices(self,
                         assets,
-                        timestep: str="",
                         quote=None,
                         exchange=None):
         """
@@ -372,8 +528,6 @@ class Broker(ABC):
         ----------
         assets : list
             The assets to get the prices of.
-        timestep: str 
-            The time granularity (e.g., "minute").
         quote : Asset
             The quote asset to get the prices of.
         exchange : str
@@ -384,27 +538,17 @@ class Broker(ABC):
         dict
             The last known prices of the assets.
         """
-        if timestep != "" and isinstance(self.data_source, AlpacaDataBacktesting):
-            # Ensure that all objects and dataclasses have the same timestep.
-            self.data_source.MIN_TIMESTEP = timestep
-            self.data_source._timestep = timestep
-
-            return self.data_source.get_last_prices(assets,
-                                                    timestep=timestep,
-                                                    quote=quote,
-                                                    exchange=exchange)
-        else:
-            return self.data_source.get_last_prices(assets,
-                                                    quote=quote,
-                                                    exchange=exchange)
+        return self.data_source.get_last_prices(assets,
+                                                quote=quote,
+                                                exchange=exchange)
 
     # =================================================================================
     # ================================ Common functions ================================
     @property
     def _tracked_orders(self):
         return (self._unprocessed_orders.get_list() + self._new_orders.get_list() +
-                self._partially_filled_orders.get_list() + self._filled_orders.get_list() + 
-                self._error_orders.get_list() + self._canceled_orders.get_list())
+                self._partially_filled_orders.get_list() + self._filled_orders.get_list() +
+                self._error_orders.get_list() + self._canceled_orders.get_list() + self._placeholder_orders.get_list())
 
     def is_backtesting_broker(self):
         return self.IS_BACKTESTING_BROKER
@@ -616,6 +760,9 @@ class Broker(ABC):
                         )
                         self._unprocessed_orders.append(flat_order)
 
+            # Trigger periodic cleanup after processing orders
+            self._trigger_periodic_cleanup()
+
             self._orders_queue.task_done()
 
     # =========Internal functions==============
@@ -697,7 +844,7 @@ class Broker(ABC):
             self._process_crypto_quote(order, quantity, price)
 
         return position
-    
+
     def _process_error_order(self, order, error):
         self._new_orders.remove(order.identifier, key="identifier")
         self._unprocessed_orders.remove(order.identifier, key="identifier")
@@ -731,6 +878,16 @@ class Broker(ABC):
 
     def _process_crypto_quote(self, order, quantity, price):
         """Used to process the quote side of a crypto trade."""
+        # Handle cases where price might be None (can happen with some filled orders)
+        if price is None:
+            # Try to use the limit price if available, otherwise skip processing
+            if hasattr(order, 'limit_price') and order.limit_price is not None:
+                price = order.limit_price
+                logger.debug(f"Using limit_price {price} for crypto quote processing since avg_fill_price was None for order {order.identifier}")
+            else:
+                logger.debug(f"Skipping crypto quote processing for order {order.identifier} - both avg_fill_price and limit_price are None")
+                return
+
         quote_quantity = Decimal(quantity) * Decimal(price)
         if order.side == "buy":
             quote_quantity = -quote_quantity
@@ -818,13 +975,37 @@ class Broker(ABC):
         >>> self.is_market_open()
         True
         """
-        open_time = self.utc_to_local(self.market_hours(close=False))
-        close_time = self.utc_to_local(self.market_hours(close=True))
-
-        current_time = datetime.now().astimezone(tz=tz.tzlocal())
+        # Handle 24/7 markets immediately
         if self.market == "24/7":
             return True
-        return (current_time >= open_time) and (close_time >= current_time)
+            
+        current_time = datetime.now().astimezone(tz=tz.tzlocal())
+        
+        # For ANY market, check both today's and tomorrow's sessions since trading sessions 
+        # can span multiple calendar days (futures: 6pm Thu -> 6pm Fri, forex: Sun 5pm -> Fri 5pm, 
+        # crypto sessions, international markets, etc.)
+        
+        # Check today's session
+        try:
+            open_time_today = self.utc_to_local(self.market_hours(close=False, next=False))
+            close_time_today = self.utc_to_local(self.market_hours(close=True, next=False))
+            
+            if (current_time >= open_time_today) and (close_time_today >= current_time):
+                return True
+        except:
+            pass  # Today might not have a session
+        
+        # Check tomorrow's session (which might have started today)
+        try:
+            open_time_tomorrow = self.utc_to_local(self.market_hours(close=False, next=True))
+            close_time_tomorrow = self.utc_to_local(self.market_hours(close=True, next=True))
+            
+            if (current_time >= open_time_tomorrow) and (close_time_tomorrow >= current_time):
+                return True
+        except:
+            pass  # Tomorrow might not have a session
+        
+        return False
 
     def get_time_to_open(self):
         """Return the remaining time for the market to open in seconds"""
@@ -906,12 +1087,15 @@ class Broker(ABC):
 
     def get_tracked_orders(self, strategy=None, asset=None) -> list[Order]:
         """get all tracked orders for a given strategy"""
+        # Allow filtering by Strategy instance or by name
+        if strategy is not None and not isinstance(strategy, str):
+            strategy_name = getattr(strategy, "name", getattr(strategy, "_name", None))
+        else:
+            strategy_name = strategy
         result = []
-        tracked_orders = self._tracked_orders
-        for order in tracked_orders:
-            if (strategy is None or order.strategy == strategy) and (asset is None or order.asset == asset):
+        for order in self._tracked_orders:
+            if (strategy_name is None or order.strategy == strategy_name) and (asset is None or order.asset == asset):
                 result.append(order)
-
         return result
 
     def get_all_orders(self) -> list[Order]:
@@ -961,21 +1145,23 @@ class Broker(ABC):
         return quantity
 
     def _parse_broker_orders(self, broker_orders, strategy_name, strategy_object=None):
-        """parse a list of broker orders into a
-        list of order objects"""
+        """parse a list of broker orders into a list of order objects"""
         result = []
         if broker_orders is not None:
             for broker_order in broker_orders:
-                # First try to parse the parent order
                 order = self._parse_broker_order(broker_order, strategy_name, strategy_object=strategy_object)
+                # skip if parsing returned None
+                if order is None:
+                    continue
 
                 # Check if it is a multileg order and Parse the legs
                 if isinstance(broker_order, dict) and "leg" in broker_order and isinstance(broker_order["leg"], list):
                     parsed_legs = []
                     for leg in broker_order["leg"]:
                         order_leg = self._parse_broker_order(leg, strategy_name, strategy_object=strategy_object)
-                        order_leg.parent_identifier = order.identifier
-                        parsed_legs.append(order_leg)
+                        if order_leg is not None:  # Additional None check for legs
+                            order_leg.parent_identifier = order.identifier
+                            parsed_legs.append(order_leg)
 
                     # Add the legs to the parent order
                     order.child_orders = parsed_legs
@@ -1113,6 +1299,33 @@ class Broker(ABC):
 
         self.submit_orders(orders, is_multileg=is_multileg)
 
+    def close_position(self, strategy_name: str, asset: Asset, fraction: float = 1.00):
+        """
+        Close a position for a given strategy and asset by submitting a sell order.
+
+        Parameters
+        ----------
+        strategy_name : str
+            Name of the strategy that owns the position.
+        asset : Asset
+            The asset whose position should be closed.
+        fraction : float, optional
+            Fraction of the position to close, between 0 and 1.0 (default is 1.0, meaning the full position).
+
+        Returns
+        -------
+        Order or None
+            The sell order submitted to close the position, or None if no open position exists
+            or the position quantity is zero.
+        """
+        pos = self.get_tracked_position(strategy_name, asset)
+        if pos and pos.quantity != 0:
+            order = pos.get_selling_order(quote_asset=self.quote_assets and next(iter(self.quote_assets)))
+            if fraction != 1.00:
+                order.quantity = order.quantity * fraction
+            return self.submit_order(order)
+        return None
+
     # =========Subscribers/Strategies functions==============
 
     def _add_subscriber(self, subscriber):
@@ -1206,7 +1419,9 @@ class Broker(ABC):
 
             # Log that the trade event was received
             self.logger.info(
-                f"Processing held trade event. Trade event received for stored_order: {stored_order}, type_event: {type_event}, price: {price}, filled_quantity: {filled_quantity}, multiplier: {multiplier}"
+                f"Processing held trade event. Trade event received for stored_order: {stored_order}, "
+                f"type_event: {type_event}, ID: {stored_order.identifier}, price: {price}, "
+                f"filled_quantity: {filled_quantity}, multiplier: {multiplier}"
             )
 
             # Process the trade event
@@ -1218,18 +1433,21 @@ class Broker(ABC):
                 multiplier=multiplier,
             )
 
-    def _process_trade_event(self, stored_order, type_event, price=None, filled_quantity=None, multiplier=1):
+    def _process_trade_event(self, stored_order, type_event, price=None, filled_quantity=None, multiplier=1, error=None): # Add error parameter
         """process an occurred trading event and update the
         corresponding order"""
         # Log that the trade event was received
         self.logger.info(
-            f"Processing trade event. Trade event received for {stored_order.strategy} strategy: {type_event} {stored_order.symbol}, processed by broker {self.name}"
+            f"Processing trade event. Trade event received for {stored_order.strategy} strategy: {type_event} "
+            f"{stored_order.symbol} ID={stored_order.identifier}, processed by broker {self.name}"
         )
 
         if self._hold_trade_events and not self.IS_BACKTESTING_BROKER:
             # Log that the trade event was held
             self.logger.info(
-                f"Trade event held for {stored_order.strategy} strategy: {type_event} {stored_order.symbol}, processed by broker {self.name}. self._hold_trade_events is {self._hold_trade_events}"
+                f"Trade event held for {stored_order.strategy} strategy: {type_event} {stored_order.symbol} "
+                f"ID={stored_order.identifier}, processed by broker {self.name}. "
+                f"self._hold_trade_events is {self._hold_trade_events}"
             )
 
             # Hold the trade event
@@ -1245,9 +1463,9 @@ class Broker(ABC):
             return
 
         # for fill and partial_fill events, price and filled_quantity must be specified
-        if type_event in [self.FILLED_ORDER, self.PARTIALLY_FILLED_ORDER] and (
-            price is None or filled_quantity is None
-        ):
+        if (type_event in [self.FILLED_ORDER, self.PARTIALLY_FILLED_ORDER] and
+                stored_order.order_class != Order.OrderClass.OCO and
+                (price is None or filled_quantity is None)):
             raise ValueError(
                 f"""For filled_order and partially_filled_order event,
                 price and filled_quantity must be specified.
@@ -1270,33 +1488,44 @@ class Broker(ABC):
                 raise ValueError(f"price must be a positive float, received {price} instead") from None
 
         if Order.is_equivalent_status(type_event, self.NEW_ORDER):
-            stored_order = self._process_new_order(stored_order)
-            self._on_new_order(stored_order)
-        if Order.is_equivalent_status(type_event, self.PLACEHOLDER_ORDER):
-            stored_order = self._process_placeholder_order(stored_order)
-            self._on_new_order(stored_order)
+            order = self._process_new_order(stored_order)
+            if order:
+                self._on_new_order(order)
+        elif Order.is_equivalent_status(type_event, self.PLACEHOLDER_ORDER):
+            order = self._process_placeholder_order(stored_order)
+            # No notification needed for placeholder
         elif Order.is_equivalent_status(type_event, self.CANCELED_ORDER):
-            # Do not cancel or re-cancel already completed orders
-            if stored_order.is_active():
-                stored_order = self._process_canceled_order(stored_order)
-                self._on_canceled_order(stored_order)
+            order = self._process_canceled_order(stored_order)
+            if order:
+                self._on_canceled_order(order)
+        elif Order.is_equivalent_status(type_event, self.ERROR_ORDER):
+            order = self._process_error_order(stored_order, error or LumibotBrokerAPIError("Unknown order error"))
+            if order:
+                # Notify subscriber about the error event
+                subscriber = self._get_subscriber(order.strategy)
+                if subscriber:
+                    payload = dict(order=order, error=error)
+                    subscriber.add_event(subscriber.ERROR_ORDER, payload)
         elif Order.is_equivalent_status(type_event, self.MODIFIED_ORDER):
-            # Modify is only allowed to adjust the stop and limit price, not quantity or other attributes.
-            if stored_order.order_type == Order.OrderType.STOP:
-                stored_order.stop_price = price
-            elif stored_order.order_type == Order.OrderType.LIMIT:
-                stored_order.limit_price = price
+            # TODO: Implement modification logic and notification if needed
+            self.logger.info(colored(f"Order was modified: {stored_order}", color="yellow"))
+            # Update raw data if modification response is available (might need adjustment)
+            # stored_order.update_raw(modification_response_data)
+            # self._on_modified_order(stored_order) # Need to implement _on_modified_order
+            pass
         elif Order.is_equivalent_status(type_event, self.PARTIALLY_FILLED_ORDER):
             stored_order, position = self._process_partially_filled_order(stored_order, price, filled_quantity)
-            self._on_partially_filled_order(position, stored_order, price, filled_quantity, multiplier)
+            if position:
+                self._on_partially_filled_order(position, stored_order, price, filled_quantity, multiplier)
         elif Order.is_equivalent_status(type_event, self.FILLED_ORDER):
             position = self._process_filled_order(stored_order, price, filled_quantity)
-            self._on_filled_order(position, stored_order, price, filled_quantity, multiplier)
+            if position:
+                self._on_filled_order(position, stored_order, price, filled_quantity, multiplier)
         elif Order.is_equivalent_status(type_event, self.CASH_SETTLED):
             self._process_cash_settlement(stored_order, price, filled_quantity)
             stored_order.order_type = self.CASH_SETTLED
         else:
-            self.logger.info(f"Unhandled type event {type_event} for {stored_order}")
+            self.logger.warning(f"Unknown trade event type: {type_event}")
 
         current_dt = self.data_source.get_datetime()
         new_row = {
@@ -1346,6 +1575,27 @@ class Broker(ABC):
                     break
         return
 
+    def get_quote(self, asset: Asset, quote: Asset = None, exchange: str = None) -> Quote:
+        """
+        Get the latest quote for an asset.
+        Returns a Quote object with bid, ask, last, and other fields if available.
+
+        Parameters
+        ----------
+        asset : Asset object
+            The asset for which the quote is needed.
+        quote : Asset object, optional
+            The quote asset for cryptocurrency pairs.
+        exchange : str, optional
+            The exchange to get the quote from.
+
+        Returns
+        -------
+        Quote
+            A Quote object with the quote information.
+        """
+        return self.data_source.get_quote(asset, quote, exchange)
+
     def export_trade_events_to_csv(self, filename):
         if len(self._trade_event_log_df) > 0:
             output_df = self._trade_event_log_df.set_index("time")
@@ -1364,3 +1614,11 @@ class Broker(ABC):
 
         # Update the strategy name in the logger
         self.logger.update_strategy_name(strategy_name)
+
+    def _perform_cleanup(self):
+        """Perform cleanup actions based on the configured strategy."""
+        # Call our new comprehensive cleanup method
+        try:
+            self._cleanup_old_tracking_data()
+        except Exception as e:
+            self.logger.warning(f"Memory cleanup failed: {e}")

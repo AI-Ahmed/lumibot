@@ -1,14 +1,46 @@
-import logging
 import uuid
 from collections import namedtuple
 from decimal import Decimal
-from enum import StrEnum
+from enum import Enum
 from threading import Event
 import datetime
-from typing import Union
+from typing import Union, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from lumibot.entities.asset import Asset
 
 import lumibot.entities as entities
 from lumibot.tools.types import check_positive, check_price
+
+
+# Set up module-specific logger
+from lumibot.tools.lumibot_logger import get_logger
+logger = get_logger(__name__)
+
+
+# Custom string enum implementation for Python 3.9 compatibility
+class StrEnum(str, Enum):
+    """
+    A string enum implementation that works with Python 3.9+
+    
+    This class extends str and Enum to create string enums that:
+    1. Can be used like strings (string methods, comparison)
+    2. Are hashable (for use in dictionaries, sets, etc.)
+    3. Can be used in string comparisons without explicit conversion
+    """
+    def __str__(self):
+        return self.value
+        
+    def __eq__(self, other):
+        if isinstance(other, str):
+            return self.value == other
+        return super().__eq__(other)
+    
+    def __hash__(self):
+        # Use the hash of the enum member, not the string value
+        # This ensures proper hashability while maintaining enum identity
+        return super().__hash__()
+
 
 SELL = "sell"
 BUY = "buy"
@@ -116,7 +148,7 @@ class Order:
         order_type: Union[OrderType, None] = None,
         order_class: Union[OrderClass, None] = OrderClass.SIMPLE,
         trade_cost: float = None,
-        custom_params: dict = {},
+        custom_params: dict = None,
         identifier: str = None,
         avg_fill_price: float = None,
         error_message: str = None,
@@ -304,7 +336,7 @@ class Order:
         self.child_orders = child_orders if isinstance(child_orders, list) else []
 
         if asset == quote and asset is not None:
-            logging.error(
+            logger.error(
                 f"When creating an Order, asset and quote must be different. Got asset = {asset} and quote = {quote}"
             )
             return
@@ -318,7 +350,7 @@ class Order:
         # If quantity is negative, then make sure it is positive
         if quantity is not None and quantity < 0:
             # Warn the user that the quantity is negative
-            logging.warning(
+            logger.warning(
                 f"Quantity for order {identifier} is negative ({quantity}). Changing to positive because quantity must always be positive for orders."
             )
             quantity = abs(quantity)
@@ -410,10 +442,19 @@ class Order:
         }
         for param, new_param in deprecated_params.items():
             if locals()[param] is not None:
-                logging.warning(f"Order: {param} is deprecated. Use {new_param} instead.")
+                # Get caller information for better debugging
+                import inspect
+                frame = inspect.currentframe().f_back
+                filename = frame.f_code.co_filename.split('/')[-1]  # Just the filename
+                lineno = frame.f_lineno
+                function_name = frame.f_code.co_name
+                
+                logger.warning(f"DEPRECATED in {filename}:{function_name}:{lineno} - "
+                             f"Order parameter '{param}' is deprecated. Use '{new_param}' instead.")
+                
                 if locals()[new_param]:
                     raise ValueError(f"You cannot set both {param} and {new_param}. "
-                                     f"This may cause unexpected behavior.")
+                                   f"This may cause unexpected behavior.")
                 locals()[new_param] = locals()[param]
 
         # TODO: Remove when type//take_profit_price/stop_loss_price/stop_loss_limit_price are finally
@@ -443,7 +484,7 @@ class Order:
         valid_order_classes = [order_class for order_class in Order.OrderClass]
         valid_order_types = [order_type for order_type in Order.OrderType]
         if order_type in valid_order_classes:
-            logging.warning(f"Order: Passing Advanced order class ({self.order_type}) in 'order_type' field is "
+            logger.warning(f"Order: Passing Advanced order class ({self.order_type}) in 'order_type' field is "
                             f"deprecated. Please use 'order_class' instead. "
                             f"Valid Classes: {', '.join(valid_order_classes)} | "
                             f"Valid Types: {', '.join(valid_order_types)}")
@@ -844,7 +885,7 @@ class Order:
             else:
                 self._status = value.lower()
                 # Log an error
-                logging.error(f"Invalid order status: {value}")
+                logger.error(f"Invalid order status: {value}")
 
     @property
     def quantity(self):
@@ -1028,9 +1069,13 @@ class Order:
 
         if not status1 or not status2:
             return False
-        elif status1.lower() in [status2.lower(), STATUS_ALIAS_MAP.get(status2.lower(), "")]:
+        elif status1.lower() == status2.lower():  # Direct match check
             return True
-        # open/new status is equivalent
+        elif status1.lower() in STATUS_ALIAS_MAP.get(status2.lower(), []):
+            return True
+        elif status2.lower() in STATUS_ALIAS_MAP.get(status1.lower(), []):
+            # Bidirectional alias check
+            return True
         elif {status1.lower(), status2.lower()}.issubset({"open", "new"}):
             return True
         else:
@@ -1067,7 +1112,11 @@ class Order:
     def get_increment(self):
         increment = self.quantity
         if self.side == SELL:
-            increment = -increment
+            if not self.is_option():
+                increment = -increment
+        if self.side == BUY:
+            if self.is_option():
+                increment = -increment
         return float(increment)
 
     def is_option(self):
@@ -1093,14 +1142,14 @@ class Order:
     # =========Waiting methods==================
 
     def wait_to_be_registered(self):
-        logging.info("Waiting for order %r to be registered" % self)
+        logger.info("Waiting for order %r to be registered" % self)
         self._new_event.wait()
-        logging.info("Order %r registered" % self)
+        logger.info("Order %r registered" % self)
 
     def wait_to_be_closed(self):
-        logging.info("Waiting for broker to execute order %r" % self)
+        logger.info("Waiting for broker to execute order %r" % self)
         self._closed_event.wait()
-        logging.info("Order %r executed by broker" % self)
+        logger.info("Order %r executed by broker" % self)
 
     # ========= Serialization methods ===========
 

@@ -1,5 +1,4 @@
 # This file contains helper functions for getting data from Polygon.io
-import logging
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -14,17 +13,24 @@ import pandas as pd
 import pandas_market_calendars as mcal
 from lumibot import LUMIBOT_CACHE_FOLDER
 from lumibot.entities import Asset
+from lumibot.tools.lumibot_logger import get_logger
 
 # noinspection PyPackageRequirements
-from polygon import RESTClient
+from polygon.rest import RESTClient
+from polygon.exceptions import BadResponse
 from typing import Iterator
 from termcolor import colored
 from tqdm import tqdm
 
 from lumibot import LUMIBOT_CACHE_FOLDER
 from lumibot.entities import Asset
+
+logger = get_logger(__name__)
 from lumibot import LUMIBOT_DEFAULT_PYTZ
 from lumibot.credentials import POLYGON_API_KEY
+from lumibot.tools.lumibot_logger import get_logger
+
+logger = get_logger(__name__)
 
 # Adjust as desired, in days. We'll reuse any existing chain file
 # that is not older than RECENT_FILE_TOLERANCE_DAYS.
@@ -87,7 +93,7 @@ def get_price_data_from_polygon(
     timespan: str = "minute",
     quote_asset: Optional[Asset] = None,
     force_cache_update: bool = False,
-    max_workers: int = 10,
+    max_workers: int = 10
 ) -> Optional[pd.DataFrame]:
     """
     Query Polygon.io for historical pricing data for the given asset, using parallel downloads.
@@ -242,14 +248,14 @@ def validate_cache(force_cache_update: bool, asset: Asset, cache_file: Path, api
                 # No need to rewrite contents.  Just update the timestamp.
                 splits_file_path.touch()
             else:
-                logging.info(f"Invalidating cache for {asset.symbol} because its splits have changed.")
+                logger.info(f"Invalidating cache for {asset.symbol} because its splits have changed.")
                 force_cache_update = True
                 cache_file.unlink(missing_ok=True)
                 # Create the directory if it doesn't exist
                 cache_file.parent.mkdir(parents=True, exist_ok=True)
                 splits_df.to_feather(splits_file_path)
         else:
-            logging.warn(f"Unexpected response getting splits for {asset.symbol} from Polygon.  Response: {splits}")
+            logger.warning(f"Unexpected response getting splits for {asset.symbol} from Polygon.  Response: {splits}")
     return force_cache_update
 
 
@@ -353,14 +359,11 @@ def get_polygon_symbol(asset, polygon_client, quote_asset=None):
 
         if len(contracts) == 0:
             text = colored(f"Unable to find option contract for {asset}", "red")
-            logging.debug(text)
+            logger.debug(text)
             return
 
         # Example: O:SPY230802C00457000
         symbol = contracts[0].ticker
-
-    elif asset.asset_type == Asset.AssetType.INDEX:
-        symbol = f"I:{asset.symbol}"
 
     else:
         raise ValueError(f"Unsupported asset type for polygon: {asset.asset_type}")
@@ -611,7 +614,7 @@ def get_chains_cached(
     quote: Asset = None,
     exchange: str = None,
     current_date: date = None,
-    polygon_client: Optional["PolygonClient"] = None,
+    polygon_client: Optional["PolygonClient"] = None
 ) -> dict:
     """
     Retrieve an option chain for a given asset and historical date using Polygon, 
@@ -665,16 +668,16 @@ def get_chains_cached(
     4) By default, we fetch both 'expired=True' and 'expired=False', so you get 
        historical + near-future options for your specified date.
     """
-    logging.debug(f"get_chains_cached called for {asset.symbol} on {current_date}")
+    logger.debug(f"get_chains_cached called for {asset.symbol} on {current_date}")
 
     # 1) If current_date is None => bail out (no real date to query).
     if current_date is None:
-        logging.debug("No current_date provided; returning None.")
+        logger.debug("No current_date provided; returning None.")
         return None
 
     # 2) Ensure we have a PolygonClient
     if polygon_client is None:
-        logging.debug("No polygon_client provided; creating a new one.")
+        logger.debug("No polygon_client provided; creating a new one.")
         polygon_client = PolygonClient.create(api_key=api_key)
 
     # 3) Build the chain folder path and create if not present
@@ -702,7 +705,7 @@ def get_chains_cached(
 
         # If file_date is recent enough, reuse it
         if earliest_okay_date <= file_date <= current_date:
-            logging.debug(
+            logger.debug(
                 f"Reusing chain file {fpath} (file_date={file_date}), "
                 f"within {RECENT_FILE_TOLERANCE_DAYS} days of {current_date}."
             )
@@ -717,7 +720,7 @@ def get_chains_cached(
             return data
 
     # 5) No suitable file => must fetch from Polygon
-    logging.debug(
+    logger.debug(
         f"No suitable recent file found for {asset.symbol} on {current_date}. "
         "Downloading from Polygon..."
     )
@@ -761,7 +764,7 @@ def get_chains_cached(
     cache_file = chain_folder / f"{asset.symbol}_{current_date.isoformat()}.feather"
     df_to_cache = pd.DataFrame({"data": [option_contracts]})
     df_to_cache.to_feather(cache_file)
-    logging.debug(
+    logger.debug(
         f"Download complete for {asset.symbol} on {current_date}. "
         f"Saved chain file to {cache_file}"
     )
@@ -781,6 +784,7 @@ class PolygonClient(RESTClient):
         self._last_rate_limit_log_time = 0.0
         # Only log once every 300s (5 minutes); tweak as you see fit.
         self._rate_limit_log_cooldown = 300.0
+        # Store the CSV path for potential future use
 
     @classmethod
     def create(cls, *args, **kwargs) -> RESTClient:
@@ -847,8 +851,11 @@ class PolygonClient(RESTClient):
                         "You can use the coupon code 'LUMI10' for 10% off."
                     )
                     colored_message = colored(message, "red")
-                    logging.error(colored_message)
-                    logging.debug(f"Error: {e}")
+                    logger.error(colored_message)
+                    logger.debug(f"Error: {e}")
+
+                    # Log to CSV using standard logger (will auto-capture to CSV if enabled)
+                    logger.error(f"POLYGON_RATE_LIMIT_EXCEEDED: Polygon rate limit reached | URL: {str(url)}, Wait time: {PolygonClient.WAIT_SECONDS_RETRY}s, Error: {str(e)}")
 
                     # Update our last log time
                     self._last_rate_limit_log_time = now
@@ -858,3 +865,45 @@ class PolygonClient(RESTClient):
 
                 # Sleep for WAIT_SECONDS_RETRY, then try again
                 time.sleep(PolygonClient.WAIT_SECONDS_RETRY)
+            
+            except BadResponse as e:
+                # Handle Polygon BadResponse errors specifically
+                url = str(urlunparse(urlparse(kwargs.get('path', 'unknown'))._replace(query=""))) if 'path' in kwargs else 'unknown'
+                
+                # Check if this is an authorization/entitlement error
+                error_str = str(e)
+                if "NOT_AUTHORIZED" in error_str or "not entitled to this data" in error_str.lower():
+                    # Use CRITICAL level for authorization errors to match ErrorLogger behavior
+                    logger.critical(f"POLYGON_NOT_AUTHORIZED: Polygon authorization error - insufficient permissions | URL: {url}, Operation: HTTP GET request, Error: {error_str}")
+                else:
+                    # Other BadResponse errors (e.g., invalid parameters, server errors)
+                    logger.error(f"POLYGON_BAD_REQUEST: Polygon bad request error | URL: {url}, Operation: HTTP GET request, Error: {error_str}")
+                
+                # Log to console as well
+                message = f"Polygon BadResponse error: {type(e).__name__}"
+                colored_message = colored(message, "red")
+                logger.error(colored_message)
+                logger.debug(f"Full error details: {e}")
+                
+                # Re-raise the exception since this is not a rate limit we can handle
+                raise e
+            
+            except Exception as e:
+                # Check if we've logged an exception message recently
+                now = time.time()
+
+                message = (
+                    f"Polygon API error encountered: {type(e).__name__}\n"
+                    "This may be due to insufficient subscriptions or temporary server issues. "
+                )
+                colored_message = colored(message, "yellow")
+                logger.warning(colored_message)
+                logger.debug(f"Full error details: {e}")
+
+                # Log to CSV using standard logger (will auto-capture to CSV if enabled)
+                url = str(urlunparse(urlparse(kwargs.get('path', 'unknown'))._replace(query=""))) if 'path' in kwargs else 'unknown'
+                error_type = type(e).__name__
+                logger.error(f"POLYGON_API_{error_type.upper()}: Polygon API error: {error_type} | URL: {url}, Operation: HTTP GET request, Error: {str(e)}")
+
+                # Re-raise the exception since this is not a rate limit we can handle
+                raise e                

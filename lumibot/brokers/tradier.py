@@ -1,5 +1,4 @@
-import logging
-import math
+import os
 import re
 import traceback
 from typing import Union
@@ -7,7 +6,8 @@ from typing import Union
 import pandas as pd
 from termcolor import colored
 
-from lumibot.brokers import Broker
+from lumibot.tools.lumibot_logger import get_logger
+from lumibot.brokers import Broker, LumibotBrokerAPIError
 from lumibot.data_sources.tradier_data import TradierData
 from lumibot.entities import Asset, Order, Position
 from lumibot.tools.helpers import create_options_symbol
@@ -15,6 +15,8 @@ from lumibot.trading_builtins import PollingStream
 from lumiwealth_tradier import Tradier as _Tradier
 from lumiwealth_tradier.base import TradierApiError
 from lumiwealth_tradier.orders import OrderLeg
+
+logger = get_logger(__name__)
 
 
 class Tradier(Broker):
@@ -81,8 +83,6 @@ class Tradier(Broker):
         self._tradier_paper = paper
         self.polling_interval = polling_interval
 
-        self.market = "NYSE"  # The default market is NYSE.
-
         # Create the Tradier object
         self.tradier = _Tradier(account_number, access_token, paper)
 
@@ -104,6 +104,9 @@ class Tradier(Broker):
             connect_stream=connect_stream,
             extended_trading_minutes=extended_trading_minutes,
         )
+
+        # Override default market setting for Tradier to be NYSE, but still respect config/env if set
+        self.market = (config.get("MARKET") if config else None) or os.environ.get("MARKET") or "NYSE"
 
     def cancel_order(self, order: Order):
         """Cancels an order at the broker. Nothing will be done for orders that are already cancelled or filled."""
@@ -133,11 +136,14 @@ class Tradier(Broker):
             raise ValueError("Order identifier is not set, unable to modify order. Did you remember to submit it?")
 
         # Modify the order
-        self.tradier.orders.modify(
-            order.identifier,
-            limit_price=limit_price,
-            stop_price=stop_price,
-        )
+        try:
+            self.tradier.orders.modify(
+                order.identifier,
+                limit_price=limit_price,
+                stop_price=stop_price,
+            )
+        except TradierApiError as e:
+            raise LumibotBrokerAPIError(f"Unable to modify order at broker. {e}") from e
 
     def _submit_orders(self, orders, is_multileg=False, order_type=None, duration="day", price=None):
         """
@@ -330,7 +336,7 @@ class Tradier(Broker):
 
                 for child_order in order.child_orders:
                     if child_order.asset is None:
-                        logging.error(f"Asset {child_order.asset} not supported by Tradier.")
+                        logger.error(f"Asset {child_order.asset} not supported by Tradier.")
                         return None
 
                     # Check if the child order is a stop limit order
@@ -396,7 +402,7 @@ class Tradier(Broker):
                 )
 
                 if not tradier_side or not option_symbol:
-                    logging.error(f"Unable to parse order {order} for Tradier.")
+                    logger.error(f"Unable to parse order {order} for Tradier.")
                     return None
 
                 order_response = self.tradier.orders.order_option(
@@ -412,7 +418,7 @@ class Tradier(Broker):
                 )
             else:
                 # Log the error and return None
-                logging.error(f"Asset {order.asset} not supported by Tradier.")
+                logger.error(f"Asset {order.asset} not supported by Tradier.")
                 return None
 
             order.identifier = order_response["id"]
@@ -449,9 +455,9 @@ class Tradier(Broker):
                 raise ValueError(colored_message) from e
             raise e
         except Exception as e:
-            logging.error(f"Error pulling balances from Tradier: {e}")
+            logger.error(f"Error pulling balances from Tradier: {e}")
             # Add traceback to the error message
-            logging.error(traceback.format_exc())
+            logger.error(traceback.format_exc())
             return None
 
         # Get the portfolio value (total_equity) column
@@ -466,7 +472,7 @@ class Tradier(Broker):
         return cash, positions_value, portfolio_value
 
     def get_historical_account_value(self):
-        logging.error("The function get_historical_account_value is not implemented yet for Tradier.")
+        logger.error("The function get_historical_account_value is not implemented yet for Tradier.")
         return {"hourly": None, "daily": None}
 
     def _pull_positions(self, strategy):
@@ -480,16 +486,16 @@ class Tradier(Broker):
                 if self._tradier_access_token is None or self._tradier_account_number is None or len(self._tradier_access_token) == 0 or len(self._tradier_account_number) == 0:
                     colored_message = colored("Your TRADIER_ACCOUNT_NUMBER or TRADIER_ACCESS_TOKEN are blank. Please check your keys.", color="red")
                     raise ValueError(colored_message) from e
-                
+
                 # Conceal the end of the access token
                 access_token = self._tradier_access_token[:7] + "*" * 7
                 colored_message = colored(f"Your TRADIER_ACCOUNT_NUMBER or TRADIER_ACCESS_TOKEN are invalid. Your account number is: {self._tradier_account_number} and your access token is: {access_token}", color="red")
                 raise ValueError(colored_message) from e
             raise e
         except Exception as e:
-            logging.error(f"Error pulling positions from Tradier: {e}")
+            logger.error(f"Error pulling positions from Tradier: {e}")
             return []
-            
+
         positions_ret = []
 
         # Loop through each row in the dataframe
@@ -610,6 +616,19 @@ class Tradier(Broker):
         # Get the reason_description if it exists
         reason_description = response.get("reason_description", "")
 
+        # Tradier sometimes returns None for avg_fill_price and sometimes $0.0. It mostly appears that:
+        #    - 0.0 occurs during submission (mostly for OCO child orders it seems)
+        #    - None while the order is active/cancelled
+        #    - A value when the order is filled
+        # Lumibot treats 0.0 as a valid fill amount, so need to convert to None when it is just a placeholder
+        #    value for non-filled orders.
+        avg_fill_price = response["avg_fill_price"] if "avg_fill_price" in response else None
+        if avg_fill_price == 0.0 and not Order.is_equivalent_status(response["status"], Order.OrderStatus.FILLED):
+            avg_fill_price = None
+
+        # Map Tradier order types to Lumi order types
+        lumi_order_type = self._tradier_type2lumi(self._extract_order_value(response, {}, "type"))
+
         # Create the order object
         order = Order(
             identifier=response["id"],
@@ -618,21 +637,31 @@ class Tradier(Broker):
             asset=asset,
             side=self._tradier_side2lumi(side),
             quantity=self._extract_order_value(response, limit_order, "quantity"),
-            order_type=self._extract_order_value(response, {}, "type"),
+            order_type=lumi_order_type,
             time_in_force=self._extract_order_value(response, limit_order, "duration"),
             limit_price=self._extract_order_value(response, limit_order, "price"),
             stop_price=self._extract_order_value(response, stop_order, "stop_price"),
             tag=response["tag"] if "tag" in response and response["tag"] else None,
             date_created=response["create_date"],
-            avg_fill_price=response["avg_fill_price"] if "avg_fill_price" in response else None,
+            avg_fill_price=avg_fill_price,
             error_message=reason_description,
-            order_class=self._tradier_class2lumi(response["class"] if "class" in response else None),
+            order_class=self._tradier_class2lumi(response["class"] if "class" in response else None) or Order.OrderClass.SIMPLE,
         )
         # Example Tradier Date Value: '2024-10-04T15:46:14.946Z'
         order.broker_create_date = response["create_date"] if "create_date" in response else None
         order.broker_update_date = response["transaction_date"] if "transaction_date" in response else None
         order.update_raw(response)  # This marks order as 'transmitted'
         return order
+
+    @staticmethod
+    def _tradier_type2lumi(order_type):
+        """
+        Map Tradier order types to Lumi order types.
+        Tradier may return 'debit', 'credit', or 'even' for multi-leg orders, which should be treated as 'limit'.
+        """
+        if order_type in ("debit", "credit", "even"):
+            return "limit"
+        return order_type
 
     @staticmethod
     def _extract_order_value(response, child_response, key):
@@ -662,7 +691,7 @@ class Tradier(Broker):
         try:
             df = self.tradier.orders.get_orders()
         except Exception as e:
-            logging.error(f"Error pulling orders from Tradier: {e}")
+            logger.error(f"Error pulling orders from Tradier: {e}")
             return []
 
         # Check if the dataframe is empty or None
@@ -718,7 +747,7 @@ class Tradier(Broker):
                 elif position.quantity <= 0 and side == Order.OrderSide.SELL:
                     side = "sell_to_open"
                 else:
-                    logging.error(
+                    logger.error(
                         f"Unable to determine the correct side for the order. " f"Position: {position}, Order: {order}"
                     )
 
@@ -734,7 +763,7 @@ class Tradier(Broker):
 
         # Check if the side is a valid Tradier side
         if side not in ["buy_to_open", "buy_to_close", "sell_to_open", "sell_to_close"]:
-            logging.error(f"Invalid option order side for Tradier: {order.side}")
+            logger.error(f"Invalid option order side for Tradier: {order.side}")
             return ""
 
         return side
@@ -829,6 +858,10 @@ class Tradier(Broker):
                     # for the first time.
                     stored_order = stored_orders[order.identifier]
                     stored_order.quantity = order.quantity  # Update the quantity in case it has changed
+                    stored_order.broker_create_date = order.broker_create_date
+                    stored_order.broker_update_date = order.broker_update_date
+                    if order.avg_fill_price:
+                        stored_order.avg_fill_price = order.avg_fill_price
                     stored_children = [stored_orders[o.identifier] if o.identifier in stored_orders else o
                                        for o in order.child_orders]
                     stored_order.child_orders = stored_children
@@ -859,9 +892,23 @@ class Tradier(Broker):
                                 else:
                                     fill_qty = order.quantity
 
-                                self.stream.dispatch(
-                                    self.FILLED_ORDER, order=stored_order, price=fill_price, filled_quantity=fill_qty
-                                )
+                                # For OCO orders - Parent order never gets filled values populated by Tradier API.
+                                # Need to look at the child orders to get the necessary fill values.
+                                if order.order_class == Order.OrderClass.OCO:
+                                    filled_children = [o for o in order.child_orders if o.is_filled()]
+                                    if filled_children:
+                                        fill_price = filled_children[0].avg_fill_price
+                                        fill_qty = filled_children[0].quantity
+
+                                # There's race condition where Tradier API is marking status=filled but has not yet
+                                # populated the avg_fill_price and other fill data. At some time in the future these
+                                # values will be filled in by Tradier, so do not trigger a 'filled' event until
+                                # all the needed data has been populated.
+                                if fill_price is not None and fill_qty is not None:
+                                    self.stream.dispatch(
+                                        self.FILLED_ORDER, order=stored_order, price=fill_price,
+                                        filled_quantity=fill_qty
+                                    )
                             case "canceled":
                                 self.stream.dispatch(self.CANCELED_ORDER, order=stored_order)
                             case "error":
@@ -886,7 +933,7 @@ class Tradier(Broker):
         broker_ids = self._get_broker_id_from_raw_orders(raw_orders)
         for order_id, order in tracked_orders.items():
             if order_id not in broker_ids:
-                logging.debug(
+                logger.debug(
                     f"Poll Update: {self.name} no longer has order {order}, but Lumibot does. "
                     f"Dispatching as cancelled."
                 )
@@ -925,7 +972,7 @@ class Tradier(Broker):
         @broker.stream.add_action(broker.NEW_ORDER)
         def on_trade_event_new(order):
             # Log that the order was submitted
-            logging.info(f"Processing action for new order {order}")
+            logger.info(f"Processing action for new order {order}")
 
             try:
                 broker._process_trade_event(
@@ -934,12 +981,12 @@ class Tradier(Broker):
                 )
                 return True
             except:
-                logging.error(traceback.format_exc())
+                logger.error(traceback.format_exc())
 
         @broker.stream.add_action(broker.FILLED_ORDER)
         def on_trade_event_fill(order, price, filled_quantity):
             # Log that the order was filled
-            logging.info(f"Processing action for filled order {order} | {price} | {filled_quantity}")
+            logger.info(f"Processing action for filled order {order} | {price} | {filled_quantity}")
 
             try:
                 broker._process_trade_event(
@@ -951,12 +998,12 @@ class Tradier(Broker):
                 )
                 return True
             except:
-                logging.error(traceback.format_exc())
+                logger.error(traceback.format_exc())
 
         @broker.stream.add_action(broker.CANCELED_ORDER)
         def on_trade_event_cancel(order):
             # Log that the order was cancelled
-            logging.info(f"Processing action for cancelled order {order}")
+            logger.info(f"Processing action for cancelled order {order}")
 
             try:
                 broker._process_trade_event(
@@ -964,12 +1011,12 @@ class Tradier(Broker):
                     broker.CANCELED_ORDER,
                 )
             except:
-                logging.error(traceback.format_exc())
+                logger.error(traceback.format_exc())
 
         @broker.stream.add_action(broker.CASH_SETTLED)
         def on_trade_event_cash(order, price, filled_quantity):
             # Log that the order was cash settled
-            logging.info(f"Processing action for cash settled order {order} | {price} | {filled_quantity}")
+            logger.info(f"Processing action for cash settled order {order} | {price} | {filled_quantity}")
 
             try:
                 broker._process_trade_event(
@@ -980,23 +1027,32 @@ class Tradier(Broker):
                     multiplier=order.asset.multiplier,
                 )
             except:
-                logging.error(traceback.format_exc())
+                logger.error(traceback.format_exc())
 
         @broker.stream.add_action(broker.ERROR_ORDER)
         def on_trade_event_error(order, error_msg):
             # Log that the order had an error
-            logging.error(f"Processing action for error order {order} | {error_msg}")
-                                                                         
+            logger.error(f"Processing action for error order {order} | {error_msg}")
             try:
                 if order.is_active():
+                    # If the order has children, cancel them first upon error
+                    if order.child_orders:
+                        for child_order in order.child_orders:
+                            child_order.set_error(error_msg)
+                            broker._process_trade_event(
+                                child_order,
+                                broker.ERROR_ORDER,
+                            )
+
+                    # Then cancel the parent order
                     broker._process_trade_event(
                         order,
-                        broker.CANCELED_ORDER,
+                        broker.ERROR_ORDER,
                     )
-                logging.error(error_msg)
+                logger.error(error_msg)
                 order.set_error(error_msg)
             except:
-                logging.error(traceback.format_exc())
+                logger.error(traceback.format_exc())
 
     def _run_stream(self):
         self._stream_established()

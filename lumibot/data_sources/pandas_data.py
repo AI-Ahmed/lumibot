@@ -1,4 +1,3 @@
-import logging
 from collections import defaultdict, OrderedDict
 from datetime import timedelta
 from decimal import Decimal
@@ -6,7 +5,10 @@ from typing import Union
 
 import pandas as pd
 from lumibot.data_sources import DataSourceBacktesting
-from lumibot.entities import Asset, Bars
+from lumibot.entities import Asset, Bars, Quote
+from lumibot.tools.lumibot_logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class PandasData(DataSourceBacktesting):
@@ -44,7 +46,7 @@ class PandasData(DataSourceBacktesting):
                 # If quote is not specified, use USD as the quote
                 if data.quote is None:
                     # Warn that USD is being used as the quote
-                    logging.warning(f"No quote specified for {data.asset}. Using USD as the quote.")
+                    logger.warning(f"No quote specified for {data.asset}. Using USD as the quote.")
                     return data.asset, Asset(symbol="USD", asset_type="forex")
                 return data.asset, data.quote
             else:
@@ -78,16 +80,48 @@ class PandasData(DataSourceBacktesting):
         return pcal
 
     def clean_trading_times(self, dt_index, pcal):
-        # Used to fill in blanks in the data, on trading days, within market trading hours.
+        """
+        Fill in blanks in the data on trading days within market trading hours.
+
+        Parameters:
+        dt_index (DatetimeIndex): The original datetime index.
+        pcal (DataFrame): A calendar DataFrame containing "market_open" and "market_close" columns,
+                            indexed by dates.
+
+        Returns:
+        DatetimeIndex: The cleaned index with one-minute frequency within the market hours.
+        """
+        # Ensure the datetime index is in datetime format and drop duplicate timestamps
+        dt_index = pd.to_datetime(dt_index).drop_duplicates()
+
+        # Create a DataFrame with dt_index as the index and sort it
         df = pd.DataFrame(range(len(dt_index)), index=dt_index)
         df = df.sort_index()
+
+        # Create a column for the date portion only
         df["dates"] = df.index.date
-        df = df.merge(pcal[["market_open", "market_close"]], left_on="dates", right_index=True)
+
+        # Merge with the trading calendar on the 'dates' column to get market open/close times.
+        # Use a left join to keep all rows from the original index.
+        df = df.merge(
+            pcal[["market_open", "market_close"]],
+            left_on="dates",
+            right_index=True,
+            how="left"
+        )
+
         if self._timestep == "minute":
+            # Resample to a 1-minute frequency, using pad to fill missing times.
+            # At this point, the index is unique so asfreq will work correctly.
             df = df.asfreq("1min", method="pad")
-            result_index = df.loc[(df.index >= df["market_open"]) & (df.index <= df["market_close"]), :].index
+
+            # Filter to include only the rows that fall within market open and close times.
+            result_index = df.loc[
+                (df.index >= df["market_open"]) & (df.index <= df["market_close"])
+            ].index
         else:
             result_index = df.index
+
         return result_index
 
     def get_trading_days_pandas(self):
@@ -192,17 +226,44 @@ class PandasData(DataSourceBacktesting):
 
                 # Check if price is NaN
                 if pd.isna(price):
-                    logging.info(f"Error getting last price for {tuple_to_find}: price is NaN")
+                    # Provide more specific error message for index assets
+                    if hasattr(asset, 'asset_type') and asset.asset_type == Asset.AssetType.INDEX:
+                        logger.warning(f"Index asset `{asset.symbol}` returned NaN price. This could be due to missing data for the index or a subscription issue if using Polygon.io. Note that some index data (like SPX) requires a paid subscription. Consider using Yahoo Finance for broader index data coverage.")
+                    else:
+                        logger.info(f"Error getting last price for {tuple_to_find}: price is NaN")
                     return None
 
                 return price
             except Exception as e:
-                logging.info(f"Error getting last price for {tuple_to_find}: {e}")
+                logger.info(f"Error getting last price for {tuple_to_find}: {e}")
                 return None
         else:
+            # Provide more specific error message when asset not found in data store
+            if hasattr(asset, 'asset_type') and asset.asset_type == Asset.AssetType.INDEX:
+                logger.warning(f"The index asset `{asset.symbol}` does not exist or does not have data. Index data may not be available from this data source. If using Polygon, note that some index data (like SPX) requires a paid subscription. Consider using Yahoo Finance for broader index data coverage.")
             return None
 
-    def get_quote(self, asset, quote=None, exchange=None):
+    def get_quote(self, asset, quote=None, exchange=None) -> Quote:
+        """
+        Get the latest quote for an asset.
+        Returns a Quote object with bid, ask, last, and other fields if available.
+
+        Parameters
+        ----------
+        asset : Asset object
+            The asset for which the quote is needed.
+        quote : Asset object, optional
+            The quote asset for cryptocurrency pairs.
+        exchange : str, optional
+            The exchange to get the quote from.
+
+        Returns
+        -------
+        Quote
+            A Quote object with the quote information.
+        """
+        from lumibot.entities import Quote
+
         # Takes an asset and returns the last known price
         tuple_to_find = self.find_asset_in_data_store(asset, quote)
 
@@ -213,12 +274,21 @@ class PandasData(DataSourceBacktesting):
 
             # Check if ohlcv_bid_ask_dict is NaN
             if pd.isna(ohlcv_bid_ask_dict):
-                logging.info(f"Error getting ohlcv_bid_ask for {tuple_to_find}: ohlcv_bid_ask_dict is NaN")
-                return None
+                logger.info(f"Error getting ohlcv_bid_ask for {tuple_to_find}: ohlcv_bid_ask_dict is NaN")
+                return Quote(asset=asset)
 
-            return ohlcv_bid_ask_dict
+            # Convert dictionary to Quote object
+            return Quote(
+                asset=asset,
+                price=ohlcv_bid_ask_dict.get('close'),
+                bid=ohlcv_bid_ask_dict.get('bid'),
+                ask=ohlcv_bid_ask_dict.get('ask'),
+                volume=ohlcv_bid_ask_dict.get('volume'),
+                timestamp=dt,
+                raw_data=ohlcv_bid_ask_dict
+            )
         else:
-            return None
+            return Quote(asset=asset)
 
     def get_last_prices(self, assets, quote=None, exchange=None, **kwargs):
         result = {}
@@ -251,7 +321,7 @@ class PandasData(DataSourceBacktesting):
     ):
         timestep = timestep if timestep else self.MIN_TIMESTEP
         if exchange is not None:
-            logging.warning(
+            logger.warning(
                 f"the exchange parameter is not implemented for PandasData, but {exchange} was passed as the exchange"
             )
 
@@ -263,7 +333,10 @@ class PandasData(DataSourceBacktesting):
         if asset_to_find in self._data_store:
             data = self._data_store[asset_to_find]
         else:
-            logging.warning(f"The asset: `{asset}` does not exist or does not have data.")
+            if hasattr(asset, 'asset_type') and asset.asset_type == Asset.AssetType.INDEX:
+                logger.warning(f"The index asset `{asset.symbol}` does not exist or does not have data. Index data may not be available from this data source. If using Polygon, note that some index data (like SPX) requires a paid subscription. Consider using Yahoo Finance for broader index data coverage.")
+            else:
+                logger.warning(f"The asset: `{asset}` does not exist or does not have data.")
             return
 
         now = self.get_datetime()
@@ -271,7 +344,7 @@ class PandasData(DataSourceBacktesting):
             res = data.get_bars(now, length=length, timestep=timestep, timeshift=timeshift)
         # Return None if data.get_bars returns a ValueError
         except ValueError as e:
-            logging.info(f"Error getting bars for {asset}: {e}")
+            logger.info(f"Error getting bars for {asset}: {e}")
             return None
 
         return res
@@ -294,7 +367,10 @@ class PandasData(DataSourceBacktesting):
         if asset_to_find in self._data_store:
             data = self._data_store[asset_to_find]
         else:
-            logging.warning(f"The asset: `{asset}` does not exist or does not have data.")
+            if hasattr(asset, 'asset_type') and asset.asset_type == Asset.AssetType.INDEX:
+                logger.warning(f"The index asset `{asset.symbol}` does not exist or does not have data. Index data may not be available from this data source. If using Polygon, note that some index data (like SPX) requires a paid subscription. Consider using Yahoo Finance for broader index data coverage.")
+            else:
+                logger.warning(f"The asset: `{asset}` does not exist or does not have data.")
             return
 
         try:
@@ -304,7 +380,7 @@ class PandasData(DataSourceBacktesting):
                                               is_benchmark_asset=is_benchmark_asset)
         # Return None if data.get_bars returns a ValueError
         except ValueError as e:
-            logging.info(f"Error getting bars for {asset}: {e}")
+            logger.info(f"Error getting bars for {asset}: {e}")
             res = None
         return res
 
