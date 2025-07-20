@@ -212,87 +212,6 @@ class Data:
 
         return df
 
-    def set_date_format(self, df):
-        df.index.name = "datetime"
-        df.index = pd.to_datetime(df.index)
-        if not df.index.tzinfo:
-            df.index = pd.to_datetime(df.index).tz_localize(DEFAULT_PYTZ)
-        elif df.index.tzinfo != DEFAULT_PYTZ:
-            df.index = df.index.tz_convert(DEFAULT_PYTZ)
-    def set_date_format(self, df, timezone=None):
-        """
-        Ensure the DataFrame index (or timestamp level in MultiIndex) is in the correct datetime format and timezone.
-
-        Parameters
-        ----------
-        df : pd.DataFrame
-            The DataFrame to process. Can have a single index or a MultiIndex.
-        timezone : str or pytz.timezone, optional
-            The timezone to localize or convert the index to. If None, uses DEFAULT_PYTZ.
-
-        Returns
-        -------
-        pd.DataFrame
-            The DataFrame with the index (or timestamp level) properly formatted.
-        """
-        if timezone is None:
-            timezone = DEFAULT_PYTZ
-
-        if isinstance(df.index, pd.MultiIndex):
-            date_index = df.index.levels[1]
-        else:
-            date_index = df.index
-
-        # Check if the index is datetime (it has to be), and if it's not then try to find it in the columns
-        if not str(date_index.dtype).startswith("datetime"):
-            date_cols = [
-                "Date",
-                "date",
-                "Time",
-                "time",
-                "Datetime",
-                "datetime",
-                "timestamp",
-                "Timestamp",
-            ]
-            for date_col in date_cols:
-                if date_col in df.columns:
-                    df[date_col] = pd.to_datetime(df[date_col])
-                    df = df.set_index(date_col)
-                    break
-
-        # Handle MultiIndex
-        if isinstance(df.index, pd.MultiIndex):
-            if "timestamp" not in df.index.names:
-                raise ValueError("MultiIndex must have a 'timestamp' level")
-
-            # Extract the timestamp level
-            timestamp_level = df.index.get_level_values("timestamp")
-            timestamp_level = pd.to_datetime(timestamp_level, utc=True)  # Convert to UTC
-
-            # Handle timezone for the timestamp level
-            if timestamp_level.tzinfo is None:
-                timestamp_level = timestamp_level.tz_localize(timezone)
-            elif timestamp_level.tzinfo != timezone:
-                timestamp_level = timestamp_level.tz_convert(timezone)
-
-            # Rebuild the MultiIndex with the updated timestamp level
-            new_index = pd.MultiIndex.from_arrays(
-                [df.index.get_level_values(level) for level in df.index.names if level != "timestamp"] + [timestamp_level],
-                names=df.index.names
-            )
-            df = df.set_index(new_index)
-        else:
-            # Handle single index
-            df.index.name = "datetime"
-            df.index = pd.to_datetime(df.index)
-            if df.index.tzinfo is None:
-                df.index = df.index.tz_localize(timezone)
-            elif df.index.tzinfo != timezone:
-                df.index = df.index.tz_convert(timezone)
-
-        return df
-
     def set_date_format(self, df, timezone=None):
         """
         Ensure the DataFrame index (or timestamp level in MultiIndex) is in the correct datetime format and timezone.
@@ -472,7 +391,7 @@ class Data:
         df.loc[:, ~df.columns.isin(["open", "high", "low"])] = df.loc[
             :, ~df.columns.isin(["open", "high", "low"])
         ].ffill()
-            df["volume"] = 0
+        df["volume"] = 0
 
         # Forward-fill all columns except "open", "high", and "low"
         if any(col in df.columns for col in ["open", "high", "low", "close"]):
@@ -559,27 +478,9 @@ class Data:
         if dt in self.iter_index_dict:
             i = self.iter_index_dict[dt]
         else:
-            if is_benchmark_asset:
-                i = self.custom_asof(self.iter_index, dt)
-            else:
-                i = self.iter_index.asof(dt)
+            i = self.iter_index.asof(dt)
 
         return i
-
-    def custom_asof(self, index, label):
-        # Use asof to get the previous label
-        result = index.asof(label)
-        
-        # If the result is NaN, return the next label
-        if pd.isna(result):
-            # Find the index of the first label greater than the given label
-            next_labels = index[index.index > label]
-            if not next_labels.empty:
-                return next_labels.iloc[0]
-            else:
-                return None  # No next label exists
-        else:
-            return result
         
     def check_data(func):
         # Validates if the provided date, length, timeshift, and timestep
