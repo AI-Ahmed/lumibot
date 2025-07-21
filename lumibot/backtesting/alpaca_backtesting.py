@@ -29,6 +29,7 @@ from lumibot.tools.helpers import (
 logger = get_logger(__name__)
 
 from lumibot.tools.alpaca_helpers import sanitize_base_and_quote_asset
+from lumibot.credentials import ALPACA_CONFIG
 
 
 class AlpacaBacktesting(DataSourceBacktesting):
@@ -136,9 +137,13 @@ class AlpacaBacktesting(DataSourceBacktesting):
         self._remove_incomplete_current_bar = kwargs.get('remove_incomplete_current_bar', False)
 
         if config is None:
-            raise ValueError("Config cannot be None. Please provide a valid configuration.")
+            config = ALPACA_CONFIG
+            
+        # Check if the required config exists in the passed dict
         if not config.get("PAPER", True):
             raise ValueError("Backtesting is restricted to paper accounts. Pass in a paper account config.")
+        if not config.get("API_KEY") or not config.get("API_SECRET"):
+            raise ValueError("API key and secret are required for Alpaca authentication.")
 
         # Initialize clients based on available authentication method
         oauth_token = config.get("OAUTH_TOKEN")

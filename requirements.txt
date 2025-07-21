@@ -38,3 +38,4 @@ schwab-py>=1.5.0
 Flask>=2.3
 free-proxy
 requests-oauthlib
+pandas-market-calendars==5.1.1
