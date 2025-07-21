@@ -3,8 +3,7 @@ import time
 import datetime
 from decimal import Decimal
 import uuid
-from typing import Union, List, Type, Callable
-from loguru import logger
+from typing import Union, List, Type, Callable, Literal
 
 import jsonpickle
 import matplotlib
@@ -13,6 +12,9 @@ import pandas as pd
 import pandas_market_calendars as mcal
 from termcolor import colored
 from apscheduler.triggers.cron import CronTrigger
+
+from loguru import logger
+from lumibot import log
 
 from ..entities import Asset, Order, Position, Data, TradingFee, Quote
 from ..tools import get_risk_free_rate

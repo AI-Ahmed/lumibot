@@ -52,42 +52,59 @@ class AlpacaBacktesting(DataSourceBacktesting):
             pandas_data: dict | list = None,
             **kwargs
     ):
-        """
-        Initializes a class instance for handling backtesting data and parameters. This initialization 
-        process involves setting up key configurations, verifying account types, and preparing backtesting 
-        timings, timezones, and historical data clients. Data caching and warm-up trading days are also 
-        appropriately configured.
-
-        Args:
-            datetime_start (tz aware datetime): The starting datetime for the backtesting process. Inclusive.
-            datetime_end (tz aware datetime): The ending datetime for the backtesting process. Inclusive.
-            backtesting_started (datetime | None): Represents the datetime when backtesting started. Defaults to None.
-            config (dict | None): Configuration dictionary containing required API keys and account details.
-                Cannot be None as it's critical for API connections.
-            api_key (str | None): API key for authorized data access. Optional as it can typically be found 
-                within the provided config.
-            show_progress_bar (bool): Indicates whether to show a progress bar during data operations. 
-                Defaults to True.
-            delay (int | None): Delay in seconds added between operations to simulate real-world activity. 
-                Defaults to None.
-            pandas_data (dict | list): Data to be loaded directly into pandas, allowing analysis or backtesting 
-                without requiring external API calls.
-            **kwargs: Additional keyword arguments, such as:
-                - timestep (str): Interval for data ("day" or "minute"). Defaults to "day".
-                - refresh_cache (bool): Whether to force cache refresh. Defaults to False.
-                - warm_up_trading_days (int): The number of trading days used for warm-up before processing 
-                  the primary dataset. Defaults to 0.
-                - market (str): Indicates the stock exchange or market (e.g., "NYSE"). Defaults to "NYSE".
-                - auto_adjust (bool): Determines whether to auto-adjust data, such as stock splits. Defaults 
-                  to True.
-                remove_incomplete_current_bar (bool): Whether to remove the incomplete current bar from the data.
-                  Alpaca includes incomplete bars for the current bar (ie: it gives you a daily bar for the current
-                  day even if the day isn't over yet). That's not how lumibot does it, but it is probably
-                  what most Alpaca users expect so the default is False (leave incomplete bar in the data).
-
-        Raises:
-            ValueError: If the `config` argument is None or lacks a valid paper account setup.
-
+        """Initialize AlpacaBacktesting instance for backtesting with Alpaca data.
+        
+        Parameters
+        ----------
+        datetime_start : datetime, optional
+            The starting datetime for the backtesting period (inclusive).
+            Must be timezone-aware.
+        datetime_end : datetime, optional
+            The ending datetime for the backtesting period (inclusive).
+            Must be timezone-aware and have the same tzinfo as datetime_start.
+        backtesting_started : datetime, optional
+            The datetime when backtesting was initiated.
+        config : dict, required
+            Configuration dictionary containing API keys and account details.
+            Must include either OAuth token or API key/secret for authentication.
+        api_key : str, optional
+            API key for data access (typically included in config).
+        show_progress_bar : bool, default True
+            Whether to display a progress bar during data operations.
+        delay : int, optional
+            Delay in seconds between operations to simulate real-world activity.
+        pandas_data : dict or list, optional
+            Data to be loaded directly into pandas for analysis without API calls.
+        **kwargs : dict
+            Additional keyword arguments:
+            
+            - timestep : {'day', 'minute'}, default 'day'
+              Interval for data sampling.
+            - refresh_cache : bool, default False
+              Whether to force cache refresh.
+            - warm_up_trading_days : int, default 0
+              Number of trading days for warm-up before the primary dataset.
+            - market : str, default 'NASDAQ'
+              Stock exchange or market identifier.
+            - auto_adjust : bool, default True
+              Whether to auto-adjust data for stock splits and dividends.
+            - remove_incomplete_current_bar : bool, default False
+              Whether to remove incomplete current bar from data.
+              
+        Raises
+        ------
+        ValueError
+            If config is None, lacks valid paper account setup, or if
+            datetime_start and datetime_end have different timezone info.
+            
+        Notes
+        -----
+        This class handles backtesting data and parameters for Alpaca data source.
+        It sets up configurations, verifies account types, and prepares backtesting
+        timings, timezones, and historical data clients.
+        
+        The backtesting period includes warm-up days before the actual start date
+        to ensure strategies have sufficient historical data for initialization.
         """
         self._datetime = None
 
@@ -229,7 +246,27 @@ class AlpacaBacktesting(DataSourceBacktesting):
             quote: Asset | None = None,
             exchange: str | None = None
     ) -> float | Decimal | None:
-        """Returns the open price of the current bar."""
+        """Get the last price for an asset.
+        
+        Parameters
+        ----------
+        asset : Asset
+            The asset to get the price for.
+        quote : Asset, optional
+            The quote asset to price against. If None, uses the default quote asset.
+        exchange : str, optional
+            The exchange to get the price from (not used in backtesting).
+            
+        Returns
+        -------
+        float or Decimal or None
+            The open price of the current bar, or None if no data is available.
+            
+        Notes
+        -----
+        In backtesting, this returns the open price of the current bar, which is 
+        consistent with how market orders are filled in the backtesting broker.
+        """
 
         asset, quote = self._sanitize_base_and_quote_asset(asset, quote)
 
@@ -264,43 +301,45 @@ class AlpacaBacktesting(DataSourceBacktesting):
             include_after_hours: bool = True,
             remove_incomplete_current_bar: Optional[bool] = None,
     ) -> Bars | None:
-        """
-        Get bars for an asset by delegating to get_historical_prices_between_dates
-        for fetching the historical data, followed by additional processing.
-
-        Get bars for a given asset, going back in time from now, getting length number of bars by timestep.
-        For example, with a length of 10 and a timestep of "day", and now timeshift, this
-        would return the last 10 daily bars.
-
-        - Higher-level method that returns a `Bars` object
-        - Handles timezone conversions automatically
-        - Includes additional metadata and processing
-        - Preferred for strategy development and backtesting
-        - Returns normalized data with consistent format across data sources
-
+        """Get historical price bars for an asset.
+        
         Parameters
         ----------
         asset : Asset
-            The asset to get the bars for.
+            The asset to get historical prices for.
         length : int
-            The number of bars to get.
-        timestep : str
-            The timestep to get the bars at. Accepts "day" or "minute".
-        timeshift : datetime.timedelta
-            The amount of time to shift the reference point (self._datetime).
-            If you want 10 daily bars from 1 week ago (not including the last week),
-            you'd use timeshift=timedelta(days=7)
-        quote : Asset
-            The quote asset to get the bars for.
-        exchange : str
-            The exchange to get the bars for.
-        include_after_hours : bool
-            Whether to include after hours data.
-
+            The number of bars to retrieve. Must be positive.
+        timestep : str, optional
+            The time interval for bars. Either 'day' or 'minute'.
+            If None, uses the default timestep set during initialization.
+        timeshift : timedelta, optional
+            Amount of time to shift the reference point backward.
+            Example: timeshift=timedelta(days=7) gets data from 1 week ago.
+        quote : Asset, optional
+            The quote asset for pricing. If None, uses the default quote asset.
+        exchange : str, optional
+            The exchange to get data from (not used in backtesting).
+        include_after_hours : bool, default True
+            Whether to include after-hours data.
+        remove_incomplete_current_bar : bool, optional
+            Whether to remove the incomplete current bar from results.
+            If None, uses the default setting from initialization.
+            
         Returns
         -------
-        Bars | None
-            The bars for the asset.
+        Bars or None
+            A Bars object containing the historical price data.
+            
+        Raises
+        ------
+        ValueError
+            If length is not positive, or if not enough historical data is available.
+            
+        Notes
+        -----
+        This is a higher-level method that returns a normalized `Bars` object with
+        consistent format across data sources. It handles timezone conversions and
+        includes additional metadata processing.
         """
         if length <= 0:
             raise ValueError("Length must be positive.")
@@ -373,7 +412,25 @@ class AlpacaBacktesting(DataSourceBacktesting):
         return Bars(result_df, self.SOURCE, asset=asset, quote=quote)
 
     def get_chains(self, asset, quote=None):
-        """Mock implementation for getting option chains"""
+        """Get option chains for an asset.
+        
+        Parameters
+        ----------
+        asset : Asset
+            The underlying asset for which to get option chains.
+        quote : Asset, optional
+            The quote asset for pricing.
+            
+        Returns
+        -------
+        dict
+            Empty dictionary as options are not supported in backtesting.
+            
+        Notes
+        -----
+        This is a mock implementation as option chains are not supported
+        in the AlpacaBacktesting class.
+        """
         return {}
 
     def _get_asset_key(
@@ -388,23 +445,36 @@ class AlpacaBacktesting(DataSourceBacktesting):
             data_datetime_end: datetime = None,
             auto_adjust: bool = None,
     ) -> str:
-        """
-        Generate a unique key for an asset combination with specific parameters.
-
+        """Generate a unique key for asset data identification.
+        
         Parameters
         ----------
-        base_asset: Asset - Base asset of the pair.
-        quote_asset: Asset - Quote asset of the pair.
-        market: str - Market or exchange identifier.
-        tzinfo: pytz.tzinfo - Timezone information.
-        timestep: str - Timestep of the source data. Accepts "day" or "minute".
-        data_datetime_start: datetime - The start date of the data in the backtest.
-        data_datetime_end: datetime - The end date of the data in the backtest. Inclusive.
-        auto_adjust: bool - Flag to indicate if auto-adjustment is applied.
-
+        base_asset : Asset
+            Base asset of the trading pair.
+        quote_asset : Asset, optional
+            Quote asset of the trading pair. If None, uses default quote asset.
+        timestep : str, optional
+            Time interval for data. Either 'day' or 'minute'.
+        market : str, optional
+            Market or exchange identifier.
+        tzinfo : pytz.tzinfo, optional
+            Timezone information for the data.
+        data_datetime_start : datetime, optional
+            Start date of the data for backtesting.
+        data_datetime_end : datetime, optional
+            End date of the data for backtesting (inclusive).
+        auto_adjust : bool, optional
+            Whether auto-adjustment is applied to the data.
+            
         Returns
         -------
-        str - A unique key string.
+        str
+            A unique string key for identifying and caching the asset data.
+            
+        Raises
+        ------
+        ValueError
+            If base_asset is None or if timestep is invalid.
         """
 
         if base_asset is None:
@@ -461,6 +531,45 @@ class AlpacaBacktesting(DataSourceBacktesting):
             data_datetime_end: datetime = None,
             auto_adjust: bool = None,
     ) -> pd.DataFrame:
+        """Download and cache OHLCV data for an asset.
+        
+        Parameters
+        ----------
+        base_asset : Asset
+            Base asset of the trading pair.
+        quote_asset : Asset
+            Quote asset of the trading pair.
+        timestep : str
+            Time interval for data. Either 'day' or 'minute'.
+        market : str
+            Market or exchange identifier.
+        tzinfo : pytz.tzinfo
+            Timezone information for the data.
+        data_datetime_start : datetime
+            Start date of the data for backtesting.
+        data_datetime_end : datetime
+            End date of the data for backtesting (inclusive).
+        auto_adjust : bool
+            Whether auto-adjustment is applied to the data.
+            
+        Returns
+        -------
+        pandas.DataFrame
+            DataFrame containing the downloaded OHLCV data.
+            
+        Raises
+        ------
+        ValueError
+            If any required parameter is None.
+        RuntimeError
+            If data fetching fails or no data is returned.
+            
+        Notes
+        -----
+        This method handles both crypto and stock data through the appropriate
+        Alpaca client. It downloads data, processes it, and saves it to the cache
+        directory for future use.
+        """
         if base_asset is None:
             raise ValueError("The parameter 'base_asset' cannot be None.")
         if quote_asset is None:
@@ -567,19 +676,26 @@ class AlpacaBacktesting(DataSourceBacktesting):
         return df
 
     def _load_ohlcv_into_data_store(self, key: str) -> bool:
-        """
-        Loads OHLCV data from a cached file into the data store. If the loading is successful, returns True;
-        otherwise, returns False.
-    
+        """Load OHLCV data from cache into the data store.
+        
         Parameters
         ----------
         key : str
-            The unique key for the cached data file.
-    
+            Unique key identifying the cached data file.
+            
         Returns
         -------
         bool
-            True if data is successfully loaded into the _data_store, False otherwise.
+            True if data was successfully loaded, False otherwise.
+            
+        Notes
+        -----
+        This method attempts to load previously cached OHLCV data from a CSV file
+        into the internal data store. It handles timezone conversion to ensure
+        consistency with the configured timezone.
+        
+        If the file doesn't exist or cannot be properly loaded, the method
+        returns False, indicating that the data needs to be downloaded.
         """
         # Directory to find the cached data file.
         cache_dir = os.path.join(LUMIBOT_CACHE_FOLDER, self.CACHE_SUBFOLDER)
@@ -622,6 +738,48 @@ class AlpacaBacktesting(DataSourceBacktesting):
             data_datetime_end: datetime = None,
             auto_adjust: bool = None,
     ) -> pd.DataFrame:
+        """Get historical price data between specified dates.
+        
+        Parameters
+        ----------
+        base_asset : Asset
+            Base asset of the trading pair.
+        quote_asset : Asset, optional
+            Quote asset of the trading pair. If None, uses default quote asset.
+        timestep : str, optional
+            Time interval for data. Either 'day' or 'minute'.
+            If None, uses the default timestep.
+        market : str, optional
+            Market or exchange identifier.
+            If None, uses the default market.
+        tzinfo : pytz.tzinfo, optional
+            Timezone information for the data.
+            If None, uses the default timezone.
+        data_datetime_start : datetime, optional
+            Start date of the data for backtesting.
+            If None, uses the default start date.
+        data_datetime_end : datetime, optional
+            End date of the data for backtesting (inclusive).
+            If None, uses the default end date.
+        auto_adjust : bool, optional
+            Whether auto-adjustment is applied to the data.
+            If None, uses the default setting.
+            
+        Returns
+        -------
+        pandas.DataFrame
+            DataFrame containing the historical OHLCV data indexed by timestamp.
+            
+        Raises
+        ------
+        ValueError
+            If base_asset is None.
+            
+        Notes
+        -----
+        This method either loads data from cache or downloads it if not available.
+        It manages cache refreshing based on the refresh_cache setting.
+        """
 
         if base_asset is None:
             raise ValueError("Base asset must be provided.")
@@ -686,6 +844,40 @@ class AlpacaBacktesting(DataSourceBacktesting):
             trading_times: pd.DatetimeIndex,
             timestep: str
     ) -> pd.DataFrame:
+        """Reindex and fill missing data in OHLCV DataFrame.
+        
+        Parameters
+        ----------
+        df : pandas.DataFrame
+            DataFrame containing OHLCV data with columns: timestamp, open, high, low, close, volume.
+        trading_times : pandas.DatetimeIndex
+            DatetimeIndex containing all trading times that should be included.
+        timestep : str
+            Time interval for data. Either 'day' or 'minute'.
+            
+        Returns
+        -------
+        pandas.DataFrame
+            Reindexed DataFrame with filled missing values.
+            
+        Raises
+        ------
+        ValueError
+            If required columns are missing or timestep is invalid.
+            
+        Notes
+        -----
+        This method ensures the DataFrame has entries for all required trading times.
+        For daily bars, it preserves original timestamps but adds missing days.
+        For minute bars, it reindexes to include all trading minutes.
+        
+        Missing values are filled using the following rules:
+        - Missing volume values are filled with 0.0
+        - Missing close prices are forward-filled
+        - Missing open/high/low prices are filled with close prices
+        - Any remaining missing open prices are backward-filled
+        - Any remaining missing high/low/close prices are filled with open prices
+        """
         if df.index.name == 'timestamp':
             df = df.reset_index()
 

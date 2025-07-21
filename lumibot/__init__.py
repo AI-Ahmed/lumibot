@@ -61,10 +61,12 @@ if not os.path.exists(LUMIBOT_CACHE_FOLDER):
             {e}. Please fix the issue to use data caching."""
         )
 
+# ================================
 # LOGGING CONFIGURATIONS
+# ================================
+
 # Remove default logger first
 log.remove()
-
 # Define custom levels with colors
 log.level("BUY", no=25, color="<green>")
 log.level("SELL", no=35, color="<red>")
@@ -107,10 +109,11 @@ log.add(
 buy_logger = log.bind(buy=True)
 sell_logger = log.bind(sell=True)
 
-# Export the loggers
-__all__ = ["log", "buy_logger", "sell_logger"]
 
-# === Backward Compatibility Aliases ===
+# ================================
+# Backward Compatibility Aliases
+# ================================
+
 # Some older code and documentation may still refer to the top-level
 # package name `entities` (e.g. `entities.asset`) that existed in
 # earlier Lumibot versions.  To avoid breaking those references we
@@ -162,5 +165,8 @@ __all__ = [
     'backtesting',
     'entities',
     'data_sources',
-    'traders'
+    'traders',
+    'log',
+    'buy_logger',
+    'sell_logger'
 ]

@@ -12,6 +12,59 @@ logger = get_logger(__name__)
 
 
 class Trader:
+    """Trader class for managing and executing trading strategies.
+    
+    The Trader class serves as a container and executor for trading strategies.
+    It handles the lifecycle of strategies including initialization, execution,
+    and termination. It supports both live trading and backtesting modes.
+    
+    Parameters
+    ----------
+    logfile : str, optional
+        Path to the logfile. If not specified, logs will be saved in the default
+        log directory.
+    backtest : bool, default False
+        Whether to run strategies in backtest mode. Acts as a safety check to
+        prevent mixing backtesting and live strategies.
+    debug : bool, default False
+        Whether to run in debug mode with increased logging verbosity.
+    strategies : list, optional
+        List of strategy instances to run. If not provided, strategies must be
+        added using `add_strategy()`.
+    quiet_logs : bool, default False
+        Whether to quiet backtest logs by setting the log level to ERROR.
+        
+    Attributes
+    ----------
+    logdir : Path
+        Directory where log files are stored.
+    logfile : Path or None
+        Path to the log file if specified, otherwise None.
+    debug : bool
+        Whether debug mode is enabled.
+    backtest : bool
+        Whether backtest mode is enabled.
+    quiet_logs : bool
+        Whether quiet logging is enabled for backtesting.
+        
+    Methods
+    -------
+    ``add_strategy(strategy)``
+        Add a strategy to the trader.
+    ``run_all(async_=False, show_plot=True, show_tearsheet=True, save_tearsheet=True,
+            show_indicators=True, tearsheet_file=None, base_filename=None)``
+        Run all added strategies.
+    ``run_all_async()``
+        Run all strategies asynchronously.
+    ``stop_all()``
+        Stop all running strategies.
+    
+    Notes
+    -----
+    - Only one strategy can be backtested at a time.
+    - Running multiple live strategies concurrently is not currently supported.
+    - Signal handlers are set up to gracefully handle termination signals.
+    """
     def __init__(self, logfile="", backtest=False, debug=False, strategies=None, quiet_logs=False):
         """
 
