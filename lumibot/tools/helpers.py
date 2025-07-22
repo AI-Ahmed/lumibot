@@ -323,6 +323,9 @@ import sys
 import datetime as dt
 from termcolor import colored  # Ensure termcolor is installed with pip
 
+# Global flag to track if a progress bar is currently displayed
+_progress_bar_active = False
+_progress_bar_completed = False
 
 def print_progress_bar(
     value,
@@ -355,6 +358,8 @@ def print_progress_bar(
         cash (float): Current cash (unused)
         portfolio_value (float): Current portfolio value
     """
+    global _progress_bar_active, _progress_bar_completed
+    
     # Ensure total_length is numeric
     total_length = end_value - start_value
     if isinstance(total_length, dt.timedelta):
@@ -372,6 +377,10 @@ def print_progress_bar(
     progress = max(min(current_length / total_length, 1.0), 0.0)
     percent = progress * 100
     percent_str = f"{percent:.{decimals}f}%"
+
+    # If progress is complete and we've already shown the final progress bar, don't show it again
+    if progress >= 1.0 and _progress_bar_completed:
+        return
 
     # Time calculations
     now = dt.datetime.now()
@@ -412,17 +421,51 @@ def print_progress_bar(
     bar = fill * filled_len + '-' * (length - filled_len)
     colored_bar = colored(bar, 'green')
 
-    # Assembly
-    progress_line = f"\r{prefix} |{colored_bar}| {percent_str} {time_info}"
-    if portfolio_info:
-        progress_line += f" {portfolio_info}"
+    # Assembly - handle progress bar state
+    if progress >= 1.0:
+        # Progress is complete - write final bar and set completion flags
+        progress_line = f"{prefix} |{colored_bar}| {percent_str} {time_info}"
+        if portfolio_info:
+            progress_line += f" {portfolio_info}"
         
-    # Truncate if over terminal width (ANSI codes aren't counted)
-    max_allowed = os.get_terminal_size().columns if 'TERM' in os.environ else 120
-    progress_line = progress_line[:max_allowed]
-
-    file.write(progress_line)
+        # Clear any existing progress line and write the final one with newline
+        file.write(f"\r{' ' * 120}\r{progress_line}\n")
+        _progress_bar_active = False
+        _progress_bar_completed = True
+    else:
+        # Progress update - use carriage return to overwrite
+        progress_line = f"\r{prefix} |{colored_bar}| {percent_str} {time_info}"
+        if portfolio_info:
+            progress_line += f" {portfolio_info}"
+        
+        # Truncate if over terminal width (ANSI codes aren't counted)
+        max_allowed = os.get_terminal_size().columns if 'TERM' in os.environ else 120
+        progress_line = progress_line[:max_allowed]
+        
+        file.write(progress_line)
+        _progress_bar_active = True
+        _progress_bar_completed = False
+    
     file.flush()
+
+def is_progress_bar_active():
+    """Check if a progress bar is currently displayed on the terminal."""
+    global _progress_bar_active
+    return _progress_bar_active
+
+def clear_progress_bar_for_logging():
+    """Clear the progress bar to make room for log messages."""
+    global _progress_bar_active
+    if _progress_bar_active:
+        sys.stdout.write('\n')
+        sys.stdout.flush()
+        _progress_bar_active = False
+
+def reset_progress_bar_state():
+    """Reset the progress bar state for a new backtest session."""
+    global _progress_bar_active, _progress_bar_completed
+    _progress_bar_active = False
+    _progress_bar_completed = False
 
 def get_lumibot_datetime():
     return dt.datetime.now().astimezone(LUMIBOT_DEFAULT_PYTZ)

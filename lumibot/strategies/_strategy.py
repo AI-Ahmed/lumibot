@@ -1160,6 +1160,14 @@ class _Strategy:
         >>>     benchmark_asset=benchmark_asset,
         >>> )
         """
+        
+        # Reset progress bar state at the start of each backtest
+        try:
+            from lumibot.tools.helpers import reset_progress_bar_state
+            reset_progress_bar_state()
+        except ImportError:
+            # If helpers module isn't available, continue without resetting
+            pass
 
         if name is None:
             name = self.__name__

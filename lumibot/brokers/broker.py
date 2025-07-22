@@ -1344,29 +1344,39 @@ class Broker(ABC):
         """notify relevant subscriber/strategy about
         new order event"""
 
-        self.logger.info(colored(f"New order was created: {order}", color="green"))
+        # Use loguru for colored output to match BUY/SELL signal colors
+        from loguru import logger as log
+        emoji = "🟢" if order.is_buy_order() else "🔴"
+        if order.is_buy_order():
+            # Use bright green color like BUY signals
+            log.opt(colors=True).info(f"<fg #00ff00><bold>{emoji} New order was created: {order}</bold></fg #00ff00>")
+        else:
+            # Use bright red for sell orders
+            log.opt(colors=True).info(f"<fg #ff0000><bold>{emoji} New order was created: {order}</bold></fg #ff0000>")
 
         payload = dict(order=order)
         subscriber = self._get_subscriber(order.strategy)
         if subscriber:
             subscriber.add_event(subscriber.NEW_ORDER, payload)
+        else:
+            self.logger.error(f"Subscriber {order.strategy} not found", color="red")
 
     def _on_canceled_order(self, order):
         """notify relevant subscriber/strategy about
         canceled order event"""
 
-        self.logger.info(colored(f"Order was canceled: {order}", color="green"))
+        self.logger.info(colored(f"❌ Order was canceled: {order}", color="yellow"))
 
         payload = dict(order=order)
         subscriber = self._get_subscriber(order.strategy)
         if subscriber:
             subscriber.add_event(subscriber.CANCELED_ORDER, payload)
+        else:
+            self.logger.error(f"Subscriber {order.strategy} not found", color="red")
 
     def _on_partially_filled_order(self, position, order, price, quantity, multiplier):
         """notify relevant subscriber/strategy about
         partially filled order event"""
-
-        self.logger.info(colored(f"Order was partially filled: {order}", color="green"))
 
         payload = dict(
             position=position,
@@ -1385,7 +1395,15 @@ class Broker(ABC):
         """notify relevant subscriber/strategy about
         filled order event"""
 
-        self.logger.info(colored(f"Order was filled: {order}", color="green"))
+        # Use loguru for colored output to match BUY/SELL signal colors
+        from loguru import logger as log
+        emoji = "🟢" if order.is_buy_order() else "🔴"
+        if order.is_buy_order():
+            # Use bright green color like BUY signals
+            log.opt(colors=True).info(f"<fg #00ff00><bold>{emoji} Order was filled: {order} @ ${price} fill</bold></fg #00ff00>")
+        else:
+            # Use bright red for sell orders
+            log.opt(colors=True).info(f"<fg #ff0000><bold>{emoji} Order was filled: {order} @ ${price} fill</bold></fg #ff0000>")
 
         payload = dict(
             position=position,
@@ -1436,11 +1454,6 @@ class Broker(ABC):
     def _process_trade_event(self, stored_order, type_event, price=None, filled_quantity=None, multiplier=1, error=None): # Add error parameter
         """process an occurred trading event and update the
         corresponding order"""
-        # Log that the trade event was received
-        self.logger.info(
-            f"Processing trade event. Trade event received for {stored_order.strategy} strategy: {type_event} "
-            f"{stored_order.symbol} ID={stored_order.identifier}, processed by broker {self.name}"
-        )
 
         if self._hold_trade_events and not self.IS_BACKTESTING_BROKER:
             # Log that the trade event was held

@@ -251,6 +251,14 @@ class LumibotFormatter(logging.Formatter):
         )
     
     def format(self, record):
+        # Check if we need to clear progress bar before logging
+        try:
+            from lumibot.tools.helpers import clear_progress_bar_for_logging
+            clear_progress_bar_for_logging()
+        except ImportError:
+            # If helpers module isn't available, continue without clearing
+            pass
+        
         # Shorten the pathname to just the filename for cleaner output
         if hasattr(record, 'pathname'):
             record.pathname = os.path.basename(record.pathname)

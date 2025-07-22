@@ -7,16 +7,27 @@ import numpy as np
 
 from .config import ALPACA_CONFIG, IS_BACKTESTING, POLYGON_KEY
 
-from lumibot.backtesting import AlpacaDataBacktesting
+from lumibot.backtesting import AlpacaBacktesting
 from lumibot.backtesting import PolygonDataBacktesting, YahooDataBacktesting
 from lumibot.brokers import Alpaca
 from lumibot.strategies import Strategy
 from lumibot.entities import Asset
+from lumibot.traders import Trader
 
 from lumibot import log
 
 class TAStrategy(Strategy):
-    def initialize(self, tickers=None, start_date=datetime(2020, 1, 1), end_date=datetime(2025, 1, 1)):
+    parameters = {
+        "tickers": "AAPL",
+        "start_date": datetime(2020, 1, 1),
+        "end_date": datetime(2025, 1, 1)
+    }
+
+    def initialize(self):
+        tickers = self.parameters["tickers"]
+        start_date = self.parameters["start_date"]
+        end_date = self.parameters["end_date"]
+        
         if tickers is None:
             tickers = ["AAPL", "MSFT", "GOOGL"]
         elif isinstance(tickers, str):
@@ -27,7 +38,6 @@ class TAStrategy(Strategy):
         self.start_date = pd.Timestamp(start_date).tz_localize(UTC) if start_date.tzinfo is None else start_date
         self.end_date = pd.Timestamp(end_date).tz_localize(UTC) if end_date.tzinfo is None else end_date
         self.stop_cash = self.cash * 0.85
-        self.timestep = "day"
         
         self.data = None
         self.sma_period = 50
@@ -144,86 +154,150 @@ class TAStrategy(Strategy):
         return 0
 
     def on_trading_iteration(self):
+        """
+        Execute trading logic for each iteration.
+        
+        Trading Rules:
+        - Buy: Price > SMA, ADX > 20 (lowered), +DI > -DI, RSI < 75 (raised)
+        - Sell: Price < SMA, ADX > 20 (lowered), -DI > +DI, OR RSI > 75 (lowered)
+        """
         self.log_message("Trading iteration started")
         current_dt = self.get_datetime()
+        
+        # Check if strategy should end
         if current_dt >= self.end_date:
             self.log_message("End date reached, selling all positions")
             self.sell_all()
             return
 
+        # Get data and indicators
         if not self._get_historical_data() or self.data is None or self.data.empty:
-            log.warning("No data available, skipping trading iteration")
+            self.log_message("No data available, skipping trading iteration", show_in_terminal=True, type_of_log='warning')
             return
 
         sma, rsi, adx_df = self._get_technical_indicators()
-        if sma is None or adx_df is None:
+        if sma is None or rsi is None or adx_df is None:
             self.log_message("Failed to calculate indicators, skipping trading iteration", show_in_terminal=True, type_of_log='error')
             return
 
         buy_signals = []
         sell_signals = []
+        active_tickers = 0
         
         for ticker in self.tickers:
             ticker_symbol = ticker.symbol
             try:
+                # Validate data availability
                 ticker_data = self.data.xs(ticker_symbol, level="symbol")
                 if ticker_data.empty:
                     continue
-                if ticker_symbol not in sma.index.get_level_values('symbol'):
+                    
+                # Check if indicators are available for this ticker
+                sma_available = ticker_symbol in sma.index.get_level_values('symbol') if hasattr(sma.index, 'get_level_values') else False
+                rsi_available = ticker_symbol in rsi.index.get_level_values('symbol') if hasattr(rsi.index, 'get_level_values') else False
+                adx_available = ticker_symbol in adx_df.index.get_level_values('symbol') if hasattr(adx_df.index, 'get_level_values') else False
+                
+                if not (sma_available and rsi_available and adx_available):
                     continue
-                if ticker_symbol not in adx_df.index.get_level_values('symbol'):
+
+                # Get indicator values with error handling
+                try:
+                    sma_val = float(sma.xs(ticker_symbol, level="symbol").iloc[-1])
+                    rsi_val = float(rsi.xs(ticker_symbol, level="symbol").iloc[-1])
+                    adx_val = float(adx_df.xs(ticker_symbol, level="symbol")['adx'].iloc[-1])
+                    plus_di = float(adx_df.xs(ticker_symbol, level="symbol")['plus_di'].iloc[-1])
+                    minus_di = float(adx_df.xs(ticker_symbol, level="symbol")['minus_di'].iloc[-1])
+                except Exception as e:
                     continue
 
-                sma_val = float(sma.xs(ticker_symbol, level="symbol").iloc[-1])
-                rsi_val = float(rsi.xs(ticker_symbol, level="symbol").iloc[-1])
-                adx_val = float(adx_df.xs(ticker_symbol, level="symbol")['adx'].iloc[-1])
-                plus_di = float(adx_df.xs(ticker_symbol, level="symbol")['plus_di'].iloc[-1])
-                minus_di = float(adx_df.xs(ticker_symbol, level="symbol")['minus_di'].iloc[-1])
-
-                last_price = self.get_last_price(ticker, timestep=self.timestep)
-                self.log_message(
-                    f"{ticker_symbol}: Price: {last_price:.2f}, SMA: {sma_val:.2f}, RSI: {rsi_val:.2f}, ADX: {adx_val:.2f}, +DI: {plus_di:.2f}, -DI: {minus_di:.2f}",
-                    show_in_terminal=True,
-                    type_of_log='debug'
-                )
-
+                last_price = self.get_last_price(ticker)
                 current_position = self._get_position_for_asset(ticker)
+                
+                # Trading conditions
+                price_above_sma = last_price > sma_val
+                adx_strong = adx_val > 15  # Further lowered from 20
+                bullish_momentum = plus_di > minus_di
+                not_overbought = rsi_val < 80  # Further raised from 75
+                has_cash = self.cash > self.stop_cash
+                
+                active_tickers += 1
 
-                if last_price > sma_val and adx_val > 25 and plus_di > minus_di:
-                    if self.cash > self.stop_cash:
-                        signal_strength = plus_di - minus_di
-                        buy_quantity = max(1, int(signal_strength))
-                        max_quantity = int(self.cash * 0.1 / last_price)  # Corrected typo: self.cash instead of self.c.ash
-                        buy_quantity = min(buy_quantity, max_quantity)
-                        if buy_quantity > 0:
-                            buy_signals.append(f"{ticker_symbol}: Buy {buy_quantity} @ {last_price:.2f}")
-                            log.log("BUY", f"BUY SIGNAL [{current_dt}]: {ticker_symbol} - {buy_quantity} shares at {last_price:.2f}", show_in_terminal=True)
-                            order = self.create_order(ticker, buy_quantity, "buy")
-                            self.submit_order(order)
+                # BUY LOGIC
+                buy_conditions_met = all([price_above_sma, adx_strong, bullish_momentum, not_overbought, has_cash])
+                
+                if buy_conditions_met:
+                    # Position sizing
+                    max_allocation_per_position = min(0.15, 1.0 / len(self.tickers))
+                    position_value = self.cash * max_allocation_per_position
+                    buy_quantity = int(position_value / last_price)
+                    
+                    if buy_quantity > 0:
+                        buy_signals.append(f"{ticker_symbol}: Buy {buy_quantity} @ {last_price:.2f}")
+                        log.log("BUY", f"BUY SIGNAL [{current_dt}]: {ticker_symbol} - {buy_quantity} shares at {last_price:.2f} (RSI: {rsi_val:.1f})")
+                        order = self.create_order(ticker, buy_quantity, "buy")
+                        self.submit_order(order)
 
-                elif last_price < sma_val and adx_val > 25 and minus_di > plus_di:
-                    if current_position > 0:
+                # SELL LOGIC
+                elif current_position > 0 and (
+                    (last_price < sma_val and adx_val > 15 and minus_di > plus_di) or  # Trend reversal
+                    rsi_val > 80  # Overbought threshold
+                ):
+                    if rsi_val > 80:
+                        sell_percent = min(40, max(25, (rsi_val - 80) * 3))
+                    else:
                         signal_strength = minus_di - plus_di
-                        sell_percent = min(100, signal_strength * 10)
-                        sell_quantity = max(1, int(current_position * sell_percent / 100))
-                        sell_quantity = min(sell_quantity, current_position)
-                        if sell_quantity > 0:
-                            sell_signals.append(f"{ticker_symbol}: Sell {sell_quantity} @ {last_price:.2f}")
-                            log.log("SELL", f"SELL SIGNAL [{current_dt}]: {ticker_symbol} - {sell_quantity} shares at {last_price:.2f}", show_in_terminal=True)
-                            order = self.create_order(ticker, sell_quantity, "sell")
-                            self.submit_order(order)
+                        sell_percent = min(60, max(20, signal_strength * 2))
+                    
+                    sell_quantity = max(1, int(current_position * sell_percent / 100))
+                    sell_quantity = min(sell_quantity, current_position)
+                    
+                    if sell_quantity > 0:
+                        sell_reason = "Overbought (RSI)" if rsi_val > 80 else "Trend Reversal"
+                        sell_signals.append(f"{ticker_symbol}: Sell {sell_quantity} @ {last_price:.2f} ({sell_reason})")
+                        log.log("SELL", f"SELL SIGNAL [{current_dt}]: {ticker_symbol} - {sell_quantity} shares at {last_price:.2f} (RSI: {rsi_val:.1f}, Reason: {sell_reason})")
+                        order = self.create_order(ticker, sell_quantity, "sell")
+                        self.submit_order(order)
 
             except Exception as e:
                 self.log_message(f"Error processing {ticker_symbol}: {str(e)}", show_in_terminal=True, type_of_log='critical')
 
-        if buy_signals:
-            self.log_message(f"Buy signals: {', '.join(buy_signals)}", show_in_terminal=False)
-        if sell_signals:
-            self.log_message(f"Sell signals: {', '.join(sell_signals)}", show_in_terminal=False)
-
-        if current_dt >= self.end_date:
-            self.log_message("Strategy end date reached. Closing all positions.")
-            self.sell_all()
+        # FALLBACK STRATEGY: Simple momentum when TA conditions are too restrictive
+        if not buy_signals and not sell_signals and active_tickers > 0:
+            # Simple momentum strategy: buy if price > 20-day average, sell if below
+            for ticker in self.tickers[:2]:  # Limit to first 2 tickers to avoid overallocation
+                try:
+                    current_position = self._get_position_for_asset(ticker)
+                    last_price = self.get_last_price(ticker)
+                    ticker_symbol = ticker.symbol
+                    
+                    # Get 20-day average from our data
+                    ticker_data = self.data.xs(ticker_symbol, level="symbol")
+                    if len(ticker_data) >= 20:
+                        avg_20 = ticker_data['close'].tail(20).mean()
+                        
+                        # Simple buy condition: price 2% above 20-day average and no position
+                        if last_price > avg_20 * 1.02 and current_position == 0 and self.cash > self.stop_cash:
+                            position_value = self.cash * 0.1  # 10% allocation
+                            buy_quantity = int(position_value / last_price)
+                            
+                            if buy_quantity > 0:
+                                log.log("BUY", f"MOMENTUM BUY [{current_dt}]: {ticker_symbol} - {buy_quantity} shares at {last_price:.2f} (20-day avg: ${avg_20:.2f})")
+                                order = self.create_order(ticker, buy_quantity, "buy")
+                                self.submit_order(order)
+                                break  # Only one buy per iteration
+                        
+                        # Simple sell condition: price 2% below 20-day average and have position
+                        elif last_price < avg_20 * 0.98 and current_position > 0:
+                            sell_quantity = int(current_position * 0.3)  # Sell 30%
+                            
+                            if sell_quantity > 0:
+                                log.log("SELL", f"MOMENTUM SELL [{current_dt}]: {ticker_symbol} - {sell_quantity} shares at {last_price:.2f} (20-day avg: ${avg_20:.2f})")
+                                order = self.create_order(ticker, sell_quantity, "sell")
+                                self.submit_order(order)
+                                break  # Only one sell per iteration
+                                
+                except Exception as e:
+                    continue
 
     def on_filled_order(self, position, order, price, quantity, multiplier):
         self.log_message(f"Filled order: {order}, {position}, {price}, {quantity}, {multiplier}", show_in_terminal=False)
@@ -233,18 +307,17 @@ class TAStrategy(Strategy):
 
 if __name__ == "__main__":
     if IS_BACKTESTING:
-        start = datetime(2024, 1, 30)
+        start = datetime(2023, 1, 30)
         end = datetime(2024, 10, 31)
+
         TAStrategy.run_backtest(
-            AlpacaDataBacktesting,
+            AlpacaBacktesting,
             start,
             end,
             benchmark_asset="SPY",
             risk_free_rate=0.025,
-            alpaca_api_key=ALPACA_CONFIG["API_KEY"],
-            alpaca_secret_key=ALPACA_CONFIG["API_SECRET"],
             parameters={
-                # "tickers": "AAPL",
+                "tickers": ["AAPL", "GOOGL", "NVDA", "TSLA", "TSM"],
                 "start_date": start,
                 "end_date": end
             },
@@ -253,6 +326,14 @@ if __name__ == "__main__":
             save_logfile=False
         )
     else:
+        trader = Trader()
         broker = Alpaca(ALPACA_CONFIG)
-        strategy = TAStrategy(broker=broker, start_date=datetime(2023, 10, 31), end_date=datetime.now())
-        strategy.run_live()
+        strategy = TAStrategy(broker=broker,
+                              parameters={
+                                  "tickers": "AAPL",
+                                  "start_date": datetime(2023, 10, 31),
+                                  "end_date": datetime.now()
+                              })
+        trader.add_strategy(strategy)
+        trader.run_all()
+        

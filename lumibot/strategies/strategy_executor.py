@@ -327,9 +327,6 @@ class StrategyExecutor(Thread):
             return
 
         if event == self.NEW_ORDER:
-            # Log that we are processing a new order.
-            self.strategy.logger.info(f"Processing a new order, payload: {payload}")
-
             self._on_new_order(**payload)
 
         elif event == self.CANCELED_ORDER:

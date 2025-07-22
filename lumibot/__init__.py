@@ -68,21 +68,21 @@ if not os.path.exists(LUMIBOT_CACHE_FOLDER):
 # Remove default logger first
 log.remove()
 # Define custom levels with colors
-log.level("BUY", no=25, color="<green>")
-log.level("SELL", no=35, color="<red>")
+log.level("BUY", no=25, color="<bold><green>")
+log.level("SELL", no=35, color="<bold><red>")
 
 # Dynamic format function for terminal with granular color control
 def dynamic_format(record):
     level = record["level"].name
     
     if level == "BUY":
-        return "\n<green>{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {message}</green>\n"
+        return "\n<fg #00ff00><bold> {time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | 🟢 {message}</bold></fg #00ff00>\n"
     elif level == "SELL":
-        return "\n<red>{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {message}</red>\n"
+        return "\n<fg #ff0000><bold> {time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | 🔴 {message}</bold></fg #ff0000>\n"
     else:
         # For standard log levels, use individual coloring for each component
         # Let loguru handle the level coloring automatically
-        return "\n<white>{time:YYYY-MM-DD HH:mm:ss.SSS}</white> | <level>{level: <8}</level> | <light-blue>{name}:{function}:{line}</light-blue> - {message}\n"
+        return "\n<white>{time:YYYY-MM-DD HH:mm:ss.SSS}</white> | <level>{level: <8}</level> | <cyan>{name}:{function}:{line}</cyan> - {message}\n"
 
 # Add sink for buy.log (file output)
 log.add(
