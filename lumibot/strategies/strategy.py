@@ -385,6 +385,10 @@ class Strategy(_Strategy):
         if not self.save_logfile and self.is_backtesting:
             return
 
+        # Check if INFO level is enabled before logging
+        if not self.logger.isEnabledFor(logging.INFO):
+            return
+
         if color:
             colored_message = colored(message, color)
             self.logger.info(colored_message)

@@ -60,7 +60,7 @@ if "GIT_TOKEN" in os.environ:
 
 setuptools.setup(
     name="lumibot",
-    version="3.17.15",
+    version="3.18.2",
     author="Robert Grzesik",
     author_email="rob@lumiwealth.com",
     description="Backtesting and Trading Library, Made by Lumiwealth.",
