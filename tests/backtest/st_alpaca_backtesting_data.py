@@ -233,7 +233,6 @@ class TAStrategy(Strategy):
                     
                     if buy_quantity > 0:
                         buy_signals.append(f"{ticker_symbol}: Buy {buy_quantity} @ {last_price:.2f}")
-                        log.log("BUY", f"BUY SIGNAL [{current_dt}]: {ticker_symbol} - {buy_quantity} shares at {last_price:.2f} (RSI: {rsi_val:.1f})")
                         order = self.create_order(ticker, buy_quantity, "buy")
                         self.submit_order(order)
 
@@ -254,7 +253,6 @@ class TAStrategy(Strategy):
                     if sell_quantity > 0:
                         sell_reason = "Overbought (RSI)" if rsi_val > 80 else "Trend Reversal"
                         sell_signals.append(f"{ticker_symbol}: Sell {sell_quantity} @ {last_price:.2f} ({sell_reason})")
-                        log.log("SELL", f"SELL SIGNAL [{current_dt}]: {ticker_symbol} - {sell_quantity} shares at {last_price:.2f} (RSI: {rsi_val:.1f}, Reason: {sell_reason})")
                         order = self.create_order(ticker, sell_quantity, "sell")
                         self.submit_order(order)
 

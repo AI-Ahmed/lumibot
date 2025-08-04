@@ -6,14 +6,13 @@ from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_EVEN
 
 import pandas as pd
-from alpaca.data.historical import CryptoHistoricalDataClient
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import CryptoBarsRequest, StockBarsRequest
+from alpaca.data.historical import CryptoHistoricalDataClient, StockHistoricalDataClient
+from alpaca.data.requests import CryptoBarsRequest, StockBarsRequest, StockTradesRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from lumibot.tools.lumibot_logger import get_logger
 from lumibot.data_sources import DataSourceBacktesting, AlpacaData
-from lumibot.entities import Asset, Bars
+from lumibot.entities import Asset, Bars, AssetsMapping
 from lumibot import (
     LUMIBOT_CACHE_FOLDER,
 )
@@ -25,6 +24,11 @@ from lumibot.tools.helpers import (
     get_decimals,
     quantize_to_num_decimals,
 )
+
+try:
+    from fpap.data.utils.data_processing import data_prep
+except ImportError:
+    data_prep = None
 
 logger = get_logger(__name__)
 
@@ -228,16 +232,52 @@ class AlpacaBacktesting(DataSourceBacktesting):
         # So if you run the backtest until the last day of data, lumibot will crash when it tries to calculate
         # the portfolio value. To avoid that crash (and because im avoiding dealing with people complaining about
         # backtest behavior changing if i fix it) im just hacking this so the backtest ends before the data runs out.
-        if self._timestep == 'day':
-            end_shift = -3
+        
+        # For HFT backtests or very short periods, we need to be more careful about end_shift
+        trading_days_count = len(self._trading_days)
+        
+        if trading_days_count < 3:
+            # For very short periods (HFT), just set end time slightly before the actual end time
+            # to ensure there's enough data for final calculations
+            logger.info(
+                f"Short backtesting period detected with only {trading_days_count} trading day(s). "
+                f"Adjusting end time to ensure proper data availability for HFT."
+            )
+            
+            # For minute data, set the end time a few minutes before the actual end
+            if self._timestep == 'minute':
+                # If we have at least one trading day
+                if trading_days_count > 0:
+                    # Get the last market close and set end time 5 minutes before that
+                    last_market_close = self._trading_days.iloc[-1]['market_close']
+                    self.datetime_end = last_market_close - timedelta(minutes=5)
+                else:
+                    # Very rare case - no trading days found
+                    # Just use a time shortly before the requested end date
+                    self.datetime_end = datetime_end - timedelta(minutes=5)
+            else:
+                # For day timestep, use the first trading day if we have only one or two
+                if trading_days_count > 0:
+                    self.datetime_end = self._trading_days.iloc[0]['market_open']
+                else:
+                    # Very rare case - no trading days found
+                    self.datetime_end = datetime_start
         else:
-            end_shift = -3
+            # Original logic for normal backtesting periods
+            if self._timestep == 'day':
+                end_shift = -3
+            else:
+                # For minute timestep (HFT), use a smaller end_shift to preserve more of the requested date range
+                end_shift = -5
 
-        # stop backtesting before the last trading date of the backtest
-        # so there's one day of data the backtester has to calculate all its stuff.
-        last_trading_day = self._trading_days.iloc[end_shift]['market_open']
-        self.datetime_end = last_trading_day
+            # Ensure end_shift is still within bounds (defensive programming)
+            end_shift = max(-trading_days_count, end_shift)
 
+            # stop backtesting before the last trading date of the backtest
+            # so there's one day of data the backtester has to calculate all its stuff.
+            last_trading_day = self._trading_days.iloc[end_shift]['market_open']
+            self.datetime_end = last_trading_day
+        
         self.datetime_start = start_dt
         self._datetime = self.datetime_start
 
@@ -247,16 +287,16 @@ class AlpacaBacktesting(DataSourceBacktesting):
 
     def get_last_price(
             self,
-            asset: Asset,
+            asset: Asset | list[Asset],
             quote: Asset | None = None,
             exchange: str | None = None
-    ) -> float | Decimal | None:
-        """Get the last price for an asset.
+    ) -> float | Decimal | dict | None:
+        """Get the last price for an asset or list of assets.
         
         Parameters
         ----------
-        asset : Asset
-            The asset to get the price for.
+        asset : Asset or list[Asset]
+            The asset or list of assets to get the price for.
         quote : Asset, optional
             The quote asset to price against. If None, uses the default quote asset.
         exchange : str, optional
@@ -264,14 +304,18 @@ class AlpacaBacktesting(DataSourceBacktesting):
             
         Returns
         -------
-        float or Decimal or None
-            The open price of the current bar, or None if no data is available.
+        float or Decimal or dict or None
+            If asset is a single Asset: The open price of the current bar, or None if no data is available.
+            If asset is a list: A dictionary mapping each asset to its last price.
             
         Notes
         -----
         In backtesting, this returns the open price of the current bar, which is 
         consistent with how market orders are filled in the backtesting broker.
         """
+        # Handle list of assets by calling get_last_prices
+        if isinstance(asset, list):
+            return self.get_last_prices(assets=asset, quote=quote, exchange=exchange)
 
         asset, quote = self._sanitize_base_and_quote_asset(asset, quote)
 
@@ -294,6 +338,61 @@ class AlpacaBacktesting(DataSourceBacktesting):
         price = bars.df.iloc[0].open
         num_decimals = get_decimals(price)
         return quantize_to_num_decimals(price, num_decimals)
+        
+    def get_last_prices(
+            self,
+            assets: list[Asset],
+            quote: Asset | None = None,
+            exchange: str | None = None
+    ) -> dict:
+        """Get the last prices for a list of assets.
+        
+        Parameters
+        ----------
+        assets : list[Asset]
+            The list of assets to get prices for.
+        quote : Asset, optional
+            The quote asset to price against. If None, uses the default quote asset.
+        exchange : str, optional
+            The exchange to get the price from (not used in backtesting).
+            
+        Returns
+        -------
+        dict
+            A dictionary mapping each asset to its last price.
+            
+        Notes
+        -----
+        This method is optimized for multiple assets in HFT scenarios.
+        """
+        result = {}
+        
+        # Process each asset individually
+        for asset in assets:
+            # Sanitize the asset and quote
+            sanitized_asset, sanitized_quote = self._sanitize_base_and_quote_asset(
+                asset, quote if quote is not None else self.LUMIBOT_DEFAULT_QUOTE_ASSET
+            )
+            
+            # Get the price for this asset - call the internal method to avoid recursion
+            bars = self.get_historical_prices(
+                asset=sanitized_asset,
+                length=1,  # Get one bar
+                timestep=self._timestep,
+                quote=sanitized_quote,
+                remove_incomplete_current_bar=False  # We want the incomplete bar (aka current bar) for get_last_price
+            )
+            
+            price = None
+            if bars is not None and not bars.df.empty:
+                price = bars.df.iloc[0].open
+                num_decimals = get_decimals(price)
+                price = quantize_to_num_decimals(price, num_decimals)
+            
+            # Store the result
+            result[asset] = price
+            
+        return AssetsMapping(result)
 
     def get_historical_prices(
             self,
@@ -345,6 +444,9 @@ class AlpacaBacktesting(DataSourceBacktesting):
         This is a higher-level method that returns a normalized `Bars` object with
         consistent format across data sources. It handles timezone conversions and
         includes additional metadata processing.
+        
+        For high-frequency trading or feature engineering requiring raw trades data,
+        use the ``get_historical_trades_between_dates`` method instead.
         """
         if length <= 0:
             raise ValueError("Length must be positive.")
@@ -459,7 +561,7 @@ class AlpacaBacktesting(DataSourceBacktesting):
         quote_asset : Asset, optional
             Quote asset of the trading pair. If None, uses default quote asset.
         timestep : str, optional
-            Time interval for data. Either 'day' or 'minute'.
+            Time interval for data. Either 'day', 'minute', or 'fractional' (for trades data).
         market : str, optional
             Market or exchange identifier.
         tzinfo : pytz.tzinfo, optional
@@ -506,8 +608,8 @@ class AlpacaBacktesting(DataSourceBacktesting):
         if timestep is None:
             timestep = self._timestep
 
-        if timestep not in ['day', 'minute']:
-            raise ValueError(f"Invalid timestep {timestep}. Must be 'day' or 'minute'.")
+        if timestep not in ['day', 'minute', 'fractional']:
+            raise ValueError(f"Invalid timestep {timestep}. Must be 'day', 'minute', or 'fractional' (for trades data).")
 
         base_quote = f"{base_asset.symbol}-{base_asset.asset_type}_{quote_asset.symbol}-{quote_asset.asset_type}"
         market = market
@@ -523,6 +625,51 @@ class AlpacaBacktesting(DataSourceBacktesting):
         key = "_".join(part for part in key_parts if part).upper()
         key = key.replace("/", "-")
         return key
+
+    def _parse_source_timestep(self, timestep, reverse=False):
+        """Transform the data source timestep variable into lumibot representation.
+        
+        Parameters
+        ----------
+        timestep : str
+            The timestep to parse.
+        reverse : bool, default False
+            If True, convert from lumibot representation to source representation.
+            If False, convert from source representation to lumibot representation.
+            
+        Returns
+        -------
+        str or TimeFrame
+            The parsed timestep.
+            
+        Notes
+        -----
+        This method overrides the parent class method to handle the 'fractional' timestep
+        used for trades data.
+        """
+        # Special handling for 'fractional' timestep (used for trades data)
+        if timestep == "fractional":
+            if reverse:
+                # When reverse=True, we're converting from lumibot to source representation
+                # For trades data, we don't have a specific TimeFrame, so return None
+                # This is handled specially in get_historical_trades_between_dates
+                return None
+            else:
+                # When reverse=False, we're converting from source to lumibot representation
+                # This shouldn't happen for trades data, but return 'fractional' for consistency
+                return "fractional"
+        
+        # For all other timesteps, use the parent class implementation
+        for item in self.TIMESTEP_MAPPING:
+            if reverse:
+                if timestep == item["timestep"]:
+                    return item["representations"][0]
+            else:
+                if timestep in item["representations"]:
+                    return item["timestep"]
+
+        # If we get here, the timestep is not supported
+        raise ValueError(f"Unsupported timestep: {timestep}")
 
     def _download_and_cache_ohlcv_data(
             self,
@@ -680,6 +827,160 @@ class AlpacaBacktesting(DataSourceBacktesting):
         logger.info(f"Finished fetching and caching data for {key}")
         return df
 
+    def _download_and_cache_trades_data(self,
+                                        *,
+                                        base_asset: Asset = None,
+                                        quote_asset: Asset = None,
+                                        market: str = None,
+                                        tzinfo: pytz.tzinfo = None,
+                                        data_datetime_start: datetime = None,
+                                        data_datetime_end: datetime = None) -> pd.DataFrame:
+        """Download and cache trades data for an asset.
+        
+        Parameters
+        ----------
+        base_asset : Asset
+            Base asset of the trading pair.
+        quote_asset : Asset
+            Quote asset of the trading pair.
+        market : str
+            Market or exchange identifier.
+        tzinfo : pytz.tzinfo
+            Timezone information for the data.
+        data_datetime_start : datetime
+            Start date of the data for backtesting.
+        data_datetime_end : datetime
+            End date of the data for backtesting (inclusive).
+            
+        Returns
+        -------
+        pandas.DataFrame
+            DataFrame containing the downloaded trades data.
+
+        Notes
+        -----
+        This method handles is similar to ``_download_and_cache_ohlcv_data`` but
+        uses the ``StockTradesRequest`` instead of ``StockBarsRequest`` to collect trades data.
+        """
+        # Log information for user awareness
+        logger.warning(
+            "Fetching trades data. Note: It's the strategy's responsibility to process "
+            "this raw trades data for feature engineering or custom bar construction."
+        )
+
+        if base_asset is None:
+            raise ValueError("The parameter 'base_asset' cannot be None.")
+        if quote_asset is None:
+            raise ValueError("The parameter 'quote_asset' cannot be None.")
+        if market is None:
+            raise ValueError("The parameter 'market' cannot be None.")
+        if tzinfo is None:
+            raise ValueError("The parameter 'tzinfo' cannot be None.")
+        if data_datetime_start is None:
+            raise ValueError("The parameter 'data_datetime_start' cannot be None.")
+        if data_datetime_end is None:
+            raise ValueError("The parameter 'data_datetime_end' cannot be None.")
+
+        key = self._get_asset_key(
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            timestep="fractional",
+            market=market,
+            tzinfo=tzinfo,
+            data_datetime_start=data_datetime_start,
+            data_datetime_end=data_datetime_end,
+        )
+
+        # Directory to save cached data.
+        cache_dir = os.path.join(LUMIBOT_CACHE_FOLDER, self.CACHE_SUBFOLDER)
+        os.makedirs(cache_dir, exist_ok=True)
+
+        # File path based on the unique key
+        filename = f"{key}.parquet"
+        filepath = os.path.join(cache_dir, filename)
+
+        logger.info(f"Fetching and caching data for {key}")
+
+        client = self._stock_client
+
+        request_params = StockTradesRequest(
+            symbol_or_symbols=base_asset.symbol,
+            start=data_datetime_start,
+            end=data_datetime_end + timedelta(minutes=1),  # alpaca end dates are exclusive, but we want to include the last bar
+            currency=quote_asset.symbol,  # Use symbol as currency
+        )
+
+        try:
+            trades = client.get_stock_trades(request_params)
+        except Exception as e:
+            raise RuntimeError(f"Failed to fetch data for {key}: {e}")
+
+        df = trades.df.reset_index()
+
+        if df.empty:
+            raise RuntimeError(f"No data fetched for {key}.")
+
+        # Process the data
+        try:
+            if data_prep is not None:
+                try:
+                    # To be compatible with fpap, we need to keep the following columns
+                    df = df[['timestamp', 'symbol', 'id', 'price', 'size', 'exchange', 'tape', 'conditions']]
+                    df = data_prep(df)
+
+                    # Ensure 'timestamp' is a pandas timestamp object
+                    if 'Datetime' in df.columns:
+                        df = df.rename(columns={'Datetime': 'timestamp'})
+                except Exception as e:
+                    logger.warning(f"Error in data_prep: {e}. Falling back to default processing.")
+                    # Fallback to default processing
+            
+            # Based on the API response structure, the timestamp is in column 't'
+            # Price is in column 'p', size is in column 's'
+            if 't' in df.columns and 'timestamp' not in df.columns:
+                df = df.rename(columns={'t': 'timestamp', 'p': 'price', 's': 'size'})
+            
+            # Ensure 'timestamp' column exists and is properly formatted
+            if 'timestamp' not in df.columns:
+                # If timestamp is the index, reset it to make it a column
+                if df.index.name == 'timestamp':
+                    df = df.reset_index()
+                # If timestamp is still not a column, check for alternative column names
+                elif 'time' in df.columns:
+                    df = df.rename(columns={'time': 'timestamp'})
+                elif 'date' in df.columns:
+                    df = df.rename(columns={'date': 'timestamp'})
+                elif 'datetime' in df.columns:
+                    df = df.rename(columns={'datetime': 'timestamp'})
+                else:
+                    # If no suitable column is found, use the first column as timestamp
+                    df = df.reset_index()
+                    df = df.rename(columns={df.columns[0]: 'timestamp'})
+            
+            # Convert timestamp to datetime
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            
+        except Exception as e:
+            logger.warning(f"Error processing dataframe: {e}. Creating empty dataframe.")
+            # Return an empty dataframe with the right structure based on the API response
+            df = pd.DataFrame(columns=['timestamp', 'price', 'size'])
+            # Initialize with empty values to avoid timestamp conversion error
+            df['timestamp'] = []
+            
+        # Sometime there are duplicated records due to the nature of the HFT data
+        # We need to drop them
+        df = df[~df.timestamp.duplicated(keep='last')]
+        
+        # Save to cache (parquet is faster than csv for large datasets)
+        df.to_parquet(filepath, index=False)
+        
+        # Store in _data_store
+        df.set_index('timestamp', inplace=True)
+        self._data_store[key] = df
+        logger.info(f"Finished fetching and caching data for {key}")
+        
+        return df
+
     def _load_ohlcv_into_data_store(self, key: str) -> bool:
         """Load OHLCV data from cache into the data store.
         
@@ -730,6 +1031,47 @@ class AlpacaBacktesting(DataSourceBacktesting):
         except Exception as e:
             logger.error(f"Failed to load cached data for key: {key}. Error: {e}")
             return False
+
+    def _load_trades_into_data_store(self, key: str) -> bool:
+        """Load trades data from cache into the data store.
+        
+        Parameters
+        ----------
+        key : str
+            Unique key identifying the cached data file.
+        
+        Returns
+        -------
+        bool
+            True if data was successfully loaded, False otherwise.
+        
+        Notes
+        -----
+        This method attempts to load previously cached trades data from a parquet file
+        into the internal data store. It handles timezone conversion to ensure
+        consistency with the configured timezone.
+        
+        If the file doesn't exist or cannot be properly loaded, the method
+        """
+        # Directory to find the cached data file.
+        cache_dir = os.path.join(LUMIBOT_CACHE_FOLDER, self.CACHE_SUBFOLDER)
+        filename = f"{key}.parquet"
+        filepath = os.path.join(cache_dir, filename)
+
+        # Check if the file exists
+        if not os.path.exists(filepath):
+            return False
+
+        try:
+            df = pd.read_parquet(filepath)
+        except Exception as e:
+            logger.error(f"Failed to load cached data for key: {key}. Error: {e}")
+            return False
+
+        df.set_index('timestamp', inplace=True)
+        self._data_store[key] = df
+        logger.info(f"Loaded cached data for key: {key} from cache.")
+        return True
 
     def get_historical_prices_between_dates(
             self,
@@ -784,6 +1126,9 @@ class AlpacaBacktesting(DataSourceBacktesting):
         -----
         This method either loads data from cache or downloads it if not available.
         It manages cache refreshing based on the refresh_cache setting.
+        
+        For high-frequency trading or feature engineering requiring raw trades data,
+        use the ``get_historical_trades_between_dates`` method instead.
         """
 
         if base_asset is None:
@@ -812,9 +1157,10 @@ class AlpacaBacktesting(DataSourceBacktesting):
         if auto_adjust is None:
             auto_adjust = self._auto_adjust
 
-        key = self._get_asset_key(base_asset=asset, quote_asset=quote, timestep=timestep)
+        # Get OHLCV data key
+        ohlcv_key = self._get_asset_key(base_asset=asset, quote_asset=quote, timestep=timestep)
 
-        if self._refresh_cache and key not in self._refreshed_keys:
+        if self._refresh_cache and ohlcv_key not in self._refreshed_keys:
             # If we need are refreshing cache and we didn't refresh this key's cache yet, refresh it.
             self._download_and_cache_ohlcv_data(
                 base_asset=asset,
@@ -826,8 +1172,8 @@ class AlpacaBacktesting(DataSourceBacktesting):
                 data_datetime_end=data_datetime_end,
                 auto_adjust=auto_adjust
             )
-            self._refreshed_keys[key] = True
-        elif key not in self._data_store and not self._load_ohlcv_into_data_store(key):
+            self._refreshed_keys[ohlcv_key] = True
+        elif ohlcv_key not in self._data_store and not self._load_ohlcv_into_data_store(ohlcv_key):
             # If not refreshing or already refreshed, try to load from cache or download
             self._download_and_cache_ohlcv_data(
                 base_asset=asset,
@@ -840,8 +1186,148 @@ class AlpacaBacktesting(DataSourceBacktesting):
                 auto_adjust=auto_adjust
             )
 
-        df = self._data_store[key]
-        return df
+        # Get the OHLCV DataFrame
+        ohlcv_df = self._data_store[ohlcv_key]
+        return ohlcv_df
+        
+    def get_historical_trades_between_dates(
+            self,
+            *,
+            base_asset: Asset | list[Asset] = None,
+            quote_asset: Asset = None,
+            market: str = None,
+            tzinfo: pytz.tzinfo = None,
+            data_datetime_start: datetime = None,
+            data_datetime_end: datetime = None,
+    ) -> pd.DataFrame:
+        """Get historical trades data between specified dates.
+        
+        Parameters
+        ----------
+        base_asset : Asset or list[Asset]
+            Base asset or list of base assets of the trading pair.
+        quote_asset : Asset, optional
+            Quote asset of the trading pair. If None, uses default quote asset.
+        market : str, optional
+            Market or exchange identifier.
+            If None, uses the default market.
+        tzinfo : pytz.tzinfo, optional
+            Timezone information for the data.
+            If None, uses the default timezone.
+        data_datetime_start : datetime, optional
+            Start date of the data for backtesting.
+            If None, uses the default start date.
+        data_datetime_end : datetime, optional
+            End date of the data for backtesting (inclusive).
+            If None, uses the default end date.
+            
+        Returns
+        -------
+        pandas.DataFrame
+            DataFrame containing the historical trades data indexed by timestamp.
+            If base_asset is a list, returns a concatenated DataFrame with all assets.
+            
+        Raises
+        ------
+        ValueError
+            If base_asset is None or if the asset type is not 'stock'.
+            
+        Notes
+        -----
+        This method fetches raw trades data for high-frequency trading or custom
+        feature engineering. It's the user's responsibility to process this data
+        appropriately in their strategy.
+        
+        Currently only supports stock assets, not crypto.
+        """
+        if base_asset is None:
+            raise ValueError("Base asset must be provided.")
+
+        if quote_asset is None:
+            quote_asset = self.LUMIBOT_DEFAULT_QUOTE_ASSET
+
+        if market is None:
+            market = self.market
+
+        if tzinfo is None:
+            tzinfo = self.tzinfo
+
+        if data_datetime_start is None:
+            data_datetime_start = self._data_datetime_start
+
+        if data_datetime_end is None:
+            data_datetime_end = self._data_datetime_end
+
+        # Handle list of assets
+        if isinstance(base_asset, list):
+            all_trades_dfs = []
+            assets = [self._sanitize_base_and_quote_asset(asset, quote_asset) for asset in base_asset]
+
+            for asset, quote in assets:
+                # Get trades for each asset individually
+                asset_trades_df = self.get_historical_trades_between_dates(
+                    base_asset=asset,
+                    quote_asset=quote,
+                    market=market,
+                    tzinfo=tzinfo,
+                    data_datetime_start=data_datetime_start,
+                    data_datetime_end=data_datetime_end
+                )
+                
+                if not asset_trades_df.empty:
+                    all_trades_dfs.append(asset_trades_df)
+            
+            # Combine all dataframes
+            if all_trades_dfs:
+                return pd.concat(all_trades_dfs, axis=0).sort_index()
+            else:
+                return pd.DataFrame()
+
+        asset, quote = self._sanitize_base_and_quote_asset(base_asset, quote_asset)
+        
+        if asset.asset_type != 'stock':
+            raise ValueError("Trades data is currently only supported for stock assets.")
+
+        # Get trades data key
+        trades_key = self._get_asset_key(
+            base_asset=asset, 
+            quote_asset=quote, 
+            timestep="fractional",  # Special timestep indicator for trades data
+            market=market,
+            tzinfo=tzinfo,
+            data_datetime_start=data_datetime_start,
+            data_datetime_end=data_datetime_end
+        )
+
+        # Check if we need to refresh or fetch trades data
+        if self._refresh_cache and trades_key not in self._refreshed_keys:
+            self._download_and_cache_trades_data(
+                base_asset=asset,
+                quote_asset=quote,
+                market=market,
+                tzinfo=tzinfo,
+                data_datetime_start=data_datetime_start,
+                data_datetime_end=data_datetime_end
+            )
+            self._refreshed_keys[trades_key] = True
+        elif trades_key not in self._data_store and not self._load_trades_into_data_store(trades_key):
+            self._download_and_cache_trades_data(
+                base_asset=asset,
+                quote_asset=quote,
+                market=market,
+                tzinfo=tzinfo,
+                data_datetime_start=data_datetime_start,
+                data_datetime_end=data_datetime_end
+            )
+        
+        # Get the trades DataFrame
+        trades_df = self._data_store.get(trades_key)
+        
+        if trades_df is None or trades_df.empty:
+            logger.warning(f"No trades data available for {asset.symbol} between {data_datetime_start} and {data_datetime_end}")
+            return pd.DataFrame()
+            
+        return trades_df
 
     def _reindex_and_fill(
             self,

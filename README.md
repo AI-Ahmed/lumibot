@@ -38,6 +38,25 @@ To run a backtest, you can use the following code snippet:
 python -m lumibot.example_strategies.stock_buy_and_hold
 ```
 
+## Installing with Private Dependencies
+
+If you're a contributor or have access to private dependencies used in this project, you can install them using:
+
+```bash
+# Set your GitHub token as an environment variable
+export GIT_TOKEN=your_github_token_here
+
+# Install the package with private dependencies
+pip install -e ".[private]"
+```
+
+If you don't have access to the private dependencies, you can still install and use the package without them:
+
+```bash
+# Standard installation without private dependencies
+pip install -e .
+```
+
 ## Run an Example Strategy
 
 We made a small example strategy to show you how to use Lumibot in this GitHub repository: [Example Algorithm GitHub](https://github.com/Lumiwealth-Strategies/stock_example_algo)

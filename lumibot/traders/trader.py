@@ -125,6 +125,7 @@ class Trader:
             show_indicators=True, 
             tearsheet_file=None,
             base_filename=None,
+            resample_rule=None,  # Add resample_rule parameter
             ):
         """
         run all strategies
@@ -151,6 +152,11 @@ class Trader:
 
         base_filename: str
             The base filename to save the tearsheet, plot, indicators, etc. This is only used for backtesting.
+            
+        resample_rule: str, optional
+            The pandas resample rule to use for performance metrics. For HFT strategies, 
+            use a finer granularity like "1T" (1 minute) or "1S" (1 second). Default is None,
+            which will auto-detect based on strategy characteristics.
 
         Returns
         -------
@@ -207,6 +213,7 @@ class Trader:
                     show_indicators=show_indicators,
                     tearsheet_file=tearsheet_file,
                     base_filename=base_filename,
+                    resample_rule=resample_rule,  # Pass the resample_rule parameter
                 )
 
         return result

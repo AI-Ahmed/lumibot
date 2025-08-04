@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import time
 from abc import ABC, abstractmethod
@@ -90,6 +92,11 @@ class Broker(ABC):
         self._held_trades = []
         self._config = config
         self._strategy_name = ""
+        
+        # Track processed order notifications to prevent duplicates
+        self._processed_new_orders = set()
+        self._processed_filled_orders = set()
+        self._last_batch_id = None  # For tracking order batches in HFT scenarios
         self.data_source = data_source
         self.option_source = option_source
         self.max_workers = min(max_workers, 200)
@@ -1343,16 +1350,31 @@ class Broker(ABC):
     def _on_new_order(self, order):
         """notify relevant subscriber/strategy about
         new order event"""
+        
+        # Create a unique key for this specific order
+        order_key = f"{order.identifier}_{order.status}"
+        
+        # Check if we've already processed this exact order to prevent duplicate notifications
+        # For HFT portfolio strategies, we allow processing of different assets in the same batch
+        if order_key in self._processed_new_orders:
+            return
+            
+        # Add to processed set to prevent duplicate notifications of the same order
+        self._processed_new_orders.add(order_key)
 
         # Use loguru for colored output to match BUY/SELL signal colors
         from loguru import logger as log
         emoji = "🟢" if order.is_buy_order() else "🔴"
+        
+        # Convert quantity to integer for display if it's a whole number
+        display_quantity = int(order.quantity) if order.quantity == int(order.quantity) else order.quantity
+        
         if order.is_buy_order():
             # Use bright green color like BUY signals
-            log.opt(colors=True).info(f"<fg #00ff00><bold>{emoji} New order was created: {order}</bold></fg #00ff00>")
+            log.opt(colors=True).info(f"<fg #00ff00><bold>{emoji} New order was created: {order.order_type} order of | {display_quantity} {order.symbol} {order.side} | {order.status}</bold></fg #00ff00>")
         else:
             # Use bright red for sell orders
-            log.opt(colors=True).info(f"<fg #ff0000><bold>{emoji} New order was created: {order}</bold></fg #ff0000>")
+            log.opt(colors=True).info(f"<fg #ff0000><bold>{emoji} New order was created: {order.order_type} order of | {display_quantity} {order.symbol} {order.side} | {order.status}</bold></fg #ff0000>")
 
         payload = dict(order=order)
         subscriber = self._get_subscriber(order.strategy)
@@ -1394,16 +1416,31 @@ class Broker(ABC):
     def _on_filled_order(self, position, order, price, quantity, multiplier):
         """notify relevant subscriber/strategy about
         filled order event"""
+        
+        # Create a unique key for this specific order fill
+        order_key = f"{order.identifier}_{price}_{quantity}"
+        
+        # Check if we've already processed this exact order fill to prevent duplicate notifications
+        # For HFT portfolio strategies, we allow processing of different assets in the same batch
+        if order_key in self._processed_filled_orders:
+            return
+            
+        # Add to processed set to prevent duplicate notifications of the same order
+        self._processed_filled_orders.add(order_key)
 
         # Use loguru for colored output to match BUY/SELL signal colors
         from loguru import logger as log
         emoji = "🟢" if order.is_buy_order() else "🔴"
+        
+        # Convert quantity to integer for display if it's a whole number
+        display_quantity = int(quantity) if quantity == int(quantity) else quantity
+        
         if order.is_buy_order():
             # Use bright green color like BUY signals
-            log.opt(colors=True).info(f"<fg #00ff00><bold>{emoji} Order was filled: {order} @ ${price} fill</bold></fg #00ff00>")
+            log.opt(colors=True).info(f"<fg #00ff00><bold>{emoji} Order was filled: {order.order_type} order of | {display_quantity} {order.symbol} {order.side} | @ ${price} fill</bold></fg #00ff00>")
         else:
             # Use bright red for sell orders
-            log.opt(colors=True).info(f"<fg #ff0000><bold>{emoji} Order was filled: {order} @ ${price} fill</bold></fg #ff0000>")
+            log.opt(colors=True).info(f"<fg #ff0000><bold>{emoji} Order was filled: {order.order_type} order of | {display_quantity} {order.symbol} {order.side} | @ ${price} fill</bold></fg #ff0000>")
 
         payload = dict(
             position=position,
@@ -1451,9 +1488,27 @@ class Broker(ABC):
                 multiplier=multiplier,
             )
 
-    def _process_trade_event(self, stored_order, type_event, price=None, filled_quantity=None, multiplier=1, error=None): # Add error parameter
+    def _process_trade_event(self, stored_order, type_event, price=None, filled_quantity=None, multiplier=1, error=None, batch_id=None): # Add error parameter
         """process an occurred trading event and update the
         corresponding order"""
+        
+        # Generate a batch ID if not provided (for HFT portfolio processing)
+        # This helps group related orders that should be processed together
+        if batch_id is None:
+            import uuid
+            batch_id = str(uuid.uuid4())
+        
+        # For backtesting, especially HFT, track the batch_id to prevent duplicate processing
+        # of orders that come in rapid succession
+        if self.IS_BACKTESTING_BROKER:
+            # If this is a new batch, update the last batch ID
+            if self._last_batch_id != batch_id:
+                self._last_batch_id = batch_id
+                # Clear processed sets when a new batch starts to ensure proper processing
+                if type_event == self.NEW_ORDER:
+                    self._processed_new_orders.clear()
+                elif type_event == self.FILLED_ORDER:
+                    self._processed_filled_orders.clear()
 
         if self._hold_trade_events and not self.IS_BACKTESTING_BROKER:
             # Log that the trade event was held

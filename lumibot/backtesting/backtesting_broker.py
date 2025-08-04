@@ -1,3 +1,4 @@
+import uuid
 import traceback
 from datetime import timedelta
 from decimal import Decimal
@@ -383,6 +384,36 @@ class BacktestingBroker(Broker):
 
         existing_position = self.get_tracked_position(order.strategy, order.asset)
 
+        # HFT safety check: Prevent negative positions for sell orders when no position exists
+        if order.is_sell_order() and (existing_position is None or existing_position.quantity < quantity):
+            # If this is an HFT strategy, log a warning and mark the order as error
+            logger.warning(
+                f"HFT Safety: Preventing negative position for {order.asset.symbol}. "
+                f"Attempted to sell {quantity} but current position is "
+                f"{existing_position.quantity if existing_position else 0}. "
+                f"Order will be marked as error."
+            )
+            
+            # Process as error order instead of just returning None
+            error_msg = "Insufficient position for sell order"
+            error_order = self._process_error_order(order, error_msg)
+            
+            # Notify subscribers about the error
+            self.stream.dispatch(
+                self.ERROR_ORDER,
+                wait_until_complete=False,  # Changed to False to prevent blocking
+                order=error_order,
+                error=error_msg,
+            )
+            
+            # Remove from filled orders to prevent double processing
+            self._filled_orders.remove(error_order.identifier, key="identifier")
+
+            # Return a dummy position to prevent backtesting from freezing
+            # but don't actually modify any positions
+            dummy_position = Position(order.strategy, order.asset, 0)
+            return dummy_position
+
         # Currently perfect fill price in backtesting!
         order.avg_fill_price = price
 
@@ -407,6 +438,38 @@ class BacktestingBroker(Broker):
         to do it
         """
         existing_position = self.get_tracked_position(order.strategy, order.asset)
+        
+        # HFT safety check: Prevent negative positions for sell orders when no position exists
+        if order.is_sell_order() and (existing_position is None or existing_position.quantity < quantity):
+            # If this is an HFT strategy, log a warning and mark the order as error
+            logger.warning(
+                f"HFT Safety: Preventing negative position for {order.asset.symbol} in partial fill. "
+                f"Attempted to sell {quantity} but current position is "
+                f"{existing_position.quantity if existing_position else 0}. "
+                f"Order will be marked as error."
+            )
+            
+            # Process as error order instead of just returning None
+            error_msg = "Insufficient position for partial sell order"
+            error_order = self._process_error_order(order, error_msg)
+            
+            # Notify subscribers about the error
+            self.stream.dispatch(
+                self.ERROR_ORDER,
+                wait_until_complete=False,  # Changed to False to prevent blocking
+                order=error_order,
+                error=error_msg,
+            )
+            
+            # CRITICAL: Remove from filled and partially filled orders to prevent double processing
+            self._filled_orders.remove(error_order.identifier, key="identifier")
+            self._partially_filled_orders.remove(error_order.identifier, key="identifier")
+            
+            # Return dummy values to prevent backtesting from freezing
+            # but don't actually modify any positions
+            dummy_position = Position(order.strategy, order.asset, 0)
+            return error_order, dummy_position
+            
         stored_order, position = super()._process_partially_filled_order(order, price, quantity)
         if existing_position:
             position.add_order(stored_order, quantity)  # Add will update quantity, but not double count the order
@@ -731,12 +794,18 @@ class BacktestingBroker(Broker):
                     child_prices = [o.get_fill_price() if o.is_buy_order() else -o.get_fill_price()
                                     for o in order.child_orders]
                     parent_price = sum(child_prices)
+
+                    # Generate a batch ID for this processing batch to group related orders
+                    # This is especially important for HFT portfolio strategies
+                    batch_id = str(uuid.uuid4())
+                    
                     self.stream.dispatch(
                         self.FILLED_ORDER,
                         wait_until_complete=True,
                         order=order,
                         price=parent_price,
                         filled_quantity=parent_qty,
+                        batch_id=batch_id,
                     )
 
                 continue
@@ -873,12 +942,17 @@ class BacktestingBroker(Broker):
                 strategy._set_cash_position(new_cash)
                 order.trade_cost = float(trade_cost)
 
+                # Generate a batch ID for this processing batch to group related orders
+                # This is especially important for HFT portfolio strategies
+                batch_id = str(uuid.uuid4())
+                
                 self.stream.dispatch(
                     self.FILLED_ORDER,
                     wait_until_complete=True,
                     order=order,
                     price=price,
                     filled_quantity=filled_quantity,
+                    batch_id=batch_id,
                 )
             else:
                 continue
@@ -935,11 +1009,16 @@ class BacktestingBroker(Broker):
         broker = self
 
         @broker.stream.add_action(broker.NEW_ORDER)
-        def on_trade_event(order):
+        def on_trade_event(order, batch_id=None):
             try:
+                # Generate a batch ID if not provided (for HFT portfolio processing)
+                if batch_id is None:
+                    batch_id = str(uuid.uuid4())
+                    
                 broker._process_trade_event(
                     order,
                     broker.NEW_ORDER,
+                    batch_id=batch_id,
                 )
                 return True
             except:
@@ -957,14 +1036,24 @@ class BacktestingBroker(Broker):
                 logger.error(traceback.format_exc())
 
         @broker.stream.add_action(broker.FILLED_ORDER)
-        def on_trade_event(order, price, filled_quantity):
+        def on_trade_event(order, price, filled_quantity, batch_id=None):
             try:
+                # Skip processing if the order is marked as error
+                if order.status == broker.ERROR_ORDER:
+                    logger.info(f"Skipping filled order event for error order: {order.identifier}")
+                    return True
+                    
+                # Generate a batch ID if not provided (for HFT portfolio processing)
+                if batch_id is None:
+                    batch_id = str(uuid.uuid4())
+                    
                 broker._process_trade_event(
                     order,
                     broker.FILLED_ORDER,
                     price=price,
                     filled_quantity=filled_quantity,
                     multiplier=order.asset.multiplier,
+                    batch_id=batch_id,
                 )
                 return True
             except:

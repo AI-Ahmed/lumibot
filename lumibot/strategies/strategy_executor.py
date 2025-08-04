@@ -686,17 +686,69 @@ class StrategyExecutor(Thread):
             # Send the message to Discord
             self.strategy.send_discord_message(message, silent=False)
 
+        # Track trade P&L for HFT strategies
+        # Calculate and store trade P&L
+        if order.is_sell_order():
+            # Calculate profit/loss for this specific trade
+            if hasattr(position, 'entry_price') and position.entry_price is not None:
+                trade_pl = (price - position.entry_price) * quantity * multiplier
+                trade_pl_pct = (price / position.entry_price - 1) * 100 if position.entry_price > 0 else 0
+                
+                # Store the trade info in the strategy
+                if not hasattr(self.strategy, '_trade_history'):
+                    self.strategy._trade_history = []
+                    
+                trade_info = {
+                    'datetime': self.strategy.get_datetime(),
+                    'asset': position.asset,
+                    'entry_price': position.entry_price,
+                    'exit_price': price,
+                    'quantity': quantity,
+                    'pl': trade_pl,
+                    'pl_pct': trade_pl_pct
+                }
+                self.strategy._trade_history.append(trade_info)
+                
+                # Log the trade P&L
+                self.strategy.log_message(
+                    f"Trade P&L: {trade_pl:.2f} ({trade_pl_pct:.2f}%) - {position.asset} - {quantity} shares",
+                    color="green" if trade_pl > 0 else "red"
+                )
+
         # Let our listener know that an order has been filled (set in the callback)
         if hasattr(self.strategy, "_filled_order_callback") and callable(self.strategy._filled_order_callback):
             self.strategy._filled_order_callback(self, position, order, price, quantity, multiplier)
 
     @event_method
-    def _on_error_order(self, order, error=None):                 # <--- new handler
+    def _on_error_order(self, order, error=None):
         """
         Use this lifecycle event to execute code
         when an order error is reported
+        
+        Parameters
+        ----------
+        order : Order
+            The order that encountered an error
+        error : str or Exception, optional
+            The error message or exception
         """
-        self.strategy.log_message("Executing the on_error_order event method", color="red")
+        # Check if this is an HFT position safety error
+        is_hft_position_error = (
+            error is not None and 
+            isinstance(error, str) and 
+            ("Insufficient position" in error or "negative position" in error)
+        )
+        
+        # For HFT position errors, use a warning level instead of error
+        if is_hft_position_error:
+            self.strategy.log_message(
+                f"HFT position safety triggered: {error}. Order {order.identifier} rejected.", 
+                color="yellow"
+            )
+        else:
+            self.strategy.log_message("Executing the on_error_order event method", color="red")
+            
+        # Call user-defined handler if it exists
         if hasattr(self.strategy, "on_error_order"):
             try:
                 self.strategy.on_error_order(order, error)
@@ -705,9 +757,12 @@ class StrategyExecutor(Thread):
                     self.strategy.on_error_order(order)
                 except Exception:
                     self.strategy.logger.error("Error in on_error_order handler", exc_info=True)
-        else:
-            # no user handler defined—just log the error
+        elif not is_hft_position_error:
+            # Only log as error for non-HFT position errors if no handler exists
             self.strategy.logger.error(f"Unhandled order error: {order}, error: {error}")
+            
+        # Ensure backtesting continues by returning quickly
+        return
 
     @staticmethod
     def _sleeptime_to_seconds(sleeptime):

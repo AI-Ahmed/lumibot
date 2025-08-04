@@ -39,3 +39,5 @@ Flask>=2.3
 free-proxy
 requests-oauthlib
 pandas-market-calendars==5.1.1
+# Private packages can be installed manually if you have access
+# git+https://${GIT_TOKEN}@github.com/AI-Ahmed/FPAP.git

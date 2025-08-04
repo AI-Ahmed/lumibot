@@ -1,9 +1,10 @@
 import contextlib
 import math
+import numpy as np
 import os
 import webbrowser
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -607,7 +608,7 @@ def plot_returns(
             connectgaps=True,
             hovertemplate=(
                 f"{strategy_name}<br>"
-                "Portfolio Value: %{y:$,.2f}<br>"
+                "Portfolio Value: %{y:$,.4f}<br>"
                 "%{x|%b %d %Y %I:%M:%S %p}<br>"
                 "Positions:<br>"
                 "%{text}<extra></extra>"
@@ -624,7 +625,7 @@ def plot_returns(
             mode="lines",
             name=benchmark_name,
             connectgaps=True,
-            hovertemplate=f"{benchmark_name}<br>Portfolio Value: %{{y:$,.2f}}<br>%{{x|%b %d %Y %I:%M:%S %p}}<extra></extra>",
+            hovertemplate=f"{benchmark_name}<br>Portfolio Value: %{{y:$,.4f}}<br>%{{x|%b %d %Y %I:%M:%S %p}}<extra></extra>",
         )
     )
 
@@ -636,7 +637,7 @@ def plot_returns(
             mode="lines",
             name="cash",
             connectgaps=True,
-            hovertemplate="Cash<br>Value: %{y:$,.2f}<br>%{x|%b %d %Y %I:%M:%S %p}<extra></extra>",
+            hovertemplate="Cash<br>Value: %{y:$,.4f}<br>%{x|%b %d %Y %I:%M:%S %p}<extra></extra>",
         ),
         secondary_y=True,
     )
@@ -653,77 +654,44 @@ def plot_returns(
 
     def generate_buysell_plotly_text(row):
         if row["status"] != "canceled" and row["status"] != "new":
-            if row["asset.asset_type"] == "option":
-                return (
-                    row["status"]
-                    + "<br>"
-                    + str(Decimal(row["filled_quantity"]).quantize(Decimal("0.01")).__format__(",f"))
-                    + " "
-                    + row["symbol"]
-                    + " "
-                    + row["asset.right"]
-                    + " Option"
-                    + "<br>"
-                    + "Strike: "
-                    + str(row["asset.strike"])
-                    + "<br>"
-                    + "Expiration: "
-                    + str(row["asset.expiration"])
-                    + "<br>"
-                    + "Price: "
-                    + str(Decimal(row["price"]).quantize(Decimal("0.0001")).__format__(",f"))
-                    + "<br>"
-                    + "Order Type: "
-                    + row["type"]
-                    + "<br>"
-                    + "Amount Transacted: "
-                    + str(
-                        # Round to 2 decimal places and add commas for thousands
-                        (
-                            (Decimal(row["price"]) if row["price"] else 0)
-                            * (Decimal(row["filled_quantity"]) if row["filled_quantity"] else 0)
-                            * (Decimal(row["asset.multiplier"]) if row["asset.multiplier"] else 0)
-                        )
-                        .quantize(Decimal("0.01"))
-                        .__format__(",f")
-                    )
-                    + "<br>"
-                    + "Trade Cost: "
-                    + str(Decimal(row["trade_cost"]).quantize(Decimal("0.01")).__format__(",f"))
-                    + "<br>"
-                )
-            else:
-                return (
-                    row["status"]
-                    + "<br>"
-                    + str(Decimal(row["filled_quantity"]).quantize(Decimal("0.01")).__format__(",f"))
-                    + " "
-                    + row["symbol"]
-                    + "<br>"
-                    + "Price: "
-                    + str(Decimal(row["price"]).quantize(Decimal("0.0001")).__format__(",f"))
-                    + "<br>"
-                    + "Order Type: "
-                    + row["type"]
-                    + "<br>"
-                    + "Amount Transacted: "
-                    + str(
-                        # Round to 2 decimal places and add commas for thousands
-                        (
-                            (Decimal(row["price"]) if row["price"] else 0)
-                            * (Decimal(row["filled_quantity"]) if row["filled_quantity"] else 0)
-                            * (Decimal(row["asset.multiplier"]) if row["asset.multiplier"] else 0)
-                        )
-                        .quantize(Decimal("0.01"))
-                        .__format__(",f")
-                    )
-                    + "<br>"
-                    + "Trade Cost: "
-                    + str(Decimal(row["trade_cost"]).quantize(Decimal("0.01")).__format__(",f"))
-                    + "<br>"
-                )
-        else:
-            return None
+            try:
+                if row["asset.asset_type"] == "option":
+                    try:
+                        filled_quantity = str(Decimal(row["filled_quantity"]).quantize(Decimal("0.01")).__format__(",f"))
+                    except (InvalidOperation, TypeError, ValueError):
+                        filled_quantity = str(row["filled_quantity"])
+                        
+                    try:
+                        price = str(Decimal(row["price"]).quantize(Decimal("0.0001")).__format__(",f"))
+                    except (InvalidOperation, TypeError, ValueError):
+                        price = str(row["price"])
+                        
+                    try:
+                        trade_cost = str(Decimal(row["trade_cost"]).quantize(Decimal("0.01")).__format__(",f"))
+                    except (InvalidOperation, TypeError, ValueError):
+                        trade_cost = str(row["trade_cost"])
+                        
+                    return f"Option: {row['symbol']}<br>Quantity: {filled_quantity}<br>Price: ${price}<br>Cost: ${trade_cost}"
+                else:
+                    try:
+                        filled_quantity = str(Decimal(row["filled_quantity"]).quantize(Decimal("0.01")).__format__(",f"))
+                    except (InvalidOperation, TypeError, ValueError):
+                        filled_quantity = str(row["filled_quantity"])
+                        
+                    try:
+                        price = str(Decimal(row["price"]).quantize(Decimal("0.01")).__format__(",f"))
+                    except (InvalidOperation, TypeError, ValueError):
+                        price = str(row["price"])
+                        
+                    try:
+                        trade_cost = str(Decimal(row["trade_cost"]).quantize(Decimal("0.01")).__format__(",f"))
+                    except (InvalidOperation, TypeError, ValueError):
+                        trade_cost = str(row["trade_cost"])
+                        
+                    return f"Quantity: {filled_quantity}<br>Price: ${price}<br>Cost: ${trade_cost}"
+            except Exception as e:
+                return f"Error formatting trade: {str(e)}"
+        return "Order not executed"
 
     buy_ticks_df = buys.apply(generate_buysell_plotly_text, axis=1)
 
@@ -830,6 +798,82 @@ def plot_returns(
     # Create graph
     fig.write_html(plot_file_html, auto_open=show_plot)
 
+    # Add layout configurations to improve the chart appearance
+    fig.update_layout(
+        title=f"{strategy_name} Strategy Compared With {benchmark_name}",
+        xaxis=dict(
+            title="Date",
+            title_font=dict(size=12),  # Changed from titlefont to title_font
+            showgrid=True,
+            gridcolor='rgba(230, 230, 230, 0.3)',
+        ),
+        yaxis=dict(
+            title="Strategy/Benchmark",
+            title_font=dict(size=12),  # Changed from titlefont to title_font
+            showgrid=True,
+            gridcolor='rgba(230, 230, 230, 0.3)',
+            tickformat="$,.4f",  # Format y-axis ticks as currency
+            rangemode="tozero",  # Start y-axis at zero
+        ),
+        yaxis2=dict(
+            title="Cash",
+            title_font=dict(size=12),  # Changed from titlefont to title_font
+            showgrid=False,
+            tickformat="$,.4f",  # Format y-axis ticks as currency
+            rangemode="tozero",  # Start y-axis at zero
+        ),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        ),
+        margin=dict(l=50, r=50, t=80, b=50),
+        plot_bgcolor='rgba(250, 250, 250, 0.9)',
+        hovermode="closest",
+        height=600,
+    )
+
+    # Add a range slider for better navigation
+    fig.update_layout(
+        xaxis=dict(
+            rangeslider=dict(visible=True),
+            type="date"
+        )
+    )
+    
+    # Fix axis scaling issues by ensuring reasonable ranges
+    y_values = df_final[[strategy_name, benchmark_name]].values.flatten()
+    y_values = y_values[~np.isnan(y_values)]  # Remove NaN values
+    
+    if len(y_values) > 0:
+        y_min = min(y_values)
+        y_max = max(y_values)
+        y_range = y_max - y_min
+        
+        # Set y-axis range with padding
+        fig.update_layout(
+            yaxis=dict(
+                range=[max(0, y_min - 0.1 * y_range), y_max + 0.1 * y_range]
+            )
+        )
+        
+    # Fix cash axis scaling if needed
+    cash_values = df_final["cash"].values
+    cash_values = cash_values[~np.isnan(cash_values)]
+    
+    if len(cash_values) > 0:
+        cash_min = min(cash_values)
+        cash_max = max(cash_values)
+        cash_range = cash_max - cash_min
+        
+        fig.update_layout(
+            yaxis2=dict(
+                range=[max(0, cash_min - 0.1 * cash_range), cash_max + 0.1 * cash_range]
+            )
+        )
+
 
 def create_tearsheet(
     strategy_df: pd.DataFrame,
@@ -841,6 +885,7 @@ def create_tearsheet(
     save_tearsheet: bool,
     risk_free_rate: float,
     strategy_parameters: dict = None,
+    resample_rule: str = "D",  # Add resample_rule parameter with default "D" for daily
 ):
     # If show tearsheet is False, then we don't want to open the tearsheet in the browser
     # IMS create the tearsheet even if we are not showinbg it
@@ -873,9 +918,42 @@ def create_tearsheet(
     df["symbol_cumprod"] = df["symbol_cumprod"].ffill()
     df.loc[df.index[0], "symbol_cumprod"] = 1
 
-    df = df.resample("D").last()
-    df["strategy"] = df["portfolio_value"].bfill().pct_change(fill_method=None).fillna(0)
-    df["benchmark"] = df["symbol_cumprod"].bfill().pct_change(fill_method=None).fillna(0)
+    # Use the configurable resample_rule parameter instead of hardcoded "D"
+    logger.info(f"Resampling data using rule: {resample_rule}")
+    
+    # Check for HFT data (high frequency)
+    is_hft = False
+    if len(df) > 0:
+        # Check if we have multiple data points per day
+        dates = df.index.date
+        unique_dates = set(dates)
+        if len(df) / len(unique_dates) > 5:  # More than 5 data points per day on average
+            is_hft = True
+            logger.info("HFT data detected - using specialized processing")
+    
+    # For HFT data, we need to be more careful with resampling
+    if is_hft:
+        # First, ensure we preserve the original data for accurate statistics
+        df = df.dropna()
+        df_original = df.copy()
+        
+        # Resample for visualization purposes (can't resample already resampled data)
+        # df = df.resample(resample_rule).last()
+        
+        # Calculate returns on the resampled data
+        df["strategy"] = df["portfolio_value"].bfill().pct_change(fill_method=None).fillna(0)
+        df["benchmark"] = df["symbol_cumprod"].bfill().pct_change(fill_method=None).fillna(0)
+        
+        # For statistics calculation, use the original data to preserve intraday movements
+        df_stats = df_original.copy()
+        df_stats["strategy"] = df_stats["portfolio_value"].bfill().pct_change(fill_method=None).fillna(0)
+        df_stats["benchmark"] = df_stats["symbol_cumprod"].bfill().pct_change(fill_method=None).fillna(0)
+    else:
+        # Standard resampling for non-HFT data
+        df = df.resample(resample_rule).last()
+        df["strategy"] = df["portfolio_value"].bfill().pct_change(fill_method=None).fillna(0)
+        df["benchmark"] = df["symbol_cumprod"].bfill().pct_change(fill_method=None).fillna(0)
+        df_stats = df.copy()
 
     # Merge the strategy and benchmark columns into a new dataframe called df_final
     df_final = df.loc[:, ["strategy", "benchmark"]]
@@ -884,16 +962,27 @@ def create_tearsheet(
     df_final.index = pd.to_datetime(df_final.index)
     df_final.index = df_final.index.tz_localize(None)
 
+    # For statistics, use df_stats
+    df_stats_final = df_stats.loc[:, ["strategy", "benchmark"]]
+    df_stats_final.index = pd.to_datetime(df_stats_final.index)
+    df_stats_final.index = df_stats_final.index.tz_localize(None)
+
     # Check if df_final is empty and return if it is
     if df_final.empty or df_final["benchmark"].isnull().all() or df_final["strategy"].isnull().all():
         logger.warning("No data to create tearsheet, skipping")
         return
+
+    # Check if df_stats_final is empty and use df_final as fallback if needed
+    if df_stats_final.empty or df_stats_final["benchmark"].isnull().all() or df_stats_final["strategy"].isnull().all():
+        logger.warning("No statistics data available, using visualization data for calculations")
+        df_stats_final = df_final.copy()
 
     # Uncomment for debugging
     # _df1.to_csv(f"df1.csv")
     # _df2.to_csv(f"df2.csv")
     # df.to_csv(f"df.csv")
     # df_final.to_csv(f"df_final.csv")
+    # df_stats_final.to_csv(f"df_stats_final.csv")  # Save statistics data for debugging
 
     bm_text = f"Compared to {benchmark_asset}" if benchmark_asset else ""
     title = f"{strat_name} {bm_text}"
@@ -911,12 +1000,33 @@ def create_tearsheet(
     '''
     # Set the name of the benchmark column so that quantstats can use it in the report
     df_final["benchmark"].name = str(benchmark_asset)
+    df_stats_final["benchmark"].name = str(benchmark_asset)
+
+    # Add HFT-specific metrics to parameters if this is HFT data
+    if is_hft:
+        if strategy_parameters is None:
+            strategy_parameters = {}
+        
+        # Calculate intraday metrics
+        try:
+            # Calculate average trades per day
+            trades_per_day = len(df_stats_final) / len(set(df_stats_final.index.date))
+            strategy_parameters["Avg Trades Per Day"] = f"{trades_per_day:.2f}"
+            
+            # Calculate intraday volatility
+            intraday_vol = df_stats_final["strategy"].std() * np.sqrt(trades_per_day)
+            strategy_parameters["Intraday Volatility"] = f"{intraday_vol:.4f}"
+            
+            # Add resampling information
+            strategy_parameters["Data Sampling"] = f"HFT ({resample_rule} resampling)"
+        except Exception as e:
+            logger.warning(f"Could not calculate HFT metrics: {e}")
 
     # Run quantstats reports surpressing any logs because it can be noisy for no reason
     with open(os.devnull, "w") as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
         result = qs.reports.html(
-            df_final["strategy"],
-            df_final["benchmark"],
+            df_stats_final["strategy"],  # Use the statistics dataframe for calculations
+            df_stats_final["benchmark"],  # Use the statistics dataframe for calculations
             title=title,
             output=tearsheet_file,
             download_filename=tearsheet_file,  # Consider if you need a different name for clarity

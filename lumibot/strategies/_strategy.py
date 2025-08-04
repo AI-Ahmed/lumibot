@@ -510,6 +510,7 @@ class _Strategy:
         - The order is not None.
         - The order is an instance of the Order class.
         - The order quantity is not zero.
+        - For HFT strategies, check if sell order would result in negative position.
         """
 
         # Check if order is None
@@ -539,6 +540,17 @@ class _Strategy:
                 f"Order quantity cannot be zero. You entered {order.quantity}."
             )
             return False
+
+        # Additional check for HFT strategies to prevent negative positions
+        if self._is_hft_strategy() and order.is_sell_order():
+            position = self.get_tracked_position(order.strategy, order.asset)
+            if position is None or position.quantity < order.quantity:
+                self.logger.warning(
+                    f"HFT Strategy: Rejecting sell order for {order.asset.symbol} - Insufficient position. "
+                    f"Attempted to sell {order.quantity} but current position is "
+                    f"{position.quantity if position else 0}."
+                )
+                return False
 
         return True
 
@@ -788,7 +800,62 @@ class _Strategy:
         if "datetime" in self._stats.columns:
             self._stats = self._stats.set_index("datetime")
             self._stats = self._stats.sort_index()
+        
+        # Calculate standard returns
         self._stats["return"] = self._stats["portfolio_value"].pct_change()
+        
+        # Add intraday metrics for HFT strategies
+        # Add trading day column for grouping
+        if self._is_hft_strategy():
+            # Add intraday cumulative return column
+            self._stats["intraday_cumulative_return"] = (1 + self._stats["return"]).cumprod() - 1
+            
+            # Add trading day column for grouping
+            self._stats["trading_day"] = self._stats.index.date
+            
+            # Calculate intraday volatility (standard deviation of returns within each day)
+            day_groups = self._stats.groupby("trading_day")
+            
+            # Create a dictionary to store intraday metrics
+            intraday_metrics = {}
+            
+            # Calculate various intraday metrics
+            intraday_metrics["max_intraday_return"] = day_groups["intraday_cumulative_return"].max()
+            intraday_metrics["min_intraday_return"] = day_groups["intraday_cumulative_return"].min()
+            intraday_metrics["intraday_volatility"] = day_groups["return"].std()
+            
+            # Calculate intraday Sharpe ratio (mean return / std of returns)
+            # Handle division by zero by replacing NaN with 0
+            mean_returns = day_groups["return"].mean()
+            std_returns = day_groups["return"].std()
+            intraday_metrics["intraday_sharpe"] = mean_returns / std_returns.replace(0, float('nan'))
+            intraday_metrics["intraday_sharpe"] = intraday_metrics["intraday_sharpe"].fillna(0)
+            
+            # Calculate trade frequency (number of non-zero returns per day)
+            intraday_metrics["trade_frequency"] = day_groups["return"].apply(lambda x: (x != 0).sum())
+            
+            # Store these metrics in the strategy for later use in tearsheet
+            self._intraday_metrics = pd.DataFrame(intraday_metrics)
+            
+            # Add a summary of intraday metrics to the strategy parameters
+            if not hasattr(self, "parameters"):
+                self.parameters = {}
+                
+            if "HFT Metrics" not in self.parameters:
+                self.parameters["HFT Metrics"] = {}
+                
+            # Add average metrics
+            self.parameters["HFT Metrics"]["Avg Max Intraday Return"] = intraday_metrics["max_intraday_return"].mean()
+            self.parameters["HFT Metrics"]["Avg Min Intraday Return"] = intraday_metrics["min_intraday_return"].mean()
+            self.parameters["HFT Metrics"]["Avg Intraday Volatility"] = intraday_metrics["intraday_volatility"].mean()
+            self.parameters["HFT Metrics"]["Avg Intraday Sharpe"] = intraday_metrics["intraday_sharpe"].mean()
+            self.parameters["HFT Metrics"]["Avg Daily Trade Count"] = intraday_metrics["trade_frequency"].mean()
+            
+            # Add maximum values
+            self.parameters["HFT Metrics"]["Max Intraday Return"] = intraday_metrics["max_intraday_return"].max()
+            self.parameters["HFT Metrics"]["Max Intraday Drawdown"] = intraday_metrics["min_intraday_return"].min()
+            self.parameters["HFT Metrics"]["Max Intraday Volatility"] = intraday_metrics["intraday_volatility"].max()
+            self.parameters["HFT Metrics"]["Max Daily Trade Count"] = intraday_metrics["trade_frequency"].max()
 
         return self._stats
 
@@ -909,6 +976,7 @@ class _Strategy:
                 if df is None or df.empty:
                     self.logger.error(f"Couldn't get_historical_prices_between_dates: {benchmark_asset}")
                     return
+
                 df = df.loc[self._backtesting_start:self._backtesting_end].copy()
                 df["return"] = df["close"].pct_change(fill_method=None)
                 df["symbol_cumprod"] = (1 + df["return"]).cumprod()
@@ -958,11 +1026,78 @@ class _Strategy:
                 initial_budget=self._initial_budget,
             )
 
+    def _is_hft_strategy(self):
+        """
+        Detect if this is a high-frequency trading strategy based on trading frequency
+        or sleeptime configuration.
+        
+        Returns
+        -------
+        bool
+            True if the strategy appears to be HFT, False otherwise
+        """
+        # First check: if sleeptime is very small (seconds or milliseconds), consider it HFT
+        if hasattr(self, '_sleeptime'):
+            sleeptime_str = str(self._sleeptime).lower()
+            
+            # Check for millisecond-level trading frequency
+            if 'ms' in sleeptime_str or sleeptime_str.endswith('s') and float(sleeptime_str.rstrip('s')) < 5:
+                return True
+                
+            # Check for very frequent minute-level trading (less than 5 minutes)
+            if sleeptime_str.endswith('m') and float(sleeptime_str.rstrip('m')) < 5:
+                return True
+        
+        # Second check: based on historical trading frequency
+        if len(self._stats_list) == 0:
+            return False
+            
+        # Calculate average iterations per day
+        trading_days = set()
+        for row in self._stats_list:
+            if 'datetime' in row:
+                if hasattr(row['datetime'], 'date'):
+                    trading_days.add(row['datetime'].date())
+                else:
+                    # Try to convert to datetime if it's not already
+                    try:
+                        dt = pd.to_datetime(row['datetime'])
+                        trading_days.add(dt.date())
+                    except:
+                        pass
+        
+        # If we couldn't extract dates, use a conservative estimate
+        if not trading_days:
+            return False
+            
+        avg_iterations_per_day = len(self._stats_list) / max(1, len(trading_days))
+        
+        # Consider it HFT if more than 100 iterations per day on average
+        return avg_iterations_per_day > 100
+    
+    def _get_appropriate_resample_rule(self):
+        """
+        Determine the appropriate resampling rule based on strategy characteristics.
+        
+        Returns
+        -------
+        str
+            The pandas resample rule to use
+        """
+        if self._is_hft_strategy():
+            # For HFT strategies, use minute-level resampling
+            # This can be adjusted based on specific needs
+            return "1min"  # 1-minute intervals
+        else:
+            # For regular strategies, use daily resampling
+            return "D"
+            
     def tearsheet(
         self,
         save_tearsheet=True,
         tearsheet_file=None,
         show_tearsheet=True,
+        resample_rule=None,  # Changed default to None for auto-detection
     ):
         if not save_tearsheet and not show_tearsheet:
             return None
@@ -981,6 +1116,37 @@ class _Strategy:
                 del strategy_parameters["pandas_data"]
 
             strat_name = self._name if self._name is not None else "Strategy"
+            
+            # Auto-detect appropriate resample rule if not specified
+            if resample_rule is None:
+                resample_rule = self._get_appropriate_resample_rule()
+                
+                # Add information about detected strategy type to parameters
+                if "Strategy Info" not in strategy_parameters:
+                    strategy_parameters["Strategy Info"] = {}
+                    
+                strategy_parameters["Strategy Info"]["Detected Type"] = "High-Frequency Trading" if resample_rule != "D" else "Standard"
+                strategy_parameters["Strategy Info"]["Resample Rule"] = resample_rule
+                
+            # For HFT strategies, include trade metrics in the parameters
+            if hasattr(self, '_trade_history') and self._trade_history:
+                # Analyze trades and add metrics to parameters
+                trade_metrics = self.analyze_trades()
+                
+                if "Trade Metrics" not in strategy_parameters:
+                    strategy_parameters["Trade Metrics"] = {}
+                
+                # Format the metrics for display
+                strategy_parameters["Trade Metrics"]["Trade Count"] = trade_metrics["trade_count"]
+                strategy_parameters["Trade Metrics"]["Win Rate"] = f"{trade_metrics['win_rate']:.2%}"
+                strategy_parameters["Trade Metrics"]["Profit Factor"] = f"{trade_metrics['profit_factor']:.2f}"
+                strategy_parameters["Trade Metrics"]["Avg Profit/Trade"] = f"${trade_metrics['avg_profit_per_trade']:.2f}"
+                strategy_parameters["Trade Metrics"]["Avg Profit %/Trade"] = f"{trade_metrics['avg_profit_pct_per_trade']:.2f}%"
+                strategy_parameters["Trade Metrics"]["Total P&L"] = f"${trade_metrics['total_profit']:.2f}"
+                strategy_parameters["Trade Metrics"]["Max Profit"] = f"${trade_metrics['max_profit']:.2f}"
+                strategy_parameters["Trade Metrics"]["Max Loss"] = f"${trade_metrics['max_loss']:.2f}"
+                strategy_parameters["Trade Metrics"]["Avg Win"] = f"${trade_metrics['avg_win']:.2f}"
+                strategy_parameters["Trade Metrics"]["Avg Loss"] = f"${trade_metrics['avg_loss']:.2f}"
 
             result = create_tearsheet(
                 self._strategy_returns_df,
@@ -992,6 +1158,7 @@ class _Strategy:
                 save_tearsheet,
                 risk_free_rate=self.risk_free_rate,
                 strategy_parameters=strategy_parameters,
+                resample_rule=resample_rule,  # Pass the resample_rule parameter
             )
 
             return result
@@ -1040,6 +1207,7 @@ class _Strategy:
         trader_class = Trader,
         include_cash_positions=False,
         save_stats_file = True,
+        resample_rule = None,  # Add resample_rule parameter
         **kwargs,
     ):
         """Backtest a strategy.
@@ -1433,6 +1601,7 @@ class _Strategy:
             show_indicators=show_indicators,
             tearsheet_file=tearsheet_file,
             base_filename=base_filename,
+            resample_rule=resample_rule,  # Pass the resample_rule parameter
         )
 
         end = datetime.datetime.now()
@@ -1463,7 +1632,8 @@ class _Strategy:
         settings_file=None,
         indicators_file=None,
         tearsheet_csv_file=None,
-        base_filename=None
+        base_filename=None,
+        resample_rule=None,  # Add resample_rule parameter
     ):
         if not self._analyze_backtest:
             return
@@ -1488,6 +1658,11 @@ class _Strategy:
         if not tearsheet_csv_file:
             tearsheet_csv_file = f"{logdir}/{base_filename}_tearsheet.csv"
 
+        # Create the directory if it doesn't exist
+        if not os.path.exists(logdir):
+            os.makedirs(logdir)
+
+        # Write the backtest settings
         self.write_backtest_settings(settings_file)
 
         backtesting_broker = self.broker
@@ -1497,6 +1672,7 @@ class _Strategy:
             backtesting_broker._trade_event_log_df,
             show_plot=show_plot,
         )
+        
         # Create chart lines dataframe
         chart_lines_df = pd.DataFrame(self._chart_lines_list)
         # Create chart markers dataframe
@@ -1516,6 +1692,7 @@ class _Strategy:
             save_tearsheet=save_tearsheet,
             tearsheet_file=tearsheet_file,
             show_tearsheet=show_tearsheet,
+            resample_rule=resample_rule,  # Pass the resample_rule parameter
         )
 
         # Save the result to a csv file
@@ -2401,3 +2578,144 @@ class _Strategy:
             quantity = 0.0
 
         return quantity
+
+    def get_historical_trades(
+        self,
+        asset,
+        quote=None,
+        data_datetime_start=None,
+        data_datetime_end=None,
+    ):
+        """Get historical trades data for an asset.
+        
+        Parameters
+        ----------
+        asset : Asset or str
+            The asset to get historical trades for.
+        quote : Asset or str, optional
+            The quote asset for pricing. If None, uses the default quote asset.
+        data_datetime_start : datetime, optional
+            Start date of the data to retrieve.
+            If None, uses the default start date from the data source.
+        data_datetime_end : datetime, optional
+            End date of the data to retrieve (inclusive).
+            If None, uses the default end date from the data source.
+            
+        Returns
+        -------
+        pandas.DataFrame
+            DataFrame containing the historical trades data indexed by timestamp.
+            
+        Notes
+        -----
+        This method fetches raw trades data for high-frequency trading or custom
+        feature engineering. It's the strategy's responsibility to process this data
+        appropriately for analysis or custom bar construction.
+        
+        Currently only supported for stock assets with certain data sources like AlpacaBacktesting.
+        """
+        asset = self._sanitize_user_asset(asset)
+        if quote is not None:
+            quote = self._sanitize_user_asset(quote)
+
+        if hasattr(self.broker.data_source, "get_historical_trades_between_dates"):
+            return self.broker.data_source.get_historical_trades_between_dates(
+                base_asset=asset,
+                quote_asset=quote,
+                data_datetime_start=data_datetime_start,
+                data_datetime_end=data_datetime_end,
+            )
+        else:
+            self.logger.error(
+                "The data source does not support fetching historical trades data. "
+                "This feature is currently only available with certain data sources like AlpacaBacktesting."
+            )
+            return None
+
+    def get_trade_history(self):
+        """
+        Get the trade history for this strategy.
+        
+        Returns
+        -------
+        pandas.DataFrame or None
+            DataFrame containing trade history with P&L information, or None if no trades have been made
+        """
+        if not hasattr(self, '_trade_history') or not self._trade_history:
+            return None
+            
+        # Convert the trade history to a DataFrame
+        trade_df = pd.DataFrame(self._trade_history)
+        
+        # Set the datetime as the index
+        if 'datetime' in trade_df.columns:
+            trade_df = trade_df.set_index('datetime')
+            trade_df = trade_df.sort_index()
+            
+        return trade_df
+        
+    def analyze_trades(self):
+        """
+        Analyze the trade history and return trade performance metrics.
+        
+        Returns
+        -------
+        dict
+            Dictionary containing trade performance metrics
+        """
+        trade_df = self.get_trade_history()
+        
+        if trade_df is None or trade_df.empty:
+            return {
+                "trade_count": 0,
+                "win_rate": 0,
+                "profit_factor": 0,
+                "avg_profit_per_trade": 0,
+                "avg_profit_pct_per_trade": 0,
+                "total_profit": 0,
+                "max_profit": 0,
+                "max_loss": 0,
+                "avg_win": 0,
+                "avg_loss": 0
+            }
+            
+        # Calculate trade metrics
+        trade_count = len(trade_df)
+        winning_trades = trade_df[trade_df['pl'] > 0]
+        losing_trades = trade_df[trade_df['pl'] < 0]
+        
+        win_count = len(winning_trades)
+        loss_count = len(losing_trades)
+        
+        win_rate = win_count / trade_count if trade_count > 0 else 0
+        
+        total_profit = trade_df['pl'].sum()
+        total_profit_winning = winning_trades['pl'].sum() if not winning_trades.empty else 0
+        total_loss_losing = abs(losing_trades['pl'].sum()) if not losing_trades.empty else 0
+        
+        profit_factor = total_profit_winning / total_loss_losing if total_loss_losing > 0 else float('inf')
+        
+        avg_profit_per_trade = total_profit / trade_count if trade_count > 0 else 0
+        avg_profit_pct_per_trade = trade_df['pl_pct'].mean() if 'pl_pct' in trade_df.columns else 0
+        
+        max_profit = trade_df['pl'].max() if not trade_df.empty else 0
+        max_loss = trade_df['pl'].min() if not trade_df.empty else 0
+        
+        avg_win = winning_trades['pl'].mean() if not winning_trades.empty else 0
+        avg_loss = losing_trades['pl'].mean() if not losing_trades.empty else 0
+        
+        # Create metrics dictionary
+        metrics = {
+            "trade_count": trade_count,
+            "win_rate": win_rate,
+            "profit_factor": profit_factor,
+            "avg_profit_per_trade": avg_profit_per_trade,
+            "avg_profit_pct_per_trade": avg_profit_pct_per_trade,
+            "total_profit": total_profit,
+            "max_profit": max_profit,
+            "max_loss": max_loss,
+            "avg_win": avg_win,
+            "avg_loss": avg_loss
+        }
+        
+        return metrics
