@@ -1,17 +1,287 @@
 [![CI Status](https://github.com/Lumiwealth/lumibot/actions/workflows/cicd.yaml/badge.svg?branch=dev)](https://github.com/Lumiwealth/lumibot/actions/workflows/cicd.yaml)
 [![Coverage](https://raw.githubusercontent.com/Lumiwealth/lumibot/badge/coverage.svg)](https://github.com/Lumiwealth/lumibot/actions/workflows/cicd.yaml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![PyPI version](https://badge.fury.io/py/lumibot.svg)](https://badge.fury.io/py/lumibot)
 
-# Lumibot - A Backtesting and Trading Library for Stocks, Options, Crypto, Futures, FOREX and More!
+# 🚀 Lumibot - Professional Algorithmic Trading Framework
 
-Lumibot is a backtesting and trading library for stocks, options, crypto, futures and more. It is made so that the same code you use for backtesting can be used for live trading, making it easy to transition from backtesting to live trading. Lumibot is a highly flexible library that allows you to create your own strategies and indicators, and backtest them on historical data. It is also highly optimized for speed, so you can backtest your strategies quickly and efficiently.
+**The Ultimate Backtesting and Live Trading Library for Stocks, Options, Crypto, Futures, FOREX and More!**
 
-**IMPORTANT: This library requires data for backtesting. The recommended data source is [Polygon.io](https://polygon.io/?utm_source=affiliate&utm_campaign=lumi10) (a free tier is available too). Please click the link to give us credit for the sale, it helps support this project. You can use the coupon code 'LUMI10' for 10% off.**
+Lumibot is a comprehensive, production-ready algorithmic trading framework designed for quantitative researchers, portfolio managers, and algorithmic traders. Built with modern Python practices, it seamlessly bridges the gap between backtesting and live trading with the same codebase.
 
-## Documentation - 👇 Start Here 👇
+## 🌟 Key Features
 
-To get started with Lumibot, you can check out our documentation below.
+- **🔄 Unified Codebase**: Same code for backtesting and live trading
+- **📈 Multi-Asset Support**: Stocks, Options, Crypto, Futures, FOREX
+- **⚡ High Performance**: Optimized for speed and efficiency
+- **🔌 Multiple Brokers**: Alpaca, Interactive Brokers, Tradier, Schwab, and more
+- **📊 Rich Analytics**: Built-in performance metrics and visualization
+- **🛡️ Risk Management**: Advanced position sizing and risk controls
+- **🐍 Modern Python**: Type hints, async support, and clean architecture
 
-**Check out the documentation for the project here: 👉 <http://lumibot.lumiwealth.com/> 👈**
+## 📚 Documentation
+
+**📖 Complete Documentation: [lumibot.lumiwealth.com](http://lumibot.lumiwealth.com/)**
+
+## 📦 Installation
+
+### Prerequisites
+
+Before installing Lumibot, ensure you have:
+
+```bash
+# Install python-dotenv (required for private packages)
+pip install python-dotenv
+
+# Or with uv (recommended)
+uv pip install python-dotenv
+```
+
+### Standard Installation
+
+```bash
+# Install from PyPI (recommended for most users)
+pip install lumibot
+
+# Or with uv (faster and more reliable)
+uv pip install lumibot
+
+# Or install from source
+pip install -e .
+```
+
+### Development Installation
+
+For contributors and developers who want access to the latest features:
+
+#### Using pip (Traditional Method)
+
+```bash
+# Clone the repository
+git clone https://github.com/AI-Ahmed/lumibot.git
+cd lumibot
+
+# Create virtual environment with Python 3.12 (required for TA libraries)
+python3.12 -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# Install python-dotenv first (required for private packages)
+pip install python-dotenv
+
+# Install development dependencies
+pip install -r requirements_dev.txt
+
+# Install package in editable mode
+pip install -e .
+```
+
+#### Using uv (Recommended - Faster & More Reliable)
+
+```bash
+# Install uv if you haven't already
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Clone the repository
+git clone https://github.com/AI-Ahmed/lumibot.git
+cd lumibot
+
+# Create virtual environment with Python 3.12
+uv venv --python 3.12
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# Install python-dotenv first
+uv pip install python-dotenv
+
+# Install development dependencies
+uv pip install -r requirements_dev.txt
+
+# Install package in editable mode
+uv pip install -e .
+```
+
+### Installation with Extras
+
+Lumibot supports several installation extras for different use cases:
+
+#### Using pip
+
+```bash
+# Technical Analysis tools 
+# - Python >= 3.12: pandas-ta (fully supported)
+pip install -e ".[ta]"
+
+# All public packages (includes TA tools)
+pip install -e ".[all]"
+
+# Private packages (for contributors with access)
+pip install -e ".[private]"  # Requires GIT_TOKEN
+```
+
+#### Using uv (Recommended)
+
+```bash
+# Technical Analysis tools with uv
+uv pip install -e ".[ta]"
+
+# All public packages with uv
+uv pip install -e ".[all]"
+
+# Private packages with uv (requires GIT_TOKEN)
+uv pip install -e ".[private]"
+
+# Install all extras at once
+uv pip install -e ".[all,private]"
+```
+
+#### Dependency Compatibility & Conflict Resolution
+
+**⚠️ Important: pandas-ta & FPAP Dependency Conflict**
+
+Due to conflicting numpy version requirements, the dependency resolver cannot install both packages simultaneously:
+- **FPAP**: Declares `numpy==1.26.4` (pinned version)
+- **pandas-ta**: Requires `numpy>=2.2.6` (newer version)
+
+**Note**: While both packages may work together at runtime with numpy 2.2.6, the strict dependency declarations prevent automatic co-installation.
+
+**Installation Options:**
+
+1. **FPAP Only** (Recommended for contributors):
+   ```bash
+   uv pip install -e ".[private]"  # Installs FPAP without pandas-ta
+   ```
+
+2. **pandas-ta Only** (Public users):
+   ```bash
+   uv pip install -e ".[ta]"       # Installs pandas-ta without FPAP
+   ```
+
+3. **Separate Environments** (Advanced users):
+   ```bash
+   # Environment 1: FPAP
+   uv venv fpap-env --python 3.12
+   source fpap-env/bin/activate
+   uv pip install -e ".[private]"
+   
+   # Environment 2: pandas-ta
+   uv venv ta-env --python 3.12
+   source ta-env/bin/activate
+   uv pip install -e ".[ta]"
+   ```
+
+**Compatibility Matrix:**
+
+| Installation | FPAP | pandas-ta | Core Trading | Notes |
+|-------------|------|-----------|--------------|-------|
+| `.[private]` | ✅ | ❌ | ✅ | For contributors with access |
+| `.[ta]` | ❌ | ✅ | ✅ | For public users needing TA |
+| `.[all]` | ❌ | ✅ | ✅ | Public packages only |
+| `.[all,private]` | ⚠️ | ❌ | ✅ | FPAP conflicts with pandas-ta |
+
+### 🔐 Private Package Installation
+
+Contributors with access to private packages can install additional proprietary tools:
+
+#### Method 1: Environment Variable (Recommended)
+
+```bash
+# Set your GitHub token
+export GIT_TOKEN=your_github_personal_access_token
+
+# Install with private packages using pip
+pip install -e ".[private]"
+
+# Or with uv (recommended)
+uv pip install -e ".[private]"
+
+# Or install everything (public + private)
+uv pip install -e ".[all,private]"
+```
+
+#### Method 2: .env File (Automatic Detection)
+
+Create a `.env` file in the project root:
+
+```env
+GIT_TOKEN=your_github_personal_access_token
+```
+
+Then install (the token will be automatically detected):
+
+```bash
+# With pip
+pip install -e ".[private]"
+
+# With uv (recommended)
+uv pip install -e ".[private]"
+```
+
+#### Complete Development Setup with Private Packages
+
+```bash
+# 1. Clone and setup
+git clone https://github.com/AI-Ahmed/lumibot.git
+cd lumibot
+
+# 2. Create .env file
+echo "GIT_TOKEN=your_github_token" > .env
+
+# 3. Setup with uv (recommended)
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install python-dotenv
+uv pip install -e ".[all,private]"
+
+# 4. Verify installation
+uv pip list | grep fpap  # Should show FPAP package
+```
+
+> **Note**: Private packages include advanced analytics tools (FPAP) and are only available to authorized contributors. The package works fully without these dependencies.
+
+## ⚡ Quick Start
+
+### Prerequisites
+
+- **Python 3.10+** (Python 3.12+ recommended for best performance)
+- **Virtual Environment** (strongly recommended)
+- **Data Source**: [Polygon.io](https://polygon.io/?utm_source=affiliate&utm_campaign=lumi10) (free tier available)
+  - Use coupon code `LUMI10` for 10% off 💰
+
+### Your First Strategy
+
+```python
+from lumibot.strategies import Strategy
+from lumibot.backtesting import YahooDataBacktesting
+from lumibot.traders import Trader
+from datetime import datetime
+
+class BuyAndHold(Strategy):
+    def initialize(self):
+        self.sleeptime = 1  # Sleep for 1 day between iterations
+        
+    def on_trading_iteration(self):
+        if self.first_iteration:
+            # Buy $10,000 worth of SPY on first iteration
+            order = self.create_order("SPY", 10000, "buy")
+            self.submit_order(order)
+
+# Backtest the strategy
+backtesting_start = datetime(2020, 1, 1)
+backtesting_end = datetime(2023, 12, 31)
+
+BuyAndHold.backtest(
+    YahooDataBacktesting,
+    backtesting_start,
+    backtesting_end,
+)
+```
+
+### Run Example Strategy
+
+```bash
+# Run a built-in example
+python -m lumibot.example_strategies.stock_buy_and_hold
+```
 
 ## Build Trading Bots with AI
 
@@ -30,38 +300,20 @@ Our blog has lots of example strategies and shows you how to run a bot using Lum
 
 **https://lumiwealth.com/blog/**
 
-## Run a backtest
+## 🚀 Example Strategies & Backtesting
 
-To run a backtest, you can use the following code snippet:
+### Quick Backtest
 
 ```bash
+# Run a simple buy and hold backtest
 python -m lumibot.example_strategies.stock_buy_and_hold
 ```
 
-## Installing with Private Dependencies
+### Example Strategy Repository
 
-If you're a contributor or have access to private dependencies used in this project, you can install them using:
+Explore our comprehensive example strategy: **[Stock Example Algorithm](https://github.com/Lumiwealth-Strategies/stock_example_algo)**
 
-```bash
-# Set your GitHub token as an environment variable
-export GIT_TOKEN=your_github_token_here
-
-# Install the package with private dependencies
-pip install -e ".[private]"
-```
-
-If you don't have access to the private dependencies, you can still install and use the package without them:
-
-```bash
-# Standard installation without private dependencies
-pip install -e .
-```
-
-## Run an Example Strategy
-
-We made a small example strategy to show you how to use Lumibot in this GitHub repository: [Example Algorithm GitHub](https://github.com/Lumiwealth-Strategies/stock_example_algo)
-
-To run this example strategy, click on the `Deploy to Render` button below to deploy the strategy to Render (our recommendation). You can also run the strategy on Repl.it by clicking on the `Run on Repl.it` button below.
+Deploy it instantly:
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Lumiwealth-Strategies/stock_example_algo)
 
@@ -69,36 +321,143 @@ To run this example strategy, click on the `Deploy to Render` button below to de
 
 **For more information on this example strategy, you can check out the README in the example strategy repository here: [Example Algorithm](https://github.com/Lumiwealth-Strategies/stock_example_algo)**
 
-## Contributors
+## 🤝 Contributing
 
-If you want to contribute to Lumibot, you can check how to get started below. We are always looking for contributors to help us out!
+We welcome contributions from the community! Whether you're fixing bugs, adding features, or improving documentation, your help is appreciated.
 
-Here's a video to help you get started with contributing to Lumibot: [Watch The Video](https://youtu.be/Huz6VxqafZs)
+### 🎥 Getting Started Video
 
-**Steps to contribute:**
+Watch our contributor onboarding video: **[Watch The Video](https://youtu.be/Huz6VxqafZs)**
 
-0. Watch the video: [Watch The Video](https://youtu.be/Huz6VxqafZs)
-1. Clone the repository to your local machine
-2. Create a new branch for your feature
-3. Run `pip install -r requirements_dev.txt` to install the developer dependencies
-4. Install all the requirements from setup.py: `pip install -e .`
-5. Make your changes
-6. Run `pytest` to make sure all the tests pass
-7. Create a pull request to merge your branch into master
+### 🔧 Development Setup
 
-## Running Tests
-
-We use pytest for our testing framework. Some tests require API keys to be in a `.env` file in the root directory. To run the tests, you can run the following command:
+#### Option 1: Using uv (Recommended)
 
 ```bash
+# 1. Fork and clone the repository
+git clone https://github.com/yourusername/lumibot.git
+cd lumibot
+
+# 2. Create virtual environment with Python 3.12
+uv venv --python 3.12
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# 3. Install python-dotenv first
+uv pip install python-dotenv
+
+# 4. Install development dependencies
+uv pip install -r requirements_dev.txt
+
+# 5. Install package in editable mode with all extras
+uv pip install -e ".[all]"
+
+# 6. Install pre-commit hooks (optional but recommended)
+pre-commit install
+```
+
+#### Option 2: Using pip (Traditional)
+
+```bash
+# 1. Fork and clone the repository
+git clone https://github.com/yourusername/lumibot.git
+cd lumibot
+
+# 2. Create virtual environment with Python 3.12
+python3.12 -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# 3. Install python-dotenv first
+pip install python-dotenv
+
+# 4. Install development dependencies
+pip install -r requirements_dev.txt
+
+# 5. Install package in editable mode
+pip install -e ".[all]"
+
+# 6. Install pre-commit hooks (optional but recommended)
+pre-commit install
+```
+
+### 🚀 Contribution Workflow
+
+1. **Watch the video**: [Contributing Guide](https://youtu.be/Huz6VxqafZs)
+2. **Fork** the repository on GitHub
+3. **Create a feature branch**: `git checkout -b feature/your-feature-name`
+4. **Make your changes** with proper tests and documentation
+5. **Run tests**: `pytest` (ensure all tests pass)
+6. **Check code quality**: `ruff check .` and `ruff format .`
+7. **Commit your changes**: `git commit -m "feat: add amazing feature"`
+8. **Push to your fork**: `git push origin feature/your-feature-name`
+9. **Create a Pull Request** targeting the `dev` branch
+
+### 📋 Contribution Guidelines
+
+- **Code Style**: We use [Ruff](https://docs.astral.sh/ruff/) for linting and formatting
+- **Testing**: Add tests for new features using `pytest`
+- **Documentation**: Update docstrings and README as needed
+- **Commit Messages**: Use conventional commits (feat:, fix:, docs:, etc.)
+- **Branch Naming**: Use descriptive names like `feature/options-trading` or `fix/memory-leak`
+
+### 🔐 Private Dependencies Access
+
+Contributors with access to private packages can install additional development tools:
+
+```bash
+# Create .env file with your GitHub token
+echo "GIT_TOKEN=your_github_token" > .env
+
+# Install with private dependencies
+pip install -e ".[private]"
+```
+
+### 🏗️ Build System
+
+Our build system supports:
+- **Dynamic dependency resolution** based on Python version
+- **Private package integration** for authorized contributors
+- **Modern Python packaging** with `pyproject.toml` and `setuptools`
+
+## 🧪 Testing
+
+We maintain high code quality with comprehensive testing using `pytest`.
+
+### Running Tests
+
+```bash
+# Run all tests
 pytest
-```
 
-To run an individual test file, you can run the following command:
+# Run with coverage report
+pytest --cov=lumibot --cov-report=html
 
-```bash
+# Run specific test file
 pytest tests/test_asset.py
+
+# Run tests matching a pattern
+pytest -k "test_order"
+
+# Run tests with verbose output
+pytest -v
 ```
+
+### Test Configuration
+
+Some tests require API keys in a `.env` file:
+
+```env
+# Required for broker integration tests
+ALPACA_API_KEY=your_alpaca_key
+ALPACA_SECRET_KEY=your_alpaca_secret
+POLYGON_API_KEY=your_polygon_key
+```
+
+### Test Categories
+
+- **Unit Tests**: Fast, isolated component tests
+- **Integration Tests**: Broker and data source integration
+- **Backtest Tests**: Strategy backtesting validation
+- **Performance Tests**: Speed and memory benchmarks
 
 ### Showing Code Coverage
 
@@ -183,80 +542,269 @@ Here's an example of an actual launch.json file:
 }
 ```
 
-## Notes on data sources
+## 📊 Supported Data Sources
 
-This table points out some of the differences between the data sources we use in Lumibot. These refer to the data 
-returned in a Bars entity that is returned from calls to get_historical_prices. 
+Lumibot supports multiple data providers for comprehensive market coverage:
 
-| data_source | type  | OHLCV | split adjusted | dividends | returns | dividend adjusted returns |
-|-------------|-------|-------|----------------|-----------|---------|---------------------------|
-| yahoo       | stock | Yes   | Yes            | Yes       | Yes     | Yes                       |
-| alpaca      | stock | Yes   | Yes            | No        | Yes     | No                        |
-| polygon     | stock | Yes   | Yes            | No        | Yes     | No                        |
-| Tradier     | stock | Yes   | Yes            | No        | Yes     | No                        |
-| Pandas*     | stock | Yes   | Yes            | Yes       | Yes     | Yes                       |
+### Data Source Comparison
 
-*Pandas is not a data source per se, but it can load csv files in the same format as Yahoo dataframes,
-which can contain dividends.
+| Data Source | Asset Types | OHLCV | Split Adjusted | Dividends | Returns | Dividend Adjusted |
+|-------------|-------------|-------|----------------|-----------|---------|-------------------|
+| **Polygon** | Stocks, Options, Crypto, Forex | ✅ | ✅ | ❌ | ✅ | ❌ |
+| **Yahoo Finance** | Stocks, ETFs, Indices | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Alpaca** | Stocks, Crypto | ✅ | ✅ | ❌ | ✅ | ❌ |
+| **Interactive Brokers** | All Asset Classes | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Tradier** | Stocks, Options | ✅ | ✅ | ❌ | ✅ | ❌ |
+| **CSV/Pandas** | Custom Data | ✅ | ✅ | ✅ | ✅ | ✅ |
 
-## An assortment of git commands our contributors may find useful
+### Data Source Features
 
-Making a new branch and pulling from main:
-```shell
-git checkout -b my-feature
+- **Real-time Data**: Live market data for active trading
+- **Historical Data**: Extensive historical coverage for backtesting
+- **Multiple Timeframes**: From tick data to daily bars
+- **Corporate Actions**: Automatic adjustment for splits and dividends
+- **Alternative Data**: Support for custom data feeds
+
+> **Recommended**: [Polygon.io](https://polygon.io/?utm_source=affiliate&utm_campaign=lumi10) offers the best balance of features, reliability, and cost. Use code `LUMI10` for 10% off.
+
+## 🏗️ Architecture & Design
+
+### Core Components
+
+- **Strategies**: Define your trading logic and rules
+- **Brokers**: Execute trades across multiple platforms  
+- **Data Sources**: Feed market data to your strategies
+- **Risk Management**: Built-in position sizing and risk controls
+- **Analytics**: Performance tracking and visualization
+- **Backtesting**: Historical strategy validation
+
+### Design Principles
+
+- **Modularity**: Plug-and-play components
+- **Extensibility**: Easy to add new brokers and data sources
+- **Performance**: Optimized for speed and memory efficiency
+- **Reliability**: Production-tested with error handling
+- **Maintainability**: Clean, well-documented codebase
+
+## 🔧 Git Workflow for Contributors
+
+### Creating a Feature Branch
+
+```bash
+# Create and switch to feature branch
+git checkout -b feature/your-feature-name
+
+# Keep your branch updated with latest dev
 git fetch origin
 git merge origin/dev
 ```
-Committing work to you feature branch:
-```shell
+
+### Making Changes
+
+```bash
+# Stage and commit your changes
 git add .
-git commit -m "my changes"
-git push -u origin my-feature
+git commit -m "feat: add your feature description"
+
+# Push to your fork
+git push -u origin feature/your-feature-name
 ```
 
-If work on main progressed while you were in another branch, this is how you rebase it into your branch. Note that
-since you've rebased your local branch, you'll need to force push your changes to update the remote branch. 
-The --force-with-lease option is a safer alternative to --force as it will abort the push if there are any new 
-commits on the remote that you haven't incorporated into your local branch
-```shell
+### Keeping Your Branch Updated
+
+```bash
+# Update dev branch
 git checkout dev
 git fetch origin
 git merge origin/dev
-git checkout my-feature
+
+# Rebase your feature branch
+git checkout feature/your-feature-name
 git rebase dev
-git checkout my-feature
-git push --force-with-lease origin my-feature
+
+# Force push (safely) to update remote branch
+git push --force-with-lease origin feature/your-feature-name
 ```
 
-When ready to merge the branch into main, go into github, create a pull request, and await review. When your PR is approved it will automatically be merged into the dev branch remotely. Now, you can delete your local branch and the remote branch.
-```shell
+### After PR Approval
+
+```bash
+# Clean up after merge
 git checkout dev
 git fetch origin
 git merge origin/dev
-git branch -D my-feature
-git push origin --delete my-feature
+git branch -D feature/your-feature-name
+git push origin --delete feature/your-feature-name
 ```
 
-## Community
+## 🔧 Troubleshooting
 
-If you want to learn more about Lumibot or Algorithmic Trading then you will love out communities! You can join us on Discord.
+### Common Installation Issues
 
-**Join us on Discord: <https://discord.gg/TmMsJCKY3T>**
+#### Dependency Conflicts
 
-**Build AI-powered trading bots on [BotSpot.trade](https://botspot.trade/)** - Our platform for creating, testing, and deploying trading strategies with AI assistance!
+**Problem**: `No solution found when resolving dependencies` with numpy versions
 
-## Courses
+**Solution**: This occurs when trying to install both FPAP and pandas-ta together:
 
-If you need extra help building your algorithm, we have courses to help you out.
+```bash
+# Error message example:
+# fpap==0.4.6 depends on numpy==1.26.4 
+# pandas-ta==0.4.71b0 depends on numpy>=2.2.6
 
-**For our Algorithmic Trading course: <https://lumiwealth.com/algorithmic-trading-landing-page>**
+# Solution 1: Install FPAP only (recommended for contributors)
+uv pip install -e ".[private]"
 
-**For our Machine Learning for Trading course: <https://www.lumiwealth.com/product-category/machine-learning-purchase/>**
+# Solution 2: Install pandas-ta only (recommended for public users)  
+uv pip install -e ".[ta]"
 
-**For our Options Trading course: <https://www.lumiwealth.com/product-category/options-trading-purchase/>**
+# Solution 3: Use separate environments
+uv venv separate-env --python 3.12
+```
 
-**Looking for a no-code solution? Build trading bots with AI on [BotSpot](https://botspot.trade/)**
+**Alternative Solutions for FPAP + TA Users:**
 
-## License
+#### Option A: Alternative TA Libraries (Recommended)
 
-This library is covered by the MIT license for open sourced software which can be found here: <https://github.com/Lumiwealth/lumibot/blob/master/LICENSE>
+```bash
+# Install FPAP first
+uv pip install -e ".[private]"
+
+# Then install numpy 1.26.4 compatible TA libraries
+uv pip install finta           # Financial Technical Analysis
+uv pip install ta              # Technical Analysis Library
+# Note: talib-binary requires Python < 3.12
+```
+
+#### Option B: Manual pandas-ta Installation (Advanced)
+
+```bash
+# Install FPAP first
+uv pip install -e ".[private]"
+
+# Force install pandas-ta (may work despite version conflict)
+uv pip install pandas-ta --force-reinstall
+
+# Verify both work (they often do despite the version warning)
+python -c "import fpap, pandas_ta; print('✅ Both packages working')"
+```
+
+> **⚠️ Warning**: Option B bypasses dependency resolution and may cause instability. Use at your own risk and test thoroughly.
+
+#### Environment Setup Issues
+
+**Problem**: `python3.12` not found
+
+**Solution**: Install Python 3.12 or use available version:
+
+```bash
+# Check available Python versions
+ls /usr/bin/python*
+
+# Use available version (e.g., python3.11)
+uv venv --python python3.11
+
+# Or install Python 3.12
+# macOS: brew install python@3.12
+# Ubuntu: sudo apt install python3.12
+```
+
+## 🔒 Security & Best Practices
+
+### API Key Management
+
+- **Never commit API keys** to version control
+- Use **environment variables** or `.env` files
+- **Rotate keys regularly** for production systems
+- **Use separate keys** for development and production
+
+### Production Deployment
+
+- **Test thoroughly** in paper trading mode first
+- **Monitor positions** and risk metrics continuously  
+- **Implement circuit breakers** for unexpected behavior
+- **Keep logs** for audit and debugging purposes
+
+### Risk Management
+
+- **Position sizing**: Never risk more than you can afford to lose
+- **Diversification**: Don't put all capital in one strategy
+- **Stop losses**: Implement proper exit strategies
+- **Monitoring**: Set up alerts for unusual behavior
+
+## 🌐 Community & Support
+
+Join our thriving community of algorithmic traders and developers!
+
+### 💬 Discord Community
+
+**[Join our Discord Server](https://discord.gg/TmMsJCKY3T)** - Connect with other traders, get help, and share strategies
+
+### 🤖 AI Trading Platform
+
+**[BotSpot.trade](https://botspot.trade/)** - Build, test, and deploy trading strategies using AI assistance (no coding required!)
+
+### 📚 Educational Resources
+
+Enhance your algorithmic trading skills with our comprehensive courses:
+
+- **[Algorithmic Trading Course](https://lumiwealth.com/algorithmic-trading-landing-page)** - Master the fundamentals
+- **[Machine Learning for Trading](https://www.lumiwealth.com/product-category/machine-learning-purchase/)** - Advanced ML techniques
+- **[Options Trading Course](https://www.lumiwealth.com/product-category/options-trading-purchase/)** - Options strategies and Greeks
+
+### 📖 Additional Resources
+
+- **[Blog](https://lumiwealth.com/blog/)** - Strategy examples and tutorials
+- **[Documentation](http://lumibot.lumiwealth.com/)** - Complete API reference
+- **[YouTube Channel](https://youtube.com/@lumiwealth)** - Video tutorials and webinars
+- **[GitHub Discussions](https://github.com/AI-Ahmed/lumibot/discussions)** - Technical discussions
+
+## 🏆 Acknowledgments
+
+Special thanks to all our contributors who make Lumibot better every day!
+
+### Core Contributors
+
+- **Robert Grzesik** - Original creator and maintainer
+- **Ahmed** - Advanced features and architecture improvements
+- **Community Contributors** - Bug fixes, documentation, and feature requests
+
+### Powered By
+
+- **[Polygon.io](https://polygon.io/?utm_source=affiliate&utm_campaign=lumi10)** - Market data provider
+- **[Alpaca](https://alpaca.markets/)** - Commission-free trading API
+- **[Interactive Brokers](https://www.interactivebrokers.com/)** - Professional trading platform
+
+## 📄 License
+
+This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
+
+```
+MIT License
+
+Copyright (c) 2024 Lumiwealth
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+```
+
+---
+
+<div align="center">
+
+**⭐ Star this repository if Lumibot helps you build better trading strategies! ⭐**
+
+[**🚀 Get Started**](http://lumibot.lumiwealth.com/) | [**📖 Documentation**](http://lumibot.lumiwealth.com/) | [**💬 Discord**](https://discord.gg/TmMsJCKY3T) | [**🐦 Twitter**](https://twitter.com/lumiwealth)
+
+</div>
