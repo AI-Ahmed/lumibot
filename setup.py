@@ -124,7 +124,7 @@ extras_require = {
 setuptools.setup(
     # Basic package information
     name="lumibot",
-    version="3.18.4",
+    version="3.18.5",
     author="Robert Grzesik",
     author_email="rob@lumiwealth.com",
     description="Backtesting and Trading Library, Made by Lumiwealth.",

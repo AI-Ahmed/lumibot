@@ -15,14 +15,19 @@ import pandas_market_calendars as mcal
 from dateutil import tz
 from termcolor import colored
 
-from lumibot.tools.lumibot_logger import get_logger
-
-logger = get_logger(__name__)
-
 from lumibot.tools.lumibot_logger import get_logger, get_strategy_logger
+from loguru import logger as log
+
+# Import types for type hints
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from lumibot.strategies import Strategy
+
 from ..data_sources import DataSource
 from ..entities import Asset, Order, Position, Quote
 from ..trading_builtins import SafeList
+
+logger = get_logger(__name__)
 
 DEFAULT_CLEANUP_CONFIG = {
     "enabled": True,
@@ -843,8 +848,9 @@ class Broker(ABC):
             # Create new position for this given strategy and asset
             position = order.to_position(quantity)
         else:
-            # Add the order to the already existing position
-            position.add_order(order)  # Don't update quantity here, it's handled by querying broker
+            # Add the order to the already existing position and update quantity
+            # Pass the quantity parameter to ensure the position is updated correctly
+            position.add_order(order, quantity=Decimal(quantity))
 
         if order.asset.asset_type == "crypto":
             self._process_crypto_quote(order, quantity, price)
@@ -1142,16 +1148,59 @@ class Broker(ABC):
 
     # =========Positions functions==================
     def get_tracked_position(self, strategy, asset):
-        """get a tracked position given an asset and
-        a strategy"""
+        """
+        Get a tracked position given an asset and a strategy
+        
+        Parameters
+        ----------
+        strategy : str
+            Strategy name or identifier
+        asset : Asset
+            Asset to find position for
+            
+        Returns
+        -------
+        Position or None
+            Returns the position if found, None otherwise
+        """
+        # Ensure we're working with a properly formatted asset
+        if isinstance(asset, str):
+            from lumibot.entities import Asset
+            asset = Asset(symbol=asset)
+            
+        # Find matching position by asset and strategy
         for position in self._filled_positions:
-            if position.asset == asset and (not strategy or position.strategy == strategy):
+            # Match by symbol and strategy (if provided)
+            if (position.asset.symbol == asset.symbol and 
+                (not strategy or position.strategy == strategy)):
                 return position
+                
         return None
 
     def get_tracked_positions(self, strategy=None):
-        """get all tracked positions for a given strategy"""
-        result = [position for position in self._filled_positions if strategy is None or position.strategy == strategy]
+        """
+        Get all tracked positions for a given strategy
+        
+        Parameters
+        ----------
+        strategy : str, optional
+            Strategy name or identifier. If None, returns positions for all strategies.
+            
+        Returns
+        -------
+        list of Position
+            List of positions for the specified strategy, or all positions if strategy is None
+        """
+        # Filter positions by strategy if provided
+        result = [
+            position for position in self._filled_positions 
+            if strategy is None or position.strategy == strategy
+        ]
+        
+        # Log position count for debugging
+        if len(result) > 0:
+            self.logger.debug(f"Found {len(result)} positions for strategy '{strategy}'")
+        
         return result
 
     # =========Orders and assets functions=================
@@ -1271,6 +1320,45 @@ class Broker(ABC):
     def modify_order(self, order, stop_price: Union[float, None] = None, limit_price: Union[float, None] = None):
         """Modify an order"""
         return self._modify_order(order, stop_price=stop_price, limit_price=limit_price)
+
+    def validate_order_position(self, order, strategy_name):
+        """
+        Professional position validation with proper error handling.
+        
+        Returns a validation result object that indicates whether the order
+        is valid and provides detailed error information for proper event dispatching.
+        
+        Parameters
+        ----------
+        order : Order
+            The order to validate
+        strategy_name : str
+            The name of the strategy submitting the order
+            
+        Returns
+        -------
+        ValidationResult
+            Object containing validation status and detailed error information
+        """
+        from collections import namedtuple
+        ValidationResult = namedtuple('ValidationResult', ['is_valid', 'message', 'error_code'])
+        
+        if not order.is_sell_order():
+            return ValidationResult(True, "Buy orders do not require position validation", None)
+            
+        # Get current position using broker's tracking system (single source of truth)
+        position = self.get_tracked_position(strategy_name, order.asset)
+        current_quantity = position.quantity if position else 0
+        
+        # Validate sufficient position for sell order
+        if position is None or current_quantity < order.quantity:
+            error_msg = (
+                f"Insufficient position for {order.asset.symbol}: "
+                f"attempted to sell {order.quantity}, available {current_quantity}"
+            )
+            return ValidationResult(False, error_msg, "insufficient_position")
+            
+        return ValidationResult(True, "Position validation passed", None)
 
     def submit_order(self, order) -> Order:
         """Conform an order for an asset to broker constraints and submit it."""
@@ -1433,20 +1521,24 @@ class Broker(ABC):
             
         # Add to processed set to prevent duplicate notifications of the same order
         self._processed_new_orders.add(order_key)
-
-        # Use loguru for colored output to match BUY/SELL signal colors
-        from loguru import logger as log
-        emoji = "🟢" if order.is_buy_order() else "🔴"
         
         # Convert quantity to integer for display if it's a whole number
         display_quantity = int(order.quantity) if order.quantity == int(order.quantity) else order.quantity
         
-        if order.is_buy_order():
-            # Use bright green color like BUY signals
-            log.opt(colors=True).info(f"<fg #00ff00><bold>{emoji} New order was created: {order.order_type} order of | {display_quantity} {order.symbol} {order.side} | {order.status}</bold></fg #00ff00>")
+        # Enhanced logging for different order statuses
+        if order.status == "error":
+            # Error orders get special treatment with warning color
+            log.opt(colors=True).warning(f"<fg #ff8800><bold>⚠️ ERROR order was created: {order.order_type} order of | {display_quantity} {order.symbol} {order.side} | {order.status} | Error: {getattr(order, 'error', 'Unknown error')}</bold></fg #ff8800>")
         else:
-            # Use bright red for sell orders
-            log.opt(colors=True).info(f"<fg #ff0000><bold>{emoji} New order was created: {order.order_type} order of | {display_quantity} {order.symbol} {order.side} | {order.status}</bold></fg #ff0000>")
+            # Normal order processing
+            emoji = "🟢" if order.is_buy_order() else "🔴"
+            
+            if order.is_buy_order():
+                # Use bright green color like BUY signals
+                log.opt(colors=True).info(f"<fg #00ff00><bold>{emoji} New order was created: {order.order_type} order of | {display_quantity} {order.symbol} {order.side} | {order.status}</bold></fg #00ff00>")
+            else:
+                # Use bright red for sell orders
+                log.opt(colors=True).info(f"<fg #ff0000><bold>{emoji} New order was created: {order.order_type} order of | {display_quantity} {order.symbol} {order.side} | {order.status}</bold></fg #ff0000>")
 
         payload = dict(order=order)
         subscriber = self._get_subscriber(order.strategy)
@@ -1486,9 +1578,22 @@ class Broker(ABC):
             self.logger.error(f"Subscriber {order.strategy} not found", color="red")
 
     def _on_filled_order(self, position, order, price, quantity, multiplier):
-        """notify relevant subscriber/strategy about
-        filled order event"""
+        """
+        Notify relevant subscriber/strategy about filled order event and show position information
         
+        Parameters
+        ----------
+        position : Position
+            The position affected by this order
+        order : Order
+            The order that was filled
+        price : float
+            The fill price
+        quantity : float
+            The quantity that was filled
+        multiplier : float
+            The contract multiplier (for options/futures)
+        """
         # Create a unique key for this specific order fill
         order_key = f"{order.identifier}_{price}_{quantity}"
         
@@ -1501,18 +1606,24 @@ class Broker(ABC):
         self._processed_filled_orders.add(order_key)
 
         # Use loguru for colored output to match BUY/SELL signal colors
-        from loguru import logger as log
         emoji = "🟢" if order.is_buy_order() else "🔴"
         
         # Convert quantity to integer for display if it's a whole number
         display_quantity = int(quantity) if quantity == int(quantity) else quantity
         
+        # Get current position quantity for this asset after the fill
+        current_position = self.get_tracked_position(order.strategy, order.asset)
+        position_quantity = current_position.quantity if current_position else 0
+        
+        # Format position quantity for display
+        display_position = int(position_quantity) if position_quantity == int(position_quantity) else position_quantity
+        
         if order.is_buy_order():
             # Use bright green color like BUY signals
-            log.opt(colors=True).info(f"<fg #00ff00><bold>{emoji} Order was filled: {order.order_type} order of | {display_quantity} {order.symbol} {order.side} | @ ${price} fill</bold></fg #00ff00>")
+            log.opt(colors=True).info(f"<fg #00ff00><bold>{emoji} Order was filled: {order.order_type} order of | {display_quantity} {order.symbol} {order.side} | @ ${price} fill | Portfolio Positions: {display_position}</bold></fg #00ff00>")
         else:
             # Use bright red for sell orders
-            log.opt(colors=True).info(f"<fg #ff0000><bold>{emoji} Order was filled: {order.order_type} order of | {display_quantity} {order.symbol} {order.side} | @ ${price} fill</bold></fg #ff0000>")
+            log.opt(colors=True).info(f"<fg #ff0000><bold>{emoji} Order was filled: {order.order_type} order of | {display_quantity} {order.symbol} {order.side} | @ ${price} fill | Portfolio Positions: {display_position}</bold></fg #ff0000>")
 
         payload = dict(
             position=position,

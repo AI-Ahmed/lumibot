@@ -12,7 +12,6 @@ from .helpers import *
 from .indicators import (
     cagr,
     calculate_returns,
-    create_tearsheet,
     get_risk_free_rate,
     get_symbol_returns,
     max_drawdown,
@@ -25,6 +24,9 @@ from .indicators import (
     total_return,
     volatility,
 )
+
+# 🔥 ENHANCED HFT TEARSHEET WITH AUTO-DETECTION 🔥
+from .hft_indicators import create_tearsheet
 from .pandas import *
 from .types import *
 from .yahoo_helper import YahooHelper

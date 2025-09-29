@@ -30,6 +30,15 @@ class BacktestingBroker(Broker):
         # catch it here and ignore it in this class. Child classes that need it should error check it themselves.
         # self._config = config
 
+        # Track invalid orders and errors for statistics and reporting
+        self._invalid_orders = []
+        self._order_error_stats = {
+            "insufficient_position": 0,
+            "validation_error": 0,
+            "execution_error": 0,
+            "other_error": 0,
+        }
+
         if not isinstance(self.data_source, DataSourceBacktesting):
             raise ValueError("Must provide a backtesting data_source to run with a BacktestingBroker")
 
@@ -391,47 +400,61 @@ class BacktestingBroker(Broker):
 
         existing_position = self.get_tracked_position(order.strategy, order.asset)
 
-        # HFT safety check: Prevent negative positions for sell orders when no position exists
-        if order.is_sell_order() and (existing_position is None or existing_position.quantity < quantity):
-            # If this is an HFT strategy, log a warning and mark the order as error
+        # Professional Position Validation
+        # Use unified validation system with proper error event dispatching
+        validation_result = self.validate_order_position(order, order.strategy)
+        
+        if order.is_sell_order() and not validation_result.is_valid:
+            # Professional error handling with complete logging and event dispatching
             logger.warning(
-                f"HFT Safety: Preventing negative position for {order.asset.symbol}. "
-                f"Attempted to sell {quantity} but current position is "
-                f"{existing_position.quantity if existing_position else 0}. "
-                f"Order will be marked as error."
+                f"🔴 Order Validation Failed: {validation_result.message} "
+                f"(Error Code: {validation_result.error_code})"
             )
             
-            # Process as error order instead of just returning None
-            error_msg = "Insufficient position for sell order"
-            error_order = self._process_error_order(order, error_msg)
+            # Log detailed position information for debugging
+            all_positions = self.get_tracked_positions(order.strategy)
+            position_info = ", ".join([f"{p.asset.symbol}: {p.quantity}" for p in all_positions])
+            logger.debug(f"Current positions for strategy '{order.strategy}': {position_info}")
             
-            # Notify subscribers about the error
+            # Create proper error order with full event lifecycle
+            error_order = self._create_error_order(order, validation_result)
+            
+            # Dispatch NEW_ORDER event first (so it appears in logs)
+            self.stream.dispatch(
+                self.NEW_ORDER,
+                wait_until_complete=True,
+                order=error_order,
+            )
+            
+            # Then dispatch ERROR_ORDER event
             self.stream.dispatch(
                 self.ERROR_ORDER,
-                wait_until_complete=False,  # Changed to False to prevent blocking
+                wait_until_complete=True,
                 order=error_order,
-                error=error_msg,
+                error=validation_result.message,
             )
             
-            # Remove from filled orders to prevent double processing
-            self._filled_orders.remove(error_order.identifier, key="identifier")
-
-            # Return a dummy position to prevent backtesting from freezing
-            # but don't actually modify any positions
-            dummy_position = Position(order.strategy, order.asset, 0)
-            return dummy_position
+            # Track error statistics
+            self._track_invalid_order(order, validation_result.error_code, validation_result.message)
+            
+            # Return existing position unchanged
+            return existing_position
 
         # Currently perfect fill price in backtesting!
         order.avg_fill_price = price
 
+        # Call parent method to process the order and get position
         position = super()._process_filled_order(order, price, quantity)
+        
+        # If we have an existing position, no need to add it again to _filled_positions
         if existing_position:
-            position.add_order(order, quantity)  # Add will update quantity, but not double count the order
+            # Check if position is now liquidated (quantity = 0)
             if position.quantity == 0:
                 logger.info(f"Position {position} liquidated")
                 self._filled_positions.remove(position)
         else:
-            self._filled_positions.append(position)  # New position, add it to the tracker
+            # This is a new position, add it to our tracked positions
+            self._filled_positions.append(position)
 
         # If this is a child order, update the parent order status if all children are filled or cancelled.
         if order.parent_identifier:
@@ -446,36 +469,50 @@ class BacktestingBroker(Broker):
         """
         existing_position = self.get_tracked_position(order.strategy, order.asset)
         
-        # HFT safety check: Prevent negative positions for sell orders when no position exists
-        if order.is_sell_order() and (existing_position is None or existing_position.quantity < quantity):
-            # If this is an HFT strategy, log a warning and mark the order as error
-            logger.warning(
-                f"HFT Safety: Preventing negative position for {order.asset.symbol} in partial fill. "
-                f"Attempted to sell {quantity} but current position is "
-                f"{existing_position.quantity if existing_position else 0}. "
-                f"Order will be marked as error."
-            )
+        # Enhanced safety check for partial fills: Prevent negative positions for sell orders
+        current_position_qty = existing_position.quantity if existing_position else 0
+        
+        if order.is_sell_order():
+            # Double-check position availability for ALL strategies (not just HFT)  
+            # BUT: Only block orders that would create significant negative positions
+            tolerance = 0.001  # Small tolerance for floating point errors
             
-            # Process as error order instead of just returning None
-            error_msg = "Insufficient position for partial sell order"
-            error_order = self._process_error_order(order, error_msg)
-            
-            # Notify subscribers about the error
-            self.stream.dispatch(
-                self.ERROR_ORDER,
-                wait_until_complete=False,  # Changed to False to prevent blocking
-                order=error_order,
-                error=error_msg,
-            )
-            
-            # CRITICAL: Remove from filled and partially filled orders to prevent double processing
-            self._filled_orders.remove(error_order.identifier, key="identifier")
-            self._partially_filled_orders.remove(error_order.identifier, key="identifier")
-            
-            # Return dummy values to prevent backtesting from freezing
-            # but don't actually modify any positions
-            dummy_position = Position(order.strategy, order.asset, 0)
-            return error_order, dummy_position
+            if current_position_qty < (quantity - tolerance):
+                # Log detailed warning with position information
+                logger.warning(
+                    f"Safety check: Preventing oversold position for {order.asset.symbol} in partial fill. "
+                    f"Attempted to sell {quantity} but current position is {current_position_qty}. "
+                    f"Difference: {quantity - current_position_qty:.6f}"
+                )
+                
+                # Log all positions for debugging
+                all_positions = self.get_tracked_positions(order.strategy)
+                position_info = ", ".join([f"{p.asset.symbol}: {p.quantity}" for p in all_positions])
+                logger.debug(f"All positions for strategy '{order.strategy}': {position_info}")
+                
+                # For backtesting, if the difference is small, allow the order but adjust quantity
+                if abs(quantity - current_position_qty) <= 1.0:  # Allow up to 1 share difference
+                    logger.info(f"Adjusting partial sell quantity from {quantity} to {current_position_qty} for {order.asset.symbol}")
+                    quantity = current_position_qty  # Adjust to exact position size
+                else:
+                    # Only block orders with significant overselling
+                    error_msg = f"Insufficient position for partial sell order: attempted {quantity}, available {current_position_qty}"
+                    error_order = self._process_error_order(order, error_msg)
+                    
+                    # Notify subscribers about the error
+                    self.stream.dispatch(
+                        self.ERROR_ORDER,
+                        wait_until_complete=False,  # Non-blocking to prevent deadlocks
+                        order=error_order,
+                        error=error_msg,
+                    )
+                    
+                    # Track the invalid order in our statistics
+                    self._track_invalid_order(order, "insufficient_position", 
+                                             f"Insufficient position for partial sell order: attempted to sell {quantity} of {order.asset.symbol} but only have {current_position_qty}")
+                    
+                    # Return error order and existing position to maintain execution flow
+                    return error_order, existing_position
             
         stored_order, position = super()._process_partially_filled_order(order, price, quantity)
         if existing_position:
@@ -808,7 +845,7 @@ class BacktestingBroker(Broker):
                     
                     self.stream.dispatch(
                         self.FILLED_ORDER,
-                        wait_until_complete=True,
+                        wait_until_complete=False,  # Changed to False to prevent blocking
                         order=order,
                         price=parent_price,
                         filled_quantity=parent_qty,
@@ -1134,3 +1171,182 @@ class BacktestingBroker(Broker):
         response = self._pull_broker_position(asset)
         result = self._parse_broker_position(response, strategy)
         return result
+        
+    def _track_invalid_order(self, order, error_type, error_message):
+        """
+        Track an invalid order for statistics and reporting
+        
+        Parameters
+        ----------
+        order : Order
+            The order that failed validation
+        error_type : str
+            The type of error (e.g., "insufficient_position", "validation_error")
+        error_message : str
+            The error message
+            
+        Notes
+        -----
+        This method is used to track invalid orders for statistics and reporting.
+        It does not affect the actual order execution or position calculations.
+        """
+        # Increment the error counter for this type
+        if error_type in self._order_error_stats:
+            self._order_error_stats[error_type] += 1
+        else:
+            self._order_error_stats["other_error"] += 1
+            
+        # Store the invalid order with error details
+        invalid_order_info = {
+            "order": order,
+            "error_type": error_type,
+            "error_message": error_message,
+            "datetime": self.datetime,
+            "strategy": order.strategy,
+            "asset": order.asset.symbol,
+            "quantity": order.quantity,
+            "side": order.side,
+        }
+        
+        # Add to invalid orders list
+        self._invalid_orders.append(invalid_order_info)
+        
+        # Log the error
+        logger.warning(f"Invalid order tracked: {error_message}")
+        
+    def get_invalid_orders_stats(self):
+        """
+        Get statistics about invalid orders
+        
+        Returns
+        -------
+        dict
+            Dictionary with statistics about invalid orders
+        """
+        return {
+            "total_invalid_orders": len(self._invalid_orders),
+            "stats_by_type": self._order_error_stats,
+            "invalid_orders_by_asset": self._get_invalid_orders_by_asset(),
+        }
+        
+    def generate_invalid_orders_report(self):
+        """
+        Generate a detailed report about invalid orders
+        
+        Returns
+        -------
+        str
+            A formatted string with details about invalid orders
+        """
+        if not self._invalid_orders:
+            return "No invalid orders recorded during backtest."
+            
+        stats = self.get_invalid_orders_stats()
+        
+        report = []
+        report.append("=" * 80)
+        report.append("INVALID ORDERS REPORT")
+        report.append("=" * 80)
+        report.append(f"Total invalid orders: {stats['total_invalid_orders']}")
+        report.append("\nBreakdown by error type:")
+        
+        for error_type, count in stats['stats_by_type'].items():
+            if count > 0:
+                report.append(f"  - {error_type}: {count}")
+                
+        report.append("\nBreakdown by asset:")
+        for asset, orders in stats['invalid_orders_by_asset'].items():
+            report.append(f"\n  {asset}: {len(orders)} invalid orders")
+            # Show the first 5 invalid orders for this asset
+            for i, order_info in enumerate(orders[:5]):
+                report.append(f"    {i+1}. {order_info['error_message']} at {order_info['datetime']}")
+            if len(orders) > 5:
+                report.append(f"    ... and {len(orders) - 5} more")
+                
+        report.append("\nRecommendations:")
+        if stats['stats_by_type'].get('insufficient_position', 0) > 0:
+            report.append("  - Check your strategy's position tracking logic")
+            report.append("  - Ensure you're not selling more shares than you own")
+            report.append("  - Consider adding position validation before creating sell orders")
+            
+        report.append("=" * 80)
+        
+        return "\n".join(report)
+        
+    def _get_invalid_orders_by_asset(self):
+        """
+        Get invalid orders grouped by asset
+        
+        Returns
+        -------
+        dict
+            Dictionary with invalid orders grouped by asset
+        """
+        result = {}
+        for invalid_order in self._invalid_orders:
+            asset = invalid_order["asset"]
+            if asset not in result:
+                result[asset] = []
+            result[asset].append(invalid_order)
+        return result
+        
+    def display_backtest_results(self):
+        """
+        Display backtest results including invalid orders report
+        
+        This method should be called at the end of the backtest to display
+        statistics and reports about the backtest execution.
+        """
+        # Display invalid orders report if there are any
+        if hasattr(self, '_invalid_orders') and self._invalid_orders:
+            report = self.generate_invalid_orders_report()
+            logger.info(report)
+
+    def _create_error_order(self, original_order, validation_result):
+        """
+        Create a proper error order that maintains the full order lifecycle.
+        
+        This ensures error orders still trigger NEW_ORDER events for complete logging.
+        
+        Parameters
+        ----------
+        original_order : Order
+            The original order that failed validation
+        validation_result : ValidationResult
+            The validation result containing error details
+            
+        Returns
+        -------
+        Order
+            Error order with proper status and error information
+        """
+        from lumibot.entities import Order
+        
+        # Create a copy of the original order
+        error_order = Order(
+            strategy=original_order.strategy,
+            asset=original_order.asset,
+            quantity=original_order.quantity,
+            side=original_order.side,
+            order_type=original_order.order_type,
+            limit_price=original_order.limit_price,
+            stop_price=original_order.stop_price,
+            time_in_force=original_order.time_in_force,
+            good_till_date=original_order.good_till_date,
+            take_profit_price=original_order.take_profit_price,
+            stop_loss_price=original_order.stop_loss_price,
+            stop_loss_limit_price=original_order.stop_loss_limit_price,
+            trail_price=original_order.trail_price,
+            trail_percent=original_order.trail_percent,
+            position_filled=original_order.position_filled,
+            order_class=original_order.order_class,
+            child_orders=original_order.child_orders,
+            tag=original_order.tag,
+        )
+        
+        # Set error status and message
+        error_order.status = "error"
+        error_order.error = validation_result.message
+        error_order.identifier = original_order.identifier if original_order.identifier else str(uuid.uuid4())
+        
+        return error_order

@@ -560,16 +560,21 @@ class _Strategy:
             )
             return False
 
-        # Additional check for HFT strategies to prevent negative positions
-        if self._is_hft_strategy() and order.is_sell_order():
-            position = self.get_tracked_position(order.strategy, order.asset)
-            if position is None or position.quantity < order.quantity:
-                self.logger.warning(
-                    f"HFT Strategy: Rejecting sell order for {order.asset.symbol} - Insufficient position. "
-                    f"Attempted to sell {order.quantity} but current position is "
-                    f"{position.quantity if position else 0}."
+        # Delegate position validation to broker for unified validation
+        # This ensures single source of truth and proper error event dispatching
+        if order.is_sell_order():
+            # Use broker's position validation for consistency
+            # The broker will handle position checks and error events properly
+            validation_result = self.broker.validate_order_position(order, self.name)
+            if not validation_result.is_valid:
+                # Log the validation failure but let broker handle the error events
+                self.logger.info(
+                    f"Order validation deferred to broker: {validation_result.message} "
+                    f"Order will be processed by broker validation system."
                 )
-                return False
+                # Return True to allow broker to handle validation and error events
+                # This ensures proper error dispatching and logging
+                return True
 
         return True
 

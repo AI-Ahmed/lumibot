@@ -172,9 +172,34 @@ class Position:
             )
         return order
 
-    def add_order(self, order: entities.Order, quantity: Decimal = Decimal(0)):
+    def add_order(self, order: entities.Order, quantity: Decimal = None):
+        """
+        Add an order to this position and update the position quantity.
+        
+        Parameters
+        ----------
+        order : Order
+            The order to add to this position
+        quantity : Decimal, optional
+            The quantity to add/subtract from position. If None, uses order.quantity.
+            
+        Notes
+        -----
+        This method is critical for position tracking. It:
+        1. Updates position quantity based on order side (buy/sell)
+        2. Adds the order to position history if not already there
+        """
+        # If quantity is not provided, use the order's quantity
+        if quantity is None:
+            quantity = Decimal(order.quantity)
+            
+        # For buy orders, add the quantity; for sell orders, subtract it
         increment = quantity if order.side == "buy" else -quantity
+        
+        # Update position quantity
         self._quantity += Decimal(increment)
+        
+        # Add order to position history if not already there
         if order not in self.orders:
             self.orders.append(order)
 

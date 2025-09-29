@@ -3,9 +3,10 @@ This module test is not using pytest or unittest, but focus on
 testing the AlpacaBacktesting class and the TradesDataStrategy class as 
 actual Quant Dev would do.
 
-HFT Performance Tracking:
+HFT Performance Tracking & Enhanced Data Processing:
 
-This file demonstrates the use of enhanced HFT performance tracking in Lumibot.
+This file demonstrates the use of enhanced HFT performance tracking in Lumibot
+with the new processed bars functionality.
 
 The modifications include:
 
@@ -13,10 +14,22 @@ The modifications include:
 2. Intraday metrics calculation for HFT strategies
 3. Trade-level P&L tracking for detailed performance analysis
 4. Enhanced tearsheet with HFT-specific insights
+5. Processed bars storage with custom indicators using set_processed_bars()
+6. Additional columns preservation (custom indicators, momentum, etc.)
+7. Non-uniform timestep support with 'custom' timestep
+
+Key Features Demonstrated:
+- Volume bars creation from trades data (trades → volume bars instead of time bars)
+- Custom indicators (VWAP, price_momentum, volume_momentum, relative_strength)
+- Processed bars storage with set_processed_bars() method for strategy data
+- Additional columns preservation in processed bars
+- Benchmark uses standard pipeline (benchmark_asset="SPY" parameter)
 
 These modifications address the issue where HFT strategies showed 0% returns
 in performance metrics despite active trading, due to daily resampling that
-erased evidence of intraday trading activity.
+erased evidence of intraday trading activity. The new processed bars functionality
+allows strategies to use custom processed bars (volume bars, information-driven bars, etc.) 
+instead of standard time-based bars for better HFT performance.
 """
 
 from datetime import datetime, timedelta, time
@@ -68,11 +81,12 @@ class TradesDataStrategy(Strategy):
         
         # Store the last computed indicators
         self.last_vwap = None
-        self.custom_bars = []
         self.last_signal = None  # Track the last trading signal
         
-        self.logger.info(f"Initialized TradesDataStrategy with symbol {self.symbol}")
-    
+        # Initialize counters for debugging
+        self.sell_signals_count = 0
+        self.buy_signals_count = 0
+        
     def on_trading_iteration(self):
         """Main trading logic executed on each iteration."""
         # Get the current datetime
@@ -130,12 +144,9 @@ class TradesDataStrategy(Strategy):
             return
             
         try:
-            self.last_vwap = vwap.iloc[-1]
-            # self.logger.info(f"VWAP calculated successfully: {self.last_vwap}")
-            
-            # Store volume bars for later use
-            self.custom_bars.extend(volume_bar)
-            # self.logger.info(f"Created {len(volume_bar)} new volume bars")
+            self.last_vwap = vwap.iloc[-1]            
+
+            self.process_and_store_bars(volume_bar, self.symbol, current_dt)
             
             # Make trading decisions based on the indicators
             self.make_trading_decisions(volume_bar)
@@ -177,6 +188,125 @@ class TradesDataStrategy(Strategy):
         except Exception as e:
             self.logger.error(f"Error in volume bar creation: {e}")
             return None
+    
+    def process_and_store_bars(self, volume_bar, symbol, current_dt):
+        """
+        Process volume bars with additional indicators and store them immediately using set_processed_bars.
+        This is synchronized with the strategy's sleeptime interval.
+        
+        Parameters
+        ----------
+        volume_bar : pandas.DataFrame
+            The volume bars data
+        symbol : str or list
+            The symbol(s) being processed
+        current_dt : datetime
+            Current datetime
+        """
+        try:
+            # Handle multiple symbols
+            symbols = symbol if isinstance(symbol, list) else [symbol]
+            
+            for sym in symbols:
+                # Create enhanced bars with additional indicators
+                enhanced_bars = self.create_enhanced_bars(volume_bar, sym, current_dt)
+                
+                if enhanced_bars is not None and not enhanced_bars.empty:
+                    # Store immediately (sync with sleeptime interval)
+                    from lumibot.entities import Asset
+                    asset = Asset(sym, "stock")
+                    
+                    self.broker.data_source.set_processed_bars(
+                        processed_bars=enhanced_bars,
+                        base_asset=asset,
+                        timestep='custom',  # Use custom for HFT non-uniform intervals
+                    )
+                    
+                    self.logger.info(f"Stored {len(enhanced_bars)} processed bars for {sym} with custom indicators")
+                        
+        except Exception as e:
+            self.logger.error(f"Error processing and storing bars: {e}")
+    
+    def create_enhanced_bars(self, volume_bar, symbol, current_dt):
+        """
+        Create enhanced bars with additional custom indicators.
+        
+        Parameters
+        ----------
+        volume_bar : pandas.DataFrame
+            The volume bars data
+        symbol : str
+            The symbol being processed
+        current_dt : datetime
+            Current datetime
+            
+        Returns
+        -------
+        pandas.DataFrame
+            Enhanced bars with additional indicators
+        """
+        try:
+            if volume_bar is None or volume_bar.empty:
+                return None
+                
+            # Create a copy for enhancement
+            enhanced = volume_bar.copy()
+            
+            # Add timestamp if not present
+            if 'timestamp' not in enhanced.columns:
+                enhanced['timestamp'] = current_dt
+                
+            # Add VWAP if not present
+            if 'VWAP' not in enhanced.columns:
+                vwap = self.compute_vwap(enhanced)
+                if vwap is not None:
+                    enhanced['VWAP'] = vwap
+            
+            # Add custom HFT indicators
+            enhanced['symbol'] = symbol
+            enhanced['strategy_signal'] = self.last_signal if self.last_signal else 'none'
+            
+            # Add price momentum indicator
+            if 'close' in enhanced.columns and len(enhanced) > 1:
+                enhanced['price_momentum'] = enhanced['close'].pct_change().fillna(0)
+            else:
+                enhanced['price_momentum'] = 0.0
+                
+            # Add volume momentum indicator
+            if 'Volume' in enhanced.columns and len(enhanced) > 1:
+                enhanced['volume_momentum'] = enhanced['Volume'].pct_change().fillna(0)
+            else:
+                enhanced['volume_momentum'] = 0.0
+            
+            # Add relative strength indicator (simple version)
+            if 'close' in enhanced.columns and 'VWAP' in enhanced.columns:
+                enhanced['relative_strength'] = (enhanced['close'] - enhanced['VWAP']) / enhanced['VWAP']
+            else:
+                enhanced['relative_strength'] = 0.0
+                
+            # Ensure we have all required OHLCV columns
+            required_columns = ['open', 'high', 'low', 'close', 'volume']
+            for col in required_columns:
+                if col not in enhanced.columns:
+                    if col == 'volume' and 'Volume' in enhanced.columns:
+                        enhanced['volume'] = enhanced['Volume']
+                    elif col in ['open', 'high', 'low'] and 'close' in enhanced.columns:
+                        # For volume bars, OHLC might be the same as close
+                        enhanced[col] = enhanced['close']
+                    else:
+                        # Set default values if we can't derive them
+                        enhanced[col] = enhanced.get('close', 0.0) if col != 'volume' else 1.0
+            
+            # Set timestamp as index
+            if 'timestamp' in enhanced.columns:
+                enhanced.set_index('timestamp', inplace=True)
+                
+            return enhanced
+            
+        except Exception as e:
+            self.logger.error(f"Error creating enhanced bars for {symbol}: {e}")
+            return None
+    
     
     def get_historical_trades(self, asset, data_datetime_start=None, data_datetime_end=None):
         """
@@ -376,7 +506,7 @@ class TradesDataStrategy(Strategy):
         
         # For single symbol case, process the trading decision
         self._process_trading_decision(self.symbol, last_price)
-    
+
     def _process_trading_decision(self, symbol, last_price):
         """
         Process trading decision for a single symbol.
@@ -410,22 +540,34 @@ class TradesDataStrategy(Strategy):
             self.logger.warning(f"Unexpected negative position for {symbol}: {position_quantity}. Skipping trading decision.")
             return
         
-        # Calculate price deviation from VWAP as a percentage
-        vwap_deviation = (last_price - self.last_vwap) / self.last_vwap
-        
-        # Log current state
-        # self.logger.info(f"Trading decision: Price={last_price:.2f}, VWAP={self.last_vwap:.2f}, "
-        #                 f"Deviation={vwap_deviation:.4f}, Current position={position_quantity}")
-        
-        # Determine the signal based on price-VWAP relationship
+        # Safety check for VWAP and calculate deviation
         signal = None
+        vwap_deviation = None
         
-        # Buy signal: Price crosses above VWAP by threshold
-        if vwap_deviation > self.vwap_threshold:
-            signal = "buy"
-        # Sell signal: Price crosses below VWAP by threshold
-        elif vwap_deviation < -self.vwap_threshold:
-            signal = "sell"
+        if self.last_vwap is None or not isinstance(self.last_vwap, (int, float)) or self.last_vwap <= 0:
+            self.logger.warning(f"DEBUG: Invalid VWAP value: {self.last_vwap}. Cannot calculate deviation.")
+            # Force a sell signal if we have a position and VWAP is invalid
+            if position_quantity > 0:
+                signal = "sell"
+                self.sell_signals_count += 1
+                self.logger.info(f"DEBUG: Forced SELL signal #{self.sell_signals_count} for {symbol} due to invalid VWAP")
+        else:
+            # Calculate price deviation from VWAP as a percentage
+            vwap_deviation = (last_price - self.last_vwap) / self.last_vwap
+            
+            # Log current state for debugging
+            self.logger.info(f"Trading decision: Price={last_price:.2f}, VWAP={self.last_vwap:.2f}, "
+                            f"Deviation={vwap_deviation:.4f} ({vwap_deviation*100:.2f}%), Current position={position_quantity}")
+            
+            # Determine the signal based on price-VWAP relationship
+            # Buy signal: Price crosses above VWAP by threshold
+            if vwap_deviation > self.vwap_threshold:
+                signal = "buy"
+                self.buy_signals_count += 1
+            # Sell signal: Price crosses below VWAP by threshold
+            elif vwap_deviation < -self.vwap_threshold:
+                signal = "sell"
+                self.sell_signals_count += 1
         
         # Only trade if we have a new signal or need to exit a position
         if signal == "buy" and (position_quantity <= 0 or self.last_signal != signal):
@@ -449,9 +591,11 @@ class TradesDataStrategy(Strategy):
                 self.last_signal = "buy"
         
         elif signal == "sell":
+            self.logger.info(f"🔴 SELL SIGNAL detected for {symbol}: Price=${last_price:.2f}, VWAP=${self.last_vwap:.2f}, Position={position_quantity}")
+            
             # Close any existing long position first
             if position_quantity > 0:
-                self.logger.info(f"Closing existing long position of {position_quantity} shares for {symbol}")
+                self.logger.info(f"🔴 Closing existing long position of {position_quantity} shares for {symbol}")
                 order = self.create_order(symbol, position_quantity, "sell")
                 self.submit_order(order)
                 self.last_signal = "sell"
@@ -461,7 +605,7 @@ class TradesDataStrategy(Strategy):
                 position_value = portfolio_value * self.position_size
                 sell_quantity = max(1, int(position_value / last_price))
                 
-                self.logger.info(f"SELL SIGNAL: Selling {sell_quantity} shares of {symbol} at ${last_price:.2f} (VWAP: ${self.last_vwap:.2f})")
+                self.logger.info(f"🔴 SELL SIGNAL: Selling {sell_quantity} shares of {symbol} at ${last_price:.2f} (VWAP: ${self.last_vwap:.2f})")
                 
                 # Create and submit sell order
                 order = self.create_order(symbol, sell_quantity, "sell")
@@ -469,9 +613,13 @@ class TradesDataStrategy(Strategy):
                 self.last_signal = "sell"
             # Only log the sell signal if we don't have a position to close and shorts aren't allowed
             elif position_quantity == 0 and not self.allow_short and self.last_signal != signal:
-                self.logger.info(f"SELL SIGNAL received but no position to close for {symbol} at ${last_price:.2f} (VWAP: ${self.last_vwap:.2f})")
+                self.logger.info(f"🔴 SELL SIGNAL received but no position to close for {symbol} at ${last_price:.2f} (VWAP: ${self.last_vwap:.2f})")
                 self.last_signal = "sell"
-        
+        else:
+            # Log when no signal is generated for debugging
+            if vwap_deviation is not None:
+                self.logger.debug(f"No signal for {symbol}: deviation {vwap_deviation:.4f} within threshold ±{self.vwap_threshold:.4f}")
+
 
 
 if __name__ == "__main__":
@@ -481,10 +629,10 @@ if __name__ == "__main__":
     eastern = pytz.timezone('US/Eastern')
     
     # Wednesday to Friday in one year
-    # backtesting_start = eastern.localize(datetime(2024, 5, 1))  # Monday
-    # backtesting_end = eastern.localize(datetime(2024, 8, 9))    # Wednesday
-    backtesting_start = eastern.localize(datetime(2023, 5, 1))  # Monday
-    backtesting_end = eastern.localize(datetime(2024, 5, 1))    # Wednesday
+    backtesting_start = eastern.localize(datetime(2024, 5, 1))  # Monday
+    backtesting_end = eastern.localize(datetime(2024, 8, 9))    # Wednesday
+    # backtesting_start = eastern.localize(datetime(2023, 5, 1))  # Monday
+    # backtesting_end = eastern.localize(datetime(2024, 5, 1))    # Wednesday
 
     TradesDataStrategy.run_backtest(
         datasource_class=AlpacaBacktesting,
@@ -493,11 +641,11 @@ if __name__ == "__main__":
         parameters={
             "symbol": ["AAPL", "MSFT", "GOOGL", "TSLA"],
             # "symbol": ["AAPL"],
-            "volume_bar_threshold": 10_000,
+            "volume_bar_threshold": 100_000,
             "vwap_window": 100,
             "allow_short": False,  # Set to False to prevent short positions
-            "position_size": 0.01,
-            "vwap_threshold": 0.001
+            "position_size": 0.1,
+            "vwap_threshold": 0.001,  # Increased from 0.0001 to 0.001 (0.1%) for more realistic signals
         },
         benchmark_asset="SPY",
         risk_free_rate=0.025,

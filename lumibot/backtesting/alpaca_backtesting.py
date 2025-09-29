@@ -608,8 +608,8 @@ class AlpacaBacktesting(DataSourceBacktesting):
         if timestep is None:
             timestep = self._timestep
 
-        if timestep not in ['day', 'minute', 'fractional']:
-            raise ValueError(f"Invalid timestep {timestep}. Must be 'day', 'minute', or 'fractional' (for trades data).")
+        if timestep not in ['day', 'minute', 'fractional', 'custom']:
+            raise ValueError(f"Invalid timestep {timestep}. Must be 'day', 'minute', 'fractional' (for trades data), or 'custom' (for processed bars).")
 
         base_quote = f"{base_asset.symbol}-{base_asset.asset_type}_{quote_asset.symbol}-{quote_asset.asset_type}"
         market = market
@@ -969,17 +969,46 @@ class AlpacaBacktesting(DataSourceBacktesting):
             
         # Sometime there are duplicated records due to the nature of the HFT data
         # We need to drop them
-        df = df[~df.timestamp.duplicated(keep='last')]
+        if not df.empty:
+            df = df[~df.timestamp.duplicated(keep='last')]
+            
+            # Ensure we have the minimum required columns for trades data
+            required_columns = ['timestamp', 'price', 'size']
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            if missing_columns:
+                logger.error(f"Missing required columns in trades data: {missing_columns}")
+                # Create a minimal DataFrame with required columns
+                df = pd.DataFrame(columns=required_columns)
+                df['timestamp'] = pd.to_datetime([])
+                df['price'] = pd.Series([], dtype=float)
+                df['size'] = pd.Series([], dtype=float)
+            
+            # Validate data types and remove invalid rows
+            if not df.empty:
+                # Remove rows with invalid prices or sizes
+                original_count = len(df)
+                df = df.dropna(subset=['price', 'size'])
+                df = df[df['price'] > 0]
+                df = df[df['size'] > 0]
+                if len(df) < original_count:
+                    logger.warning(f"Removed {original_count - len(df)} invalid trade records with zero/negative prices or sizes")
         
-        # Save to cache (parquet is faster than csv for large datasets)
-        df.to_parquet(filepath, index=False)
+        # Save to cache (parquet is faster than csv for large datasets) only if we have data
+        if not df.empty:
+            df.to_parquet(filepath, index=False)
+            
+            # Store in _data_store
+            df.set_index('timestamp', inplace=True)
+            self._data_store[key] = df
+            logger.info(f"Finished fetching and caching data for {key} - {len(df)} trades")
+        else:
+            # Store empty DataFrame to avoid repeated attempts
+            empty_df = pd.DataFrame(columns=['price', 'size'])
+            empty_df.index = pd.DatetimeIndex([], name='timestamp')
+            self._data_store[key] = empty_df
+            logger.warning(f"No valid trades data available for {key}")
         
-        # Store in _data_store
-        df.set_index('timestamp', inplace=True)
-        self._data_store[key] = df
-        logger.info(f"Finished fetching and caching data for {key}")
-        
-        return df
+        return self._data_store[key]
 
     def _load_ohlcv_into_data_store(self, key: str) -> bool:
         """Load OHLCV data from cache into the data store.
@@ -1064,14 +1093,98 @@ class AlpacaBacktesting(DataSourceBacktesting):
 
         try:
             df = pd.read_parquet(filepath)
+            
+            # Validate the loaded data
+            if df.empty:
+                logger.warning(f"Cached trades data is empty for key: {key}")
+                # Store empty DataFrame with proper structure
+                empty_df = pd.DataFrame(columns=['price', 'size'])
+                empty_df.index = pd.DatetimeIndex([], name='timestamp')
+                self._data_store[key] = empty_df
+                return True
+                
+            # Ensure timestamp exists
+            if 'timestamp' not in df.columns and df.index.name != 'timestamp':
+                logger.error(f"Cached trades data missing timestamp for key: {key}")
+                return False
+                
+            # Check for required columns or their alternatives
+            required_columns = ['price', 'size']
+            column_mapping = {
+                'price': ['price', 'Price', 'p', 'close', 'Close'],
+                'size': ['size', 'Size', 's', 'volume', 'Volume']
+            }
+            
+            # Try to map columns if the required ones don't exist
+            for req_col in required_columns:
+                if req_col not in df.columns:
+                    # Try to find an alternative column
+                    alt_cols = column_mapping.get(req_col, [])
+                    found = False
+                    for alt_col in alt_cols:
+                        if alt_col in df.columns:
+                            # Map the alternative column to the required name
+                            df[req_col] = df[alt_col]
+                            found = True
+                            logger.info(f"Mapped column {alt_col} to {req_col} for key: {key}")
+                            break
+                    
+                    # If no alternative found, create a default column
+                    if not found:
+                        if req_col == 'price' and any(col in df.columns for col in ['open', 'high', 'low', 'close']):
+                            # Use close if available, otherwise first available price column
+                            for price_col in ['close', 'open', 'high', 'low']:
+                                if price_col in df.columns:
+                                    df[req_col] = df[price_col]
+                                    logger.info(f"Created {req_col} from {price_col} for key: {key}")
+                                    found = True
+                                    break
+                        elif req_col == 'size' and any(col in df.columns for col in ['volume', 'qty', 'quantity']):
+                            # Use volume if available, otherwise first available quantity column
+                            for vol_col in ['volume', 'qty', 'quantity']:
+                                if vol_col in df.columns:
+                                    df[req_col] = df[vol_col]
+                                    logger.info(f"Created {req_col} from {vol_col} for key: {key}")
+                                    found = True
+                                    break
+                        
+                        # If still not found, create a default column with placeholder values
+                        if not found:
+                            df[req_col] = 1.0 if req_col == 'size' else df.index.to_series().diff().dt.total_seconds()
+                            logger.warning(f"Created default {req_col} column for key: {key}")
+            
+            # Verify required columns now exist
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            if missing_columns:
+                logger.error(f"Failed to create required columns {missing_columns} for key: {key}")
+                return False
+            
+            # Ensure timestamp is properly formatted
+            if 'timestamp' in df.columns:
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                df.set_index('timestamp', inplace=True)
+            elif df.index.name == 'timestamp':
+                df.index = pd.to_datetime(df.index)
+            else:
+                logger.error(f"Cannot find timestamp column or index for key: {key}")
+                return False
+                
+            # Validate data integrity
+            original_count = len(df)
+            df = df.dropna(subset=['price', 'size'])
+            df = df[df['price'] > 0]
+            df = df[df['size'] > 0]
+            
+            if len(df) < original_count:
+                logger.warning(f"Removed {original_count - len(df)} invalid cached trade records for key: {key}")
+            
+            self._data_store[key] = df
+            logger.info(f"Loaded cached trades data for key: {key} from cache - {len(df)} trades.")
+            return True
+            
         except Exception as e:
-            logger.error(f"Failed to load cached data for key: {key}. Error: {e}")
+            logger.error(f"Failed to load cached trades data for key: {key}. Error: {e}")
             return False
-
-        df.set_index('timestamp', inplace=True)
-        self._data_store[key] = df
-        logger.info(f"Loaded cached data for key: {key} from cache.")
-        return True
 
     def get_historical_prices_between_dates(
             self,
@@ -1328,6 +1441,199 @@ class AlpacaBacktesting(DataSourceBacktesting):
             return pd.DataFrame()
             
         return trades_df
+
+    def set_processed_bars(
+        self,
+        processed_bars: pd.DataFrame,
+        *,
+        base_asset: Asset,
+        quote_asset: Asset = None,
+        timestep: str = None,
+        market: str = None,
+        tzinfo: pytz.tzinfo = None,
+        data_datetime_start: datetime = None,
+        data_datetime_end: datetime = None,
+        auto_adjust: bool = None,
+    ) -> None:
+        """Store processed bars (e.g., from Information-driven bars) for use with other AlpacaBacktesting methods.
+        
+        Parameters
+        ----------
+        processed_bars : pandas.DataFrame
+            DataFrame containing the processed OHLCV bars with required columns: timestamp, open, high, low, close, volume.
+            Optional columns: vwap (Volume-Weighted Average Price).
+            Additional columns (custom indicators, features, etc.) are preserved and stored.
+            The DataFrame should have a timestamp index or timestamp column.
+        base_asset : Asset
+            Base asset of the trading pair.
+        quote_asset : Asset, optional
+            Quote asset of the trading pair. If None, uses default quote asset.
+        timestep : str, optional
+            Time interval for data. Either 'day' or 'minute'.
+            If None, uses the default timestep.
+        market : str, optional
+            Market or exchange identifier.
+            If None, uses the default market.
+        tzinfo : pytz.tzinfo, optional
+            Timezone information for the data.
+            If None, uses the default timezone.
+        data_datetime_start : datetime, optional
+            Start date of the data for backtesting.
+            If None, uses the default start date.
+        data_datetime_end : datetime, optional
+            End date of the data for backtesting (inclusive).
+            If None, uses the default end date.
+        auto_adjust : bool, optional
+            Whether auto-adjustment is applied to the data.
+            If None, uses the default auto_adjust setting.
+            
+        Raises
+        ------
+        ValueError
+            If processed_bars is empty, missing required columns, or has invalid data.
+            
+        Notes
+        -----
+        This method allows strategies to store custom processed bars (e.g., Information-driven bars)
+        that can then be accessed by other AlpacaBacktesting methods like `get_last_price`,
+        `get_last_prices`, `get_historical_prices`, etc.
+        
+        The processed bars will be stored in the internal data store using the same key format
+        as regular OHLCV data, making them seamlessly accessible to all other methods.
+        
+        Example
+        -------
+        >>> # In your strategy after processing trades data
+        >>> processed_bars = process_trades(trades_df, ...)  # Your custom processing
+        >>> self.broker.data_source.set_processed_bars(
+        ...     processed_bars=processed_bars,
+        ...     base_asset=self.symbol,
+        ...     timestep='minute'
+        ... )
+        """
+        # Validate input parameters
+        if processed_bars is None or processed_bars.empty:
+            raise ValueError("processed_bars cannot be None or empty")
+            
+        # Set default values
+        if quote_asset is None:
+            quote_asset = self.LUMIBOT_DEFAULT_QUOTE_ASSET
+        if timestep is None:
+            # For HFT strategies with non-uniform intervals, use 'custom' timestep
+            timestep = 'custom' if hasattr(self, '_is_hft_strategy') else self._timestep
+        if market is None:
+            market = self.market
+        if tzinfo is None:
+            tzinfo = self.tzinfo
+        if data_datetime_start is None:
+            data_datetime_start = self._data_datetime_start
+        if data_datetime_end is None:
+            data_datetime_end = self._data_datetime_end
+        if auto_adjust is None:
+            auto_adjust = self._auto_adjust
+            
+        # Sanitize assets
+        asset, quote = self._sanitize_base_and_quote_asset(base_asset, quote_asset)
+        
+        # Validate required columns - VWAP is optional for HFT strategies that might not calculate it
+        required_columns = {'open', 'high', 'low', 'close', 'volume'}
+        optional_columns = {'vwap'}  # VWAP is optional but commonly used in HFT
+        df_columns = set(processed_bars.columns)
+        
+        # Check if timestamp is in columns or index
+        has_timestamp = 'timestamp' in df_columns or processed_bars.index.name == 'timestamp'
+        if not has_timestamp:
+            raise ValueError("processed_bars must have a 'timestamp' column or timestamp index")
+            
+        # Check for required OHLCV columns
+        missing_columns = required_columns - df_columns
+        if missing_columns:
+            raise ValueError(f"processed_bars is missing required columns: {missing_columns}")
+            
+        # Log information about additional columns (beyond required ones)
+        additional_columns = df_columns - required_columns - optional_columns - {'timestamp'}
+        if additional_columns:
+            logger.info(f"Processed bars for {base_asset.symbol} contain additional columns: {additional_columns}")
+            
+        # Create a copy to avoid modifying the original
+        df = processed_bars.copy()
+        
+        # Keep all columns - don't filter out additional ones as they might be useful for strategies
+        # This allows HFT strategies to store custom indicators, features, etc.
+        
+        # Ensure timestamp is the index
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            if df.index.name != 'timestamp':
+                df.set_index('timestamp', inplace=True)
+        elif df.index.name == 'timestamp':
+            df.index = pd.to_datetime(df.index)
+        else:
+            raise ValueError("Cannot find valid timestamp column or index")
+            
+        # Ensure timezone consistency
+        if df.index.tz is None:
+            df.index = df.index.tz_localize(tzinfo)
+        else:
+            df.index = df.index.tz_convert(tzinfo)
+            
+        # Validate data types and remove invalid rows
+        original_count = len(df)
+        
+        # Remove rows with NaN OHLC values
+        df = df.dropna(subset=['open', 'high', 'low', 'close'])
+        
+        # Remove rows with invalid OHLC values (negative or zero prices)
+        df = df[(df['open'] > 0) & (df['high'] > 0) & (df['low'] > 0) & (df['close'] > 0)]
+        
+        # Ensure high >= low and high >= open, close and low <= open, close
+        df = df[(df['high'] >= df['low']) & 
+                (df['high'] >= df['open']) & 
+                (df['high'] >= df['close']) & 
+                (df['low'] <= df['open']) & 
+                (df['low'] <= df['close'])]
+        
+        # Fill missing volume with 0
+        df['volume'] = df['volume'].fillna(0.0)
+        
+        if len(df) < original_count:
+            logger.warning(f"Removed {original_count - len(df)} invalid bars from processed_bars for {asset.symbol}")
+            
+        if df.empty:
+            raise ValueError("All processed_bars were invalid and removed during validation")
+            
+        # Sort by timestamp to ensure proper order
+        df = df.sort_index()
+        
+        # Generate the key for storing the data
+        key = self._get_asset_key(
+            base_asset=asset,
+            quote_asset=quote,
+            timestep=timestep,
+            market=market,
+            tzinfo=tzinfo,
+            data_datetime_start=data_datetime_start,
+            data_datetime_end=data_datetime_end,
+            auto_adjust=auto_adjust,
+        )
+        
+        # Store the processed bars in the data store
+        self._data_store[key] = df
+        logger.info(f"Stored {len(df)} processed bars for {asset.symbol} with key: {key}")
+        
+        # Also save to cache for persistence
+        try:
+            cache_dir = os.path.join(LUMIBOT_CACHE_FOLDER, self.CACHE_SUBFOLDER)
+            os.makedirs(cache_dir, exist_ok=True)
+            filename = f"{key}.csv"
+            filepath = os.path.join(cache_dir, filename)
+            
+            # Reset index to save timestamp as column
+            df_to_save = df.reset_index()
+            df_to_save.to_csv(filepath, index=False)
+            logger.info(f"Cached processed bars to: {filepath}")
+        except Exception as e:
+            logger.warning(f"Failed to cache processed bars: {e}")
 
     def _reindex_and_fill(
             self,
