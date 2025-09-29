@@ -400,45 +400,10 @@ class BacktestingBroker(Broker):
 
         existing_position = self.get_tracked_position(order.strategy, order.asset)
 
-        # Professional Position Validation
-        # Use unified validation system with proper error event dispatching
-        validation_result = self.validate_order_position(order, order.strategy)
-        
-        if order.is_sell_order() and not validation_result.is_valid:
-            # Professional error handling with complete logging and event dispatching
-            logger.warning(
-                f"🔴 Order Validation Failed: {validation_result.message} "
-                f"(Error Code: {validation_result.error_code})"
-            )
-            
-            # Log detailed position information for debugging
-            all_positions = self.get_tracked_positions(order.strategy)
-            position_info = ", ".join([f"{p.asset.symbol}: {p.quantity}" for p in all_positions])
-            logger.debug(f"Current positions for strategy '{order.strategy}': {position_info}")
-            
-            # Create proper error order with full event lifecycle
-            error_order = self._create_error_order(order, validation_result)
-            
-            # Dispatch NEW_ORDER event first (so it appears in logs)
-            self.stream.dispatch(
-                self.NEW_ORDER,
-                wait_until_complete=True,
-                order=error_order,
-            )
-            
-            # Then dispatch ERROR_ORDER event
-            self.stream.dispatch(
-                self.ERROR_ORDER,
-                wait_until_complete=True,
-                order=error_order,
-                error=validation_result.message,
-            )
-            
-            # Track error statistics
-            self._track_invalid_order(order, validation_result.error_code, validation_result.message)
-            
-            # Return existing position unchanged
-            return existing_position
+        # NOTE: Position validation is now handled earlier in _submit_order() to prevent
+        # "frozen insufficient selling orders" from appearing as NEW_ORDER events.
+        # Invalid sell orders are caught at submission and converted to ERROR_ORDER events immediately.
+        # This ensures cleaner logging and prevents confusion about order status.
 
         # Currently perfect fill price in backtesting!
         order.avg_fill_price = price
@@ -559,6 +524,39 @@ class BacktestingBroker(Broker):
         if order.is_sell_order():
             order.side = Order.OrderSide.SELL
 
+        # Early validation for sell orders to prevent "frozen insufficient selling orders"
+        # This catches insufficient position errors BEFORE dispatching NEW_ORDER event
+        if order.is_sell_order():
+            validation_result = self.validate_order_position(order, order.strategy)
+            if not validation_result.is_valid:
+                # Professional error handling with complete logging and event dispatching
+                logger.warning(
+                    f"🔴 Order Validation Failed at Submission: {validation_result.message} "
+                    f"(Error Code: {validation_result.error_code})"
+                )
+                
+                # Log detailed position information for debugging
+                all_positions = self.get_tracked_positions(order.strategy)
+                position_info = ", ".join([f"{p.asset.symbol}: {p.quantity}" for p in all_positions])
+                logger.debug(f"Current positions for strategy '{order.strategy}': {position_info}")
+                
+                # Create proper error order with full event lifecycle
+                error_order = self._create_error_order(order, validation_result)
+                
+                # Dispatch ERROR_ORDER event directly (no NEW_ORDER for invalid orders)
+                self.stream.dispatch(
+                    self.ERROR_ORDER,
+                    wait_until_complete=True,
+                    order=error_order,
+                    error=validation_result.message,
+                )
+                
+                # Track error statistics
+                self._track_invalid_order(order, validation_result.error_code, validation_result.message)
+                
+                # Return the error order instead of processing further
+                return error_order
+
         # Submit regular and Bracket/OTO orders now.
         # OCO orders have no parent orders, so do not submit this "main" order. The children of an OCO will be
         # submitted below. Bracket/OTO orders will be submitted here, but their child orders will not be submitted
@@ -585,6 +583,31 @@ class BacktestingBroker(Broker):
                     child.side = Order.OrderSide.BUY
                 elif child.is_sell_order():
                     child.side = Order.OrderSide.SELL
+
+                # Early validation for sell child orders as well
+                if child.is_sell_order():
+                    validation_result = self.validate_order_position(child, child.strategy)
+                    if not validation_result.is_valid:
+                        # Professional error handling for child orders
+                        logger.warning(
+                            f"🔴 Child Order Validation Failed at Submission: {validation_result.message} "
+                            f"(Error Code: {validation_result.error_code})"
+                        )
+                        
+                        # Create proper error order for child
+                        error_child = self._create_error_order(child, validation_result)
+                        
+                        # Dispatch ERROR_ORDER event directly for invalid child
+                        self.stream.dispatch(
+                            self.ERROR_ORDER,
+                            wait_until_complete=True,
+                            order=error_child,
+                            error=validation_result.message,
+                        )
+                        
+                        # Track error statistics
+                        self._track_invalid_order(child, validation_result.error_code, validation_result.message)
+                        continue  # Skip this invalid child order
 
                 child.parent_identifier = order.identifier
                 child.update_raw(child)
