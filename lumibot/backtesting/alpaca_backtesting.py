@@ -928,9 +928,14 @@ class AlpacaBacktesting(DataSourceBacktesting):
                     df = df[['timestamp', 'symbol', 'id', 'price', 'size', 'exchange', 'tape', 'conditions']]
                     df = data_prep(df)
 
-                    # Ensure 'timestamp' is a pandas timestamp object
-                    if 'Datetime' in df.columns:
-                        df = df.rename(columns={'Datetime': 'timestamp'})
+                    # Normalize column names back to lowercase after data_prep
+                    # data_prep may rename: Datetime->timestamp, Price->price, Volume->size
+                    column_mapping = {
+                        'Datetime': 'timestamp',
+                        'Price': 'price',
+                        'Volume': 'size'
+                    }
+                    df = df.rename(columns=column_mapping)
                 except Exception as e:
                     logger.warning(f"Error in data_prep: {e}. Falling back to default processing.")
                     # Fallback to default processing
@@ -1365,11 +1370,13 @@ class AlpacaBacktesting(DataSourceBacktesting):
         if tzinfo is None:
             tzinfo = self.tzinfo
 
-        if data_datetime_start is None:
-            data_datetime_start = self._data_datetime_start
+        # Store the requested datetime range for filtering
+        requested_start = data_datetime_start if data_datetime_start is not None else self._data_datetime_start
+        requested_end = data_datetime_end if data_datetime_end is not None else self._data_datetime_end
 
-        if data_datetime_end is None:
-            data_datetime_end = self._data_datetime_end
+        # Use backtest-wide dates for caching (one cache per symbol for entire backtest period)
+        cache_start = self._data_datetime_start
+        cache_end = self._data_datetime_end
 
         # Handle list of assets
         if isinstance(base_asset, list):
@@ -1383,8 +1390,8 @@ class AlpacaBacktesting(DataSourceBacktesting):
                     quote_asset=quote,
                     market=market,
                     tzinfo=tzinfo,
-                    data_datetime_start=data_datetime_start,
-                    data_datetime_end=data_datetime_end
+                    data_datetime_start=requested_start,
+                    data_datetime_end=requested_end
                 )
                 
                 if not asset_trades_df.empty:
@@ -1401,15 +1408,15 @@ class AlpacaBacktesting(DataSourceBacktesting):
         if asset.asset_type != 'stock':
             raise ValueError("Trades data is currently only supported for stock assets.")
 
-        # Get trades data key
+        # Get trades data key using backtest-wide dates for consistent caching
         trades_key = self._get_asset_key(
             base_asset=asset, 
             quote_asset=quote, 
             timestep="fractional",  # Special timestep indicator for trades data
             market=market,
             tzinfo=tzinfo,
-            data_datetime_start=data_datetime_start,
-            data_datetime_end=data_datetime_end
+            data_datetime_start=cache_start,  # Use backtest-wide dates
+            data_datetime_end=cache_end        # Use backtest-wide dates
         )
 
         # Check if we need to refresh or fetch trades data
@@ -1419,8 +1426,8 @@ class AlpacaBacktesting(DataSourceBacktesting):
                 quote_asset=quote,
                 market=market,
                 tzinfo=tzinfo,
-                data_datetime_start=data_datetime_start,
-                data_datetime_end=data_datetime_end
+                data_datetime_start=cache_start,
+                data_datetime_end=cache_end
             )
             self._refreshed_keys[trades_key] = True
         elif trades_key not in self._data_store and not self._load_trades_into_data_store(trades_key):
@@ -1429,18 +1436,31 @@ class AlpacaBacktesting(DataSourceBacktesting):
                 quote_asset=quote,
                 market=market,
                 tzinfo=tzinfo,
-                data_datetime_start=data_datetime_start,
-                data_datetime_end=data_datetime_end
+                data_datetime_start=cache_start,
+                data_datetime_end=cache_end
             )
         
-        # Get the trades DataFrame
+        # Get the trades DataFrame (contains ALL trades for the backtest period)
         trades_df = self._data_store.get(trades_key)
         
         if trades_df is None or trades_df.empty:
-            logger.warning(f"No trades data available for {asset.symbol} between {data_datetime_start} and {data_datetime_end}")
+            logger.warning(f"No trades data available for {asset.symbol} between {requested_start} and {requested_end}")
             return pd.DataFrame()
+        
+        # Filter the DataFrame to the requested datetime range
+        try:
+            # Use loc for timezone-aware datetime slicing on the index
+            filtered_df = trades_df.loc[requested_start:requested_end]
             
-        return trades_df
+            if filtered_df.empty:
+                logger.debug(f"No trades data in requested range [{requested_start} to {requested_end}] for {asset.symbol}")
+                return pd.DataFrame()
+                
+            return filtered_df
+            
+        except Exception as e:
+            logger.error(f"Error filtering trades data for {asset.symbol}: {e}")
+            return pd.DataFrame()
 
     def set_processed_bars(
         self,
