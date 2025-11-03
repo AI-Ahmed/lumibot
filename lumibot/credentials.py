@@ -649,3 +649,16 @@ else:
 # Export variables for use in strategies
 BROKER = broker
 DATA_SOURCE = data_source
+
+# Alpaca Backtesting Configuration
+## Constants for magic numbers and configuration
+DEFAULT_END_SHIFT_DAYS = 3
+DEFAULT_END_SHIFT_MINUTES = 5
+MIN_TRADING_DAYS_FOR_SHIFT = 3
+HFT_END_TIME_BUFFER_MINUTES = 5
+DEFAULT_CACHE_MAX_MEMORY_MB = 1000
+DEFAULT_API_RETRY_ATTEMPTS = 3
+DEFAULT_API_RETRY_MIN_WAIT = 4
+DEFAULT_API_RETRY_MAX_WAIT = 10
+DATA_QUALITY_DROP_THRESHOLD = 0.05  # 5% threshold for data quality warnings
+CACHE_VERSION = "v1"  # For cache invalidation when format changes

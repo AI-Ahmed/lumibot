@@ -1,14 +1,22 @@
 import os
+import hashlib
+import signal
+import atexit
+import threading
+import bisect
+import numpy as np
 from typing import Optional
+from collections import OrderedDict
+from contextlib import contextmanager
 
 import pytz
 from datetime import datetime, timedelta
-from decimal import Decimal, ROUND_HALF_EVEN
+from decimal import Decimal
 
 import pandas as pd
 from alpaca.data.historical import CryptoHistoricalDataClient, StockHistoricalDataClient
 from alpaca.data.requests import CryptoBarsRequest, StockBarsRequest, StockTradesRequest
-from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from alpaca.data.timeframe import TimeFrame
 
 from lumibot.tools.lumibot_logger import get_logger
 from lumibot.data_sources import DataSourceBacktesting, AlpacaData
@@ -26,6 +34,16 @@ from lumibot.tools.helpers import (
 )
 
 try:
+    from tenacity import retry, stop_after_attempt, wait_exponential
+except ImportError:
+    # Fallback if tenacity is not installed
+    def retry(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    stop_after_attempt = wait_exponential = retry_if_exception_type = None
+
+try:
     from fpap.data.utils.data_processing import data_prep
 except ImportError:
     data_prep = None
@@ -33,7 +51,204 @@ except ImportError:
 logger = get_logger(__name__)
 
 from lumibot.tools.alpaca_helpers import sanitize_base_and_quote_asset
-from lumibot.credentials import ALPACA_CONFIG
+from lumibot.credentials import (
+    ALPACA_CONFIG,
+    DEFAULT_END_SHIFT_DAYS,
+    DEFAULT_END_SHIFT_MINUTES,
+    MIN_TRADING_DAYS_FOR_SHIFT,
+    HFT_END_TIME_BUFFER_MINUTES,
+    DEFAULT_CACHE_MAX_MEMORY_MB,
+    DEFAULT_API_RETRY_ATTEMPTS,
+    DEFAULT_API_RETRY_MIN_WAIT,
+    DEFAULT_API_RETRY_MAX_WAIT,
+    DATA_QUALITY_DROP_THRESHOLD,
+    CACHE_VERSION,
+)
+
+
+class BoundedDataCache:
+    """LRU cache with memory limit to prevent unbounded growth.
+    
+    Parameters
+    ----------
+    max_memory_mb : int, default 1000
+        Maximum memory to use in megabytes.
+    
+    Notes
+    -----
+    This cache implements an LRU (Least Recently Used) eviction policy
+    with memory-based limits to prevent memory exhaustion during long
+    backtests with many assets.
+    """
+    
+    def __init__(self, max_memory_mb: int = DEFAULT_CACHE_MAX_MEMORY_MB):
+        self._cache = OrderedDict()
+        self._max_bytes = max_memory_mb * 1024 * 1024
+        self._current_bytes = 0
+        self._lock = threading.Lock()
+        
+    def get(self, key: str) -> Optional[pd.DataFrame]:
+        """Get item from cache (thread-safe).
+        
+        Parameters
+        ----------
+        key : str
+            Cache key.
+            
+        Returns
+        -------
+        pd.DataFrame or None
+            Cached DataFrame or None if not found.
+        """
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)  # Mark as recently used
+                return self._cache[key]
+            return None
+    
+    def set(self, key: str, df: pd.DataFrame) -> None:
+        """Store item in cache with LRU eviction (thread-safe).
+        
+        Parameters
+        ----------
+        key : str
+            Cache key.
+        df : pd.DataFrame
+            DataFrame to cache.
+            
+        Notes
+        -----
+        Automatically evicts least recently used items if memory limit is exceeded.
+        """
+        with self._lock:
+            df_bytes = df.memory_usage(deep=True).sum()
+            
+            # Evict LRU items until we have space
+            while self._current_bytes + df_bytes > self._max_bytes and self._cache:
+                evict_key, evict_df = self._cache.popitem(last=False)
+                evict_bytes = evict_df.memory_usage(deep=True).sum()
+                self._current_bytes -= evict_bytes
+                logger.info(f"Evicted {evict_key} from cache ({evict_bytes / 1024 / 1024:.2f} MB)")
+            
+            # Remove old value if key exists
+            if key in self._cache:
+                old_bytes = self._cache[key].memory_usage(deep=True).sum()
+                self._current_bytes -= old_bytes
+                
+            self._cache[key] = df
+            self._current_bytes += df_bytes
+            
+    def contains(self, key: str) -> bool:
+        """Check if key exists in cache (thread-safe).
+        
+        Parameters
+        ----------
+        key : str
+            Cache key to check.
+            
+        Returns
+        -------
+        bool
+            True if key exists, False otherwise.
+        """
+        with self._lock:
+            return key in self._cache
+            
+    def clear(self) -> None:
+        """Clear all cached data (thread-safe)."""
+        with self._lock:
+            self._cache.clear()
+            self._current_bytes = 0
+            logger.info("Cache cleared")
+            
+    def get_memory_usage_mb(self) -> float:
+        """Get current memory usage in MB.
+        
+        Returns
+        -------
+        float
+            Current memory usage in megabytes.
+        """
+        with self._lock:
+            return self._current_bytes / 1024 / 1024
+
+
+class DataQualityTracker:
+    """Track data quality metrics during backtesting.
+    
+    Notes
+    -----
+    Collects metrics on data integrity issues like invalid trades,
+    missing data, and dropped records to alert users of potential issues.
+    """
+    
+    def __init__(self):
+        self._metrics = {
+            'total_records': 0,
+            'dropped_records': 0,
+            'invalid_prices': 0,
+            'invalid_sizes': 0,
+            'duplicate_records': 0,
+        }
+        self._lock = threading.Lock()
+        
+    def record_data_load(self, total: int, dropped: int, reason: str = "unknown"):
+        """Record data loading metrics.
+        
+        Parameters
+        ----------
+        total : int
+            Total records loaded.
+        dropped : int
+            Number of records dropped.
+        reason : str, default "unknown"
+            Reason for dropping records.
+        """
+        with self._lock:
+            self._metrics['total_records'] += total
+            self._metrics['dropped_records'] += dropped
+            
+            # Log warning if drop rate exceeds threshold
+            if total > 0:
+                drop_rate = dropped / total
+                if drop_rate > DATA_QUALITY_DROP_THRESHOLD:
+                    logger.warning(
+                        f"Data quality issue: {drop_rate:.1%} of records dropped ({dropped}/{total}) "
+                        f"due to {reason}. This may impact backtest accuracy."
+                    )
+    
+    def record_invalid_data(self, invalid_prices: int = 0, invalid_sizes: int = 0, duplicates: int = 0):
+        """Record invalid data occurrences.
+        
+        Parameters
+        ----------
+        invalid_prices : int, default 0
+            Number of invalid price records.
+        invalid_sizes : int, default 0
+            Number of invalid size records.
+        duplicates : int, default 0
+            Number of duplicate records.
+        """
+        with self._lock:
+            self._metrics['invalid_prices'] += invalid_prices
+            self._metrics['invalid_sizes'] += invalid_sizes
+            self._metrics['duplicate_records'] += duplicates
+            
+    def get_report(self) -> dict:
+        """Get data quality report.
+        
+        Returns
+        -------
+        dict
+            Dictionary containing all collected metrics.
+        """
+        with self._lock:
+            report = self._metrics.copy()
+            if report['total_records'] > 0:
+                report['drop_rate'] = report['dropped_records'] / report['total_records']
+            else:
+                report['drop_rate'] = 0.0
+            return report
 
 
 class AlpacaBacktesting(DataSourceBacktesting):
@@ -135,10 +350,24 @@ class AlpacaBacktesting(DataSourceBacktesting):
 
         self._auto_adjust: bool = kwargs.get('auto_adjust', True)
         self.CACHE_SUBFOLDER = 'alpaca'
-        self._data_store: dict[str, pd.DataFrame] = {}
+        
+        # Use bounded cache with configurable memory limit
+        cache_max_memory_mb = kwargs.get('cache_max_memory_mb', DEFAULT_CACHE_MAX_MEMORY_MB)
+        self._data_store = BoundedDataCache(max_memory_mb=cache_max_memory_mb)
+        
+        # Thread-safe refreshed keys tracking
         self._refreshed_keys = {}
+        self._refreshed_keys_lock = threading.Lock()
+        
         self._refresh_cache: bool = kwargs.get('refresh_cache', False)
         self._remove_incomplete_current_bar = kwargs.get('remove_incomplete_current_bar', False)
+        
+        # Data quality tracking
+        self._data_quality_tracker = DataQualityTracker()
+        
+        # Graceful interruption support
+        self._interrupted = False
+        self._setup_signal_handlers()
 
         if config is None:
             config = ALPACA_CONFIG
@@ -236,7 +465,7 @@ class AlpacaBacktesting(DataSourceBacktesting):
         # For HFT backtests or very short periods, we need to be more careful about end_shift
         trading_days_count = len(self._trading_days)
         
-        if trading_days_count < 3:
+        if trading_days_count < MIN_TRADING_DAYS_FOR_SHIFT:
             # For very short periods (HFT), just set end time slightly before the actual end time
             # to ensure there's enough data for final calculations
             logger.info(
@@ -248,13 +477,13 @@ class AlpacaBacktesting(DataSourceBacktesting):
             if self._timestep == 'minute':
                 # If we have at least one trading day
                 if trading_days_count > 0:
-                    # Get the last market close and set end time 5 minutes before that
+                    # Get the last market close and set end time before that
                     last_market_close = self._trading_days.iloc[-1]['market_close']
-                    self.datetime_end = last_market_close - timedelta(minutes=5)
+                    self.datetime_end = last_market_close - timedelta(minutes=HFT_END_TIME_BUFFER_MINUTES)
                 else:
                     # Very rare case - no trading days found
                     # Just use a time shortly before the requested end date
-                    self.datetime_end = datetime_end - timedelta(minutes=5)
+                    self.datetime_end = datetime_end - timedelta(minutes=HFT_END_TIME_BUFFER_MINUTES)
             else:
                 # For day timestep, use the first trading day if we have only one or two
                 if trading_days_count > 0:
@@ -265,10 +494,10 @@ class AlpacaBacktesting(DataSourceBacktesting):
         else:
             # Original logic for normal backtesting periods
             if self._timestep == 'day':
-                end_shift = -3
+                end_shift = -DEFAULT_END_SHIFT_DAYS
             else:
                 # For minute timestep (HFT), use a smaller end_shift to preserve more of the requested date range
-                end_shift = -5
+                end_shift = -DEFAULT_END_SHIFT_MINUTES
 
             # Ensure end_shift is still within bounds (defensive programming)
             end_shift = max(-trading_days_count, end_shift)
@@ -280,10 +509,189 @@ class AlpacaBacktesting(DataSourceBacktesting):
         
         self.datetime_start = start_dt
         self._datetime = self.datetime_start
+        
+        # Register cleanup on exit
+        atexit.register(self._cleanup)
+
+    def _setup_signal_handlers(self) -> None:
+        """Setup signal handlers for graceful interruption.
+        
+        Notes
+        -----
+        Handles SIGINT (Ctrl+C) and SIGTERM to allow graceful shutdown
+        and cleanup of resources.
+        """
+        def signal_handler(signum, frame):
+            logger.warning(f"Received signal {signum}, initiating graceful shutdown...")
+            self._interrupted = True
+            self._cleanup()
+            
+        try:
+            signal.signal(signal.SIGINT, signal_handler)
+            signal.signal(signal.SIGTERM, signal_handler)
+        except (ValueError, OSError) as e:
+            # Some environments don't support signal handling
+            logger.debug(f"Could not set up signal handlers: {e}")
+            
+    def _cleanup(self) -> None:
+        """Clean up resources on exit.
+        
+        Notes
+        -----
+        Called automatically on exit or when interrupted. Clears cache
+        and logs final data quality metrics.
+        """
+        try:
+            # Log data quality report
+            if hasattr(self, '_data_quality_tracker'):
+                report = self._data_quality_tracker.get_report()
+                if report['total_records'] > 0:
+                    logger.info(f"Data Quality Report: {report}")
+                    
+            # Log cache statistics
+            if hasattr(self, '_data_store'):
+                memory_mb = self._data_store.get_memory_usage_mb()
+                logger.info(f"Final cache memory usage: {memory_mb:.2f} MB")
+                
+        except Exception as e:
+            logger.debug(f"Error during cleanup: {e}")
+            
+    def _check_interrupted(self) -> None:
+        """Check if operation was interrupted.
+        
+        Raises
+        ------
+        KeyboardInterrupt
+            If the operation was interrupted by user or signal.
+        """
+        if self._interrupted:
+            raise KeyboardInterrupt("Operation interrupted by user")
 
     def _sanitize_base_and_quote_asset(self, base_asset, quote_asset) -> tuple[Asset, Asset]:
+        """Sanitize base and quote assets.
+        
+        Parameters
+        ----------
+        base_asset : Asset
+            Base asset to sanitize.
+        quote_asset : Asset
+            Quote asset to sanitize.
+            
+        Returns
+        -------
+        tuple[Asset, Asset]
+            Sanitized base and quote assets.
+        """
         asset, quote = sanitize_base_and_quote_asset(base_asset, quote_asset)
         return asset, quote
+        
+    @contextmanager
+    def _safe_file_operation(self, filepath: str, mode: str = 'r'):
+        """Context manager for safe file operations.
+        
+        Parameters
+        ----------
+        filepath : str
+            Path to file.
+        mode : str, default 'r'
+            File open mode.
+            
+        Yields
+        ------
+        file
+            Open file handle.
+            
+        Notes
+        -----
+        Ensures files are properly closed even if exceptions occur.
+        """
+        f = None
+        try:
+            f = open(filepath, mode)
+            yield f
+        finally:
+            if f is not None:
+                f.close()
+                
+    def _compute_checksum(self, filepath: str) -> str:
+        """Compute MD5 checksum of a file.
+        
+        Parameters
+        ----------
+        filepath : str
+            Path to file.
+            
+        Returns
+        -------
+        str
+            MD5 checksum as hexadecimal string.
+        """
+        hash_md5 = hashlib.md5()
+        with self._safe_file_operation(filepath, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+        
+    def _save_checksum(self, filepath: str) -> None:
+        """Save checksum for a cached file.
+        
+        Parameters
+        ----------
+        filepath : str
+            Path to cached file.
+            
+        Notes
+        -----
+        Saves checksum in a .md5 file alongside the data file.
+        """
+        try:
+            checksum = self._compute_checksum(filepath)
+            checksum_file = filepath + '.md5'
+            with self._safe_file_operation(checksum_file, 'w') as f:
+                f.write(checksum)
+        except Exception as e:
+            logger.warning(f"Failed to save checksum for {filepath}: {e}")
+            
+    def _validate_checksum(self, filepath: str) -> bool:
+        """Validate checksum of a cached file.
+        
+        Parameters
+        ----------
+        filepath : str
+            Path to cached file.
+            
+        Returns
+        -------
+        bool
+            True if checksum is valid or doesn't exist, False if corrupted.
+            
+        Notes
+        -----
+        Returns True if no checksum file exists (for backwards compatibility).
+        """
+        checksum_file = filepath + '.md5'
+        
+        if not os.path.exists(checksum_file):
+            # No checksum file, assume valid (backwards compatibility)
+            return True
+            
+        try:
+            # Read expected checksum
+            with self._safe_file_operation(checksum_file, 'r') as f:
+                expected = f.read().strip()
+                
+            # Compute actual checksum
+            actual = self._compute_checksum(filepath)
+            
+            if actual != expected:
+                logger.error(f"Checksum mismatch for {filepath}. Cache may be corrupted.")
+                return False
+                
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Error validating checksum for {filepath}: {e}")
+            return True  # Fail open for backwards compatibility
 
     def get_last_price(
             self,
@@ -486,22 +894,32 @@ class AlpacaBacktesting(DataSourceBacktesting):
                 f"Not enough historical data. Requested {length} bars but only {len(df)} available."
             )
 
-        # Adjust the search based on timestep
+        # Adjust the search based on timestep using O(log n) binary search
         if timestep == 'day':
-            # For daily bars
+            # For daily bars - convert index to dates for comparison
+            # Use numpy for faster date extraction (cached on first call)
+            if not hasattr(df.index, '_cached_dates'):
+                df.index._cached_dates = df.index.date
+            dates = df.index._cached_dates
             search_date = search_datetime.date()
-            dates = df.index.date
-            current_index = dates.searchsorted(search_date)
+            
+            # Use bisect for O(log n) search
+            current_index = bisect.bisect_right(dates, search_date) - 1
 
             # Adjust for incomplete current bar
-            if remove_incomplete_current_bar and current_index > 0 and dates[current_index] == search_date:
+            if remove_incomplete_current_bar and current_index >= 0 and dates[current_index] == search_date:
                 current_index -= 1
         else:
-            # For minute bars
-            current_index = df.index.searchsorted(search_datetime)
+            # For minute bars - use bisect on timestamp index
+            # Convert to comparable format for binary search
+            timestamps = df.index.values
+            search_ts = search_datetime.value if hasattr(search_datetime, 'value') else pd.Timestamp(search_datetime).value
+            
+            # Use numpy searchsorted for O(log n) search
+            current_index = np.searchsorted(timestamps, search_ts, side='right') - 1
 
             # Adjust for incomplete current bar
-            if remove_incomplete_current_bar and current_index > 0 and df.index[current_index] == search_datetime:
+            if remove_incomplete_current_bar and current_index >= 0:
                 current_index -= 1
 
         # Handle data retrieval and slicing
@@ -552,7 +970,7 @@ class AlpacaBacktesting(DataSourceBacktesting):
             data_datetime_end: datetime = None,
             auto_adjust: bool = None,
     ) -> str:
-        """Generate a unique key for asset data identification.
+        """Generate a unique key for asset data identification using SHA256 hash.
         
         Parameters
         ----------
@@ -576,12 +994,18 @@ class AlpacaBacktesting(DataSourceBacktesting):
         Returns
         -------
         str
-            A unique string key for identifying and caching the asset data.
+            A unique SHA256-based string key for identifying and caching the asset data.
+            Format: {CACHE_VERSION}_{symbol}_{hash[:16]}
             
         Raises
         ------
         ValueError
             If base_asset is None or if timestep is invalid.
+            
+        Notes
+        -----
+        Uses SHA256 hashing to create short, collision-resistant cache keys.
+        The cache version prefix allows for cache invalidation when format changes.
         """
 
         if base_asset is None:
@@ -611,19 +1035,24 @@ class AlpacaBacktesting(DataSourceBacktesting):
         if timestep not in ['day', 'minute', 'fractional', 'custom']:
             raise ValueError(f"Invalid timestep {timestep}. Must be 'day', 'minute', 'fractional' (for trades data), or 'custom' (for processed bars).")
 
+        # Build key components for hashing
         base_quote = f"{base_asset.symbol}-{base_asset.asset_type}_{quote_asset.symbol}-{quote_asset.asset_type}"
-        market = market
         tzinfo_str = str(tzinfo).replace("_", "-")
-        start_date_str = data_datetime_start.strftime("%Y-%m-%d")
-        end_date_str = data_datetime_end.strftime("%Y-%m-%d")
-        auto_adjust_str = "AA" if auto_adjust else ""
+        start_date_str = data_datetime_start.strftime("%Y-%m-%d-%H-%M-%S")
+        end_date_str = data_datetime_end.strftime("%Y-%m-%d-%H-%M-%S")
+        auto_adjust_str = "AA" if auto_adjust else "NA"
 
-        key_parts = [
-            base_quote, market, timestep, tzinfo_str,
-            auto_adjust_str, start_date_str, end_date_str
-        ]
-        key = "_".join(part for part in key_parts if part).upper()
-        key = key.replace("/", "-")
+        # Create a deterministic string to hash
+        key_components = f"{base_quote}|{market}|{timestep}|{tzinfo_str}|{auto_adjust_str}|{start_date_str}|{end_date_str}"
+        
+        # Generate SHA256 hash (take first 16 chars for readability)
+        hash_obj = hashlib.sha256(key_components.encode('utf-8'))
+        hash_str = hash_obj.hexdigest()[:16]
+        
+        # Create readable key with version, symbol, and hash
+        symbol_safe = base_asset.symbol.replace("/", "-").replace("\\", "-")
+        key = f"{CACHE_VERSION}_{symbol_safe}_{timestep}_{hash_str}"
+        
         return key
 
     def _parse_source_timestep(self, timestep, reverse=False):
@@ -670,6 +1099,59 @@ class AlpacaBacktesting(DataSourceBacktesting):
 
         # If we get here, the timestep is not supported
         raise ValueError(f"Unsupported timestep: {timestep}")
+        
+    def _api_call_with_retry(self, api_func, *args, **kwargs):
+        """Execute API call with retry logic.
+        
+        Parameters
+        ----------
+        api_func : callable
+            API function to call.
+        *args : tuple
+            Positional arguments for the API function.
+        **kwargs : dict
+            Keyword arguments for the API function.
+            
+        Returns
+        -------
+        Any
+            Result from the API call.
+            
+        Raises
+        ------
+        Exception
+            If all retry attempts fail.
+            
+        Notes
+        -----
+        Implements exponential backoff with jitter for API rate limiting.
+        If tenacity is not installed, calls the function directly without retries.
+        """
+        if stop_after_attempt is not None:
+            # tenacity is available, use retry logic
+            @retry(
+                stop=stop_after_attempt(DEFAULT_API_RETRY_ATTEMPTS),
+                wait=wait_exponential(
+                    multiplier=1,
+                    min=DEFAULT_API_RETRY_MIN_WAIT,
+                    max=DEFAULT_API_RETRY_MAX_WAIT
+                ),
+                reraise=True
+            )
+            def _execute_with_retry():
+                self._check_interrupted()  # Check for interruption before API call
+                try:
+                    return api_func(*args, **kwargs)
+                except Exception as e:
+                    # Log the error for debugging
+                    logger.warning(f"API call failed (will retry): {str(e)[:100]}")
+                    raise
+            
+            return _execute_with_retry()
+        else:
+            # tenacity not available, call directly
+            self._check_interrupted()
+            return api_func(*args, **kwargs)
 
     def _download_and_cache_ohlcv_data(
             self,
@@ -786,16 +1268,28 @@ class AlpacaBacktesting(DataSourceBacktesting):
             )
 
         try:
+            # Use retry logic for API calls
             if isinstance(request_params, CryptoBarsRequest):
-                bars = client.get_crypto_bars(request_params)
+                bars = self._api_call_with_retry(client.get_crypto_bars, request_params)
             else:
-                bars = client.get_stock_bars(request_params)
+                bars = self._api_call_with_retry(client.get_stock_bars, request_params)
         except Exception as e:
-            raise RuntimeError(f"Failed to fetch data for {key}: {e}")
+            error_msg = (
+                f"Failed to fetch OHLCV data for {base_asset.symbol} "
+                f"[{data_datetime_start} to {data_datetime_end}]. "
+                f"Error: {e}. "
+                f"Suggestion: Check API credentials, network connection, and Alpaca service status."
+            )
+            raise RuntimeError(error_msg) from e
 
         df = bars.df.reset_index()
         if df.empty:
-            raise RuntimeError(f"No data fetched for {key}.")
+            error_msg = (
+                f"No OHLCV data returned for {base_asset.symbol} "
+                f"[{data_datetime_start} to {data_datetime_end}]. "
+                f"Suggestion: Verify the asset exists and has data for this date range on Alpaca."
+            )
+            raise RuntimeError(error_msg)
 
         # Ensure 'timestamp' is a pandas timestamp object
         df['timestamp'] = pd.to_datetime(df['timestamp'])
@@ -816,15 +1310,25 @@ class AlpacaBacktesting(DataSourceBacktesting):
         df = self._reindex_and_fill(df=df, trading_times=trading_times, timestep=timestep)
 
         # Filter data to include only rows between data_datetime_start and data_datetime_end
+        original_len = len(df)
         df = df[(df['timestamp'] >= data_datetime_start) & (df['timestamp'] <= data_datetime_end)]
+        filtered_len = len(df)
+        
+        # Track data quality metrics
+        if original_len > 0:
+            dropped = original_len - filtered_len
+            self._data_quality_tracker.record_data_load(original_len, dropped, "date range filtering")
 
-        # Save to cache
+        # Save to cache with checksum
         df.to_csv(filepath, index=False)
+        self._save_checksum(filepath)
 
-        # Store in _data_store
+        # Store in _data_store (bounded cache)
         df.set_index('timestamp', inplace=True)
-        self._data_store[key] = df
-        logger.info(f"Finished fetching and caching data for {key}")
+        self._data_store.set(key, df)
+        
+        memory_mb = self._data_store.get_memory_usage_mb()
+        logger.info(f"Finished fetching and caching data for {key}. Cache memory: {memory_mb:.2f} MB")
         return df
 
     def _download_and_cache_trades_data(self,
@@ -911,9 +1415,15 @@ class AlpacaBacktesting(DataSourceBacktesting):
         )
 
         try:
-            trades = client.get_stock_trades(request_params)
+            trades = self._api_call_with_retry(client.get_stock_trades, request_params)
         except Exception as e:
-            raise RuntimeError(f"Failed to fetch data for {key}: {e}")
+            error_msg = (
+                f"Failed to fetch trades data for {base_asset.symbol} "
+                f"[{data_datetime_start} to {data_datetime_end}]. "
+                f"Error: {e}. "
+                f"Suggestion: Check API credentials, verify asset supports trade data, and check Alpaca service status."
+            )
+            raise RuntimeError(error_msg) from e
 
         df = trades.df.reset_index()
 
@@ -975,7 +1485,13 @@ class AlpacaBacktesting(DataSourceBacktesting):
         # Sometime there are duplicated records due to the nature of the HFT data
         # We need to drop them
         if not df.empty:
+            original_count = len(df)
             df = df[~df.timestamp.duplicated(keep='last')]
+            duplicates = original_count - len(df)
+            
+            if duplicates > 0:
+                self._data_quality_tracker.record_invalid_data(duplicates=duplicates)
+                logger.debug(f"Removed {duplicates} duplicate trade records")
             
             # Ensure we have the minimum required columns for trades data
             required_columns = ['timestamp', 'price', 'size']
@@ -992,28 +1508,50 @@ class AlpacaBacktesting(DataSourceBacktesting):
             if not df.empty:
                 # Remove rows with invalid prices or sizes
                 original_count = len(df)
-                df = df.dropna(subset=['price', 'size'])
-                df = df[df['price'] > 0]
-                df = df[df['size'] > 0]
-                if len(df) < original_count:
-                    logger.warning(f"Removed {original_count - len(df)} invalid trade records with zero/negative prices or sizes")
+                df_clean = df.dropna(subset=['price', 'size'])
+                invalid_na = original_count - len(df_clean)
+                
+                df_valid_price = df_clean[df_clean['price'] > 0]
+                invalid_price = len(df_clean) - len(df_valid_price)
+                
+                df_valid = df_valid_price[df_valid_price['size'] > 0]
+                invalid_size = len(df_valid_price) - len(df_valid)
+                
+                df = df_valid
+                
+                total_invalid = invalid_na + invalid_price + invalid_size
+                if total_invalid > 0:
+                    self._data_quality_tracker.record_invalid_data(
+                        invalid_prices=invalid_price,
+                        invalid_sizes=invalid_size
+                    )
+                    self._data_quality_tracker.record_data_load(
+                        original_count, total_invalid, "invalid prices/sizes"
+                    )
+                    logger.warning(
+                        f"Removed {total_invalid} invalid trade records "
+                        f"({invalid_price} invalid prices, {invalid_size} invalid sizes, {invalid_na} NaN)"
+                    )
         
         # Save to cache (parquet is faster than csv for large datasets) only if we have data
         if not df.empty:
             df.to_parquet(filepath, index=False)
+            self._save_checksum(filepath)
             
-            # Store in _data_store
+            # Store in _data_store (bounded cache)
             df.set_index('timestamp', inplace=True)
-            self._data_store[key] = df
-            logger.info(f"Finished fetching and caching data for {key} - {len(df)} trades")
+            self._data_store.set(key, df)
+            
+            memory_mb = self._data_store.get_memory_usage_mb()
+            logger.info(f"Finished fetching and caching data for {key} - {len(df)} trades. Cache memory: {memory_mb:.2f} MB")
         else:
             # Store empty DataFrame to avoid repeated attempts
             empty_df = pd.DataFrame(columns=['price', 'size'])
             empty_df.index = pd.DatetimeIndex([], name='timestamp')
-            self._data_store[key] = empty_df
+            self._data_store.set(key, empty_df)
             logger.warning(f"No valid trades data available for {key}")
         
-        return self._data_store[key]
+        return self._data_store.get(key)
 
     def _load_ohlcv_into_data_store(self, key: str) -> bool:
         """Load OHLCV data from cache into the data store.
@@ -1045,6 +1583,11 @@ class AlpacaBacktesting(DataSourceBacktesting):
         # Check if the file exists
         if not os.path.exists(filepath):
             return False
+            
+        # Validate checksum
+        if not self._validate_checksum(filepath):
+            logger.warning(f"Checksum validation failed for {key}. Will re-download.")
+            return False
 
         try:
             # Read CSV file with 'timestamp' column parsed as dates
@@ -1059,7 +1602,7 @@ class AlpacaBacktesting(DataSourceBacktesting):
             df['timestamp'] = df['timestamp'].dt.tz_convert(self.tzinfo)
 
             df.set_index('timestamp', inplace=True)
-            self._data_store[key] = df
+            self._data_store.set(key, df)
             logger.info(f"Loaded cached data for key: {key} from cache.")
             return True
         except Exception as e:
@@ -1095,6 +1638,11 @@ class AlpacaBacktesting(DataSourceBacktesting):
         # Check if the file exists
         if not os.path.exists(filepath):
             return False
+            
+        # Validate checksum
+        if not self._validate_checksum(filepath):
+            logger.warning(f"Checksum validation failed for trades {key}. Will re-download.")
+            return False
 
         try:
             df = pd.read_parquet(filepath)
@@ -1105,7 +1653,7 @@ class AlpacaBacktesting(DataSourceBacktesting):
                 # Store empty DataFrame with proper structure
                 empty_df = pd.DataFrame(columns=['price', 'size'])
                 empty_df.index = pd.DatetimeIndex([], name='timestamp')
-                self._data_store[key] = empty_df
+                self._data_store.set(key, empty_df)
                 return True
                 
             # Ensure timestamp exists
@@ -1181,9 +1729,11 @@ class AlpacaBacktesting(DataSourceBacktesting):
             df = df[df['size'] > 0]
             
             if len(df) < original_count:
-                logger.warning(f"Removed {original_count - len(df)} invalid cached trade records for key: {key}")
+                dropped = original_count - len(df)
+                self._data_quality_tracker.record_data_load(original_count, dropped, "cached data validation")
+                logger.warning(f"Removed {dropped} invalid cached trade records for key: {key}")
             
-            self._data_store[key] = df
+            self._data_store.set(key, df)
             logger.info(f"Loaded cached trades data for key: {key} from cache - {len(df)} trades.")
             return True
             
@@ -1278,8 +1828,14 @@ class AlpacaBacktesting(DataSourceBacktesting):
         # Get OHLCV data key
         ohlcv_key = self._get_asset_key(base_asset=asset, quote_asset=quote, timestep=timestep)
 
-        if self._refresh_cache and ohlcv_key not in self._refreshed_keys:
-            # If we need are refreshing cache and we didn't refresh this key's cache yet, refresh it.
+        # Thread-safe check and update of refreshed keys
+        with self._refreshed_keys_lock:
+            need_refresh = self._refresh_cache and ohlcv_key not in self._refreshed_keys
+            if need_refresh:
+                self._refreshed_keys[ohlcv_key] = True
+        
+        if need_refresh:
+            # Refresh cache for this key
             self._download_and_cache_ohlcv_data(
                 base_asset=asset,
                 quote_asset=quote,
@@ -1290,8 +1846,7 @@ class AlpacaBacktesting(DataSourceBacktesting):
                 data_datetime_end=data_datetime_end,
                 auto_adjust=auto_adjust
             )
-            self._refreshed_keys[ohlcv_key] = True
-        elif ohlcv_key not in self._data_store and not self._load_ohlcv_into_data_store(ohlcv_key):
+        elif not self._data_store.contains(ohlcv_key) and not self._load_ohlcv_into_data_store(ohlcv_key):
             # If not refreshing or already refreshed, try to load from cache or download
             self._download_and_cache_ohlcv_data(
                 base_asset=asset,
@@ -1304,8 +1859,14 @@ class AlpacaBacktesting(DataSourceBacktesting):
                 auto_adjust=auto_adjust
             )
 
-        # Get the OHLCV DataFrame
-        ohlcv_df = self._data_store[ohlcv_key]
+        # Get the OHLCV DataFrame from cache
+        ohlcv_df = self._data_store.get(ohlcv_key)
+        if ohlcv_df is None:
+            error_msg = (
+                f"Failed to retrieve OHLCV data for {asset.symbol} from cache. "
+                f"This is unexpected after download. Please report this issue."
+            )
+            raise RuntimeError(error_msg)
         return ohlcv_df
         
     def get_historical_trades_between_dates(
@@ -1378,12 +1939,17 @@ class AlpacaBacktesting(DataSourceBacktesting):
         cache_start = self._data_datetime_start
         cache_end = self._data_datetime_end
 
-        # Handle list of assets
+        # Handle list of assets (optimized with list accumulation)
         if isinstance(base_asset, list):
             all_trades_dfs = []
             assets = [self._sanitize_base_and_quote_asset(asset, quote_asset) for asset in base_asset]
 
+            # Pre-allocate list for better performance
+            all_trades_dfs = []
+            
             for asset, quote in assets:
+                self._check_interrupted()  # Check for interruption in loop
+                
                 # Get trades for each asset individually
                 asset_trades_df = self.get_historical_trades_between_dates(
                     base_asset=asset,
@@ -1397,9 +1963,11 @@ class AlpacaBacktesting(DataSourceBacktesting):
                 if not asset_trades_df.empty:
                     all_trades_dfs.append(asset_trades_df)
             
-            # Combine all dataframes
+            # Combine all dataframes efficiently (single concat operation)
             if all_trades_dfs:
-                return pd.concat(all_trades_dfs, axis=0).sort_index()
+                # Use copy=False to avoid unnecessary copying
+                combined_df = pd.concat(all_trades_dfs, axis=0, copy=False)
+                return combined_df.sort_index()
             else:
                 return pd.DataFrame()
 
@@ -1419,8 +1987,14 @@ class AlpacaBacktesting(DataSourceBacktesting):
             data_datetime_end=cache_end        # Use backtest-wide dates
         )
 
+        # Thread-safe check and update of refreshed keys
+        with self._refreshed_keys_lock:
+            need_refresh = self._refresh_cache and trades_key not in self._refreshed_keys
+            if need_refresh:
+                self._refreshed_keys[trades_key] = True
+        
         # Check if we need to refresh or fetch trades data
-        if self._refresh_cache and trades_key not in self._refreshed_keys:
+        if need_refresh:
             self._download_and_cache_trades_data(
                 base_asset=asset,
                 quote_asset=quote,
@@ -1429,8 +2003,7 @@ class AlpacaBacktesting(DataSourceBacktesting):
                 data_datetime_start=cache_start,
                 data_datetime_end=cache_end
             )
-            self._refreshed_keys[trades_key] = True
-        elif trades_key not in self._data_store and not self._load_trades_into_data_store(trades_key):
+        elif not self._data_store.contains(trades_key) and not self._load_trades_into_data_store(trades_key):
             self._download_and_cache_trades_data(
                 base_asset=asset,
                 quote_asset=quote,
@@ -1447,19 +2020,32 @@ class AlpacaBacktesting(DataSourceBacktesting):
             logger.warning(f"No trades data available for {asset.symbol} between {requested_start} and {requested_end}")
             return pd.DataFrame()
         
-        # Filter the DataFrame to the requested datetime range
+        # Filter the DataFrame to the requested datetime range using O(log n) binary search
         try:
-            # Use loc for timezone-aware datetime slicing on the index
-            filtered_df = trades_df.loc[requested_start:requested_end]
+            # Use numpy searchsorted for efficient binary search on sorted index
+            timestamps = trades_df.index.values
+            start_ts = requested_start.value if hasattr(requested_start, 'value') else pd.Timestamp(requested_start).value
+            end_ts = requested_end.value if hasattr(requested_end, 'value') else pd.Timestamp(requested_end).value
             
-            if filtered_df.empty:
+            # Binary search for start and end indices
+            start_idx = np.searchsorted(timestamps, start_ts, side='left')
+            end_idx = np.searchsorted(timestamps, end_ts, side='right')
+            
+            # Slice using iloc for better performance (avoids index lookup)
+            if start_idx >= len(trades_df) or end_idx <= 0 or start_idx >= end_idx:
                 logger.debug(f"No trades data in requested range [{requested_start} to {requested_end}] for {asset.symbol}")
                 return pd.DataFrame()
-                
+            
+            filtered_df = trades_df.iloc[start_idx:end_idx]
             return filtered_df
             
         except Exception as e:
-            logger.error(f"Error filtering trades data for {asset.symbol}: {e}")
+            error_msg = (
+                f"Error filtering trades data for {asset.symbol} "
+                f"[{requested_start} to {requested_end}]: {e}. "
+                f"Suggestion: Verify datetime range and check data integrity."
+            )
+            logger.error(error_msg)
             return pd.DataFrame()
 
     def set_processed_bars(
@@ -1637,9 +2223,10 @@ class AlpacaBacktesting(DataSourceBacktesting):
             auto_adjust=auto_adjust,
         )
         
-        # Store the processed bars in the data store
-        self._data_store[key] = df
-        logger.info(f"Stored {len(df)} processed bars for {asset.symbol} with key: {key}")
+        # Store the processed bars in the data store (bounded cache)
+        self._data_store.set(key, df)
+        memory_mb = self._data_store.get_memory_usage_mb()
+        logger.info(f"Stored {len(df)} processed bars for {asset.symbol}. Cache memory: {memory_mb:.2f} MB")
         
         # Also save to cache for persistence
         try:
@@ -1651,6 +2238,7 @@ class AlpacaBacktesting(DataSourceBacktesting):
             # Reset index to save timestamp as column
             df_to_save = df.reset_index()
             df_to_save.to_csv(filepath, index=False)
+            self._save_checksum(filepath)
             logger.info(f"Cached processed bars to: {filepath}")
         except Exception as e:
             logger.warning(f"Failed to cache processed bars: {e}")

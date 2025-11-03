@@ -79,6 +79,7 @@ install_requires = [
     "Flask>=2.3",
     "free-proxy",
     "requests-oauthlib",
+    "tenacity>=8.0.0",
 ]
 
 # Handle TA libraries with dependency conflict awareness
@@ -124,7 +125,7 @@ extras_require = {
 setuptools.setup(
     # Basic package information
     name="lumibot",
-    version="3.18.5",
+    version="3.18.6",
     author="Robert Grzesik",
     author_email="rob@lumiwealth.com",
     description="Backtesting and Trading Library, Made by Lumiwealth.",
