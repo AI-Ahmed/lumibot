@@ -126,6 +126,7 @@ class Trader:
             tearsheet_file=None,
             base_filename=None,
             resample_rule=None,  # Add resample_rule parameter
+            bar_type="volume",  # Bar type for HFT tearsheet: 'volume', 'dollar', 'imbalance', 'runs', 'time', 'auto'
             ):
         """
         run all strategies
@@ -214,6 +215,7 @@ class Trader:
                     tearsheet_file=tearsheet_file,
                     base_filename=base_filename,
                     resample_rule=resample_rule,  # Pass the resample_rule parameter
+                    bar_type=bar_type,  # Pass the bar_type parameter for HFT tearsheet
                 )
 
         return result

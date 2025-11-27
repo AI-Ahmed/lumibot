@@ -32,6 +32,7 @@ from lumibot.tools.helpers import (
 from lumibot.tools.alpaca_helpers import sanitize_base_and_quote_asset
 
 from .data_source import DataSource
+from .alpaca_trades_streamer import AlpacaTimeTradesStreamer
 
 logger = get_logger(__name__)
 
@@ -329,6 +330,10 @@ class AlpacaData(DataSource):
             self.is_paper = config.PAPER
         else:
             self.is_paper = True
+
+        # Real-time trades streaming (for paper/live trading)
+        self._realtime_trades_streamer: AlpacaTimeTradesStreamer = None
+        self._realtime_streaming_enabled = kwargs.get('enable_realtime_streaming', False)
 
         if isinstance(config, dict) and "VERSION" in config:
             self.version = config["VERSION"]
@@ -848,3 +853,146 @@ class AlpacaData(DataSource):
         except Exception as e:
             logger.error(f"Error fetching greeks from Alpaca Data API: {e}")
             return {}
+
+    # =========================================================================
+    # Real-Time Trades Streaming (for Paper/Live Trading)
+    # =========================================================================
+    
+    def start_realtime_trades_streaming(self, symbols: list = None) -> AlpacaTimeTradesStreamer:
+        """Start real-time trades streaming via WebSocket.
+        
+        This is used for paper trading and live trading scenarios where you need
+        actual market data in real-time (not historical data for backtesting).
+        
+        Parameters
+        ----------
+        symbols : list, optional
+            List of symbols to stream. Can add more later with add_symbol().
+            
+        Returns
+        -------
+        AlpacaTimeTradesStreamer
+            The streamer instance for accessing real-time trades
+            
+        Examples
+        --------
+        >>> # Start streaming for paper/live trading
+        >>> streamer = alpaca_data.start_realtime_trades_streaming(["AAPL", "TSLA"])
+        >>> # Get recent trades
+        >>> trades = streamer.get_trades("AAPL", minutes=5)
+        >>> # Get latest price
+        >>> price = streamer.get_latest_price("AAPL")
+        
+        Notes
+        -----
+        - For backtesting, use historical data methods instead
+        - This uses Alpaca's WebSocket API for real-time data
+        - The streamer runs in a background thread
+        """
+        if self._realtime_trades_streamer is not None and self._realtime_trades_streamer.is_running:
+            logger.warning("Real-time trades streaming is already running")
+            return self._realtime_trades_streamer
+        
+        if not self.api_key or not self.api_secret:
+            raise ValueError(
+                "Real-time streaming requires API key/secret. "
+                "OAuth tokens do not support WebSocket streaming."
+            )
+        
+        self._realtime_trades_streamer = AlpacaTimeTradesStreamer(
+            api_key=self.api_key,
+            api_secret=self.api_secret,
+            symbols=symbols or [],
+        )
+        self._realtime_trades_streamer.start()
+        self._realtime_streaming_enabled = True
+        
+        logger.info(f"Started real-time trades streaming for {len(symbols or [])} symbols")
+        return self._realtime_trades_streamer
+    
+    def stop_realtime_trades_streaming(self) -> None:
+        """Stop real-time trades streaming."""
+        if self._realtime_trades_streamer:
+            self._realtime_trades_streamer.stop()
+            self._realtime_streaming_enabled = False
+            logger.info("Stopped real-time trades streaming")
+    
+    def get_realtime_trades(
+        self,
+        symbol: str,
+        minutes: int = 5,
+    ) -> pd.DataFrame:
+        """Get real-time trades from the WebSocket stream.
+        
+        Parameters
+        ----------
+        symbol : str
+            Symbol to get trades for
+        minutes : int, default 5
+            Get last N minutes of trades
+            
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with real-time trades data
+            
+        Raises
+        ------
+        RuntimeError
+            If real-time streaming is not enabled
+        """
+        if not self._realtime_trades_streamer or not self._realtime_trades_streamer.is_running:
+            raise RuntimeError(
+                "Real-time trades streaming is not enabled. "
+                "Call start_realtime_trades_streaming() first."
+            )
+        
+        # Ensure we're subscribed to this symbol
+        self._realtime_trades_streamer.add_symbol(symbol)
+        
+        return self._realtime_trades_streamer.get_trades(symbol, minutes=minutes)
+    
+    def get_realtime_latest_price(self, symbol: str) -> float:
+        """Get the latest real-time trade price.
+        
+        Parameters
+        ----------
+        symbol : str
+            Symbol to get price for
+            
+        Returns
+        -------
+        float
+            Latest trade price
+            
+        Raises
+        ------
+        RuntimeError
+            If real-time streaming is not enabled
+        """
+        if not self._realtime_trades_streamer or not self._realtime_trades_streamer.is_running:
+            raise RuntimeError(
+                "Real-time trades streaming is not enabled. "
+                "Call start_realtime_trades_streaming() first."
+            )
+        
+        # Ensure we're subscribed to this symbol
+        self._realtime_trades_streamer.add_symbol(symbol)
+        
+        price = self._realtime_trades_streamer.get_latest_price(symbol)
+        if price is None:
+            raise ValueError(f"No trades received yet for {symbol}")
+        return price
+    
+    @property
+    def realtime_streamer(self) -> AlpacaTimeTradesStreamer:
+        """Get the real-time trades streamer instance."""
+        return self._realtime_trades_streamer
+    
+    @property
+    def is_realtime_streaming(self) -> bool:
+        """Check if real-time streaming is active."""
+        return (
+            self._realtime_trades_streamer is not None 
+            and self._realtime_trades_streamer.is_running
+        )

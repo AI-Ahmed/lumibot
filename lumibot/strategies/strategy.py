@@ -5,6 +5,7 @@ from decimal import Decimal
 import uuid
 from typing import Union, List, Type, Callable, Literal
 
+import logging
 import jsonpickle
 import matplotlib
 import numpy as np

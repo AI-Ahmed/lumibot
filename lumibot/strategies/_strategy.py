@@ -1113,6 +1113,7 @@ class _Strategy:
         tearsheet_file=None,
         show_tearsheet=True,
         resample_rule=None,  # Changed default to None for auto-detection
+        bar_type="volume",  # Bar type for HFT strategies: 'volume', 'dollar', 'imbalance', 'runs', 'time', 'auto'
     ):
         if not save_tearsheet and not show_tearsheet:
             return None
@@ -1142,6 +1143,10 @@ class _Strategy:
                     
                 strategy_parameters["Strategy Info"]["Detected Type"] = "High-Frequency Trading" if resample_rule != "D" else "Standard"
                 strategy_parameters["Strategy Info"]["Resample Rule"] = resample_rule
+            
+            # Check if bar_type is specified in strategy parameters (allows override from strategy)
+            if "bar_type" in self.parameters:
+                bar_type = self.parameters["bar_type"]
                 
             # For HFT strategies, include trade metrics in the parameters
             if hasattr(self, '_trade_history') and self._trade_history:
@@ -1174,6 +1179,7 @@ class _Strategy:
                 risk_free_rate=self.risk_free_rate,
                 strategy_parameters=strategy_parameters,
                 resample_rule=resample_rule,  # Pass the resample_rule parameter
+                bar_type=bar_type,  # Pass the bar_type parameter
             )
 
             return result
@@ -1223,6 +1229,7 @@ class _Strategy:
         include_cash_positions=False,
         save_stats_file = True,
         resample_rule = None,  # Add resample_rule parameter
+        bar_type = "volume",  # Bar type for HFT tearsheet: 'volume', 'dollar', 'imbalance', 'runs', 'time', 'auto'
         **kwargs,
     ):
         """Backtest a strategy.
@@ -1617,6 +1624,7 @@ class _Strategy:
             tearsheet_file=tearsheet_file,
             base_filename=base_filename,
             resample_rule=resample_rule,  # Pass the resample_rule parameter
+            bar_type=bar_type,  # Pass the bar_type parameter for HFT tearsheet
         )
 
         end = datetime.datetime.now()
@@ -1649,6 +1657,7 @@ class _Strategy:
         tearsheet_csv_file=None,
         base_filename=None,
         resample_rule=None,  # Add resample_rule parameter
+        bar_type="volume",  # Bar type for HFT tearsheet: 'volume', 'dollar', 'imbalance', 'runs', 'time', 'auto'
     ):
         if not self._analyze_backtest:
             return
@@ -1708,6 +1717,7 @@ class _Strategy:
             tearsheet_file=tearsheet_file,
             show_tearsheet=show_tearsheet,
             resample_rule=resample_rule,  # Pass the resample_rule parameter
+            bar_type=bar_type,  # Pass the bar_type parameter for HFT tearsheet
         )
 
         # Save the result to a csv file
@@ -2632,20 +2642,135 @@ class _Strategy:
         asset = self._sanitize_user_asset(asset)
         if quote is not None:
             quote = self._sanitize_user_asset(quote)
-
+        
         if hasattr(self.broker.data_source, "get_historical_trades_between_dates"):
-            return self.broker.data_source.get_historical_trades_between_dates(
+            # Auto-configure chunk size from strategy's sleeptime for efficient data fetching
+            # This aligns data download chunks with strategy iteration frequency
+            if hasattr(self.broker.data_source, "configure_from_sleeptime") and hasattr(self, "_sleeptime"):
+                self.broker.data_source.configure_from_sleeptime(self._sleeptime)
+            
+            result = self.broker.data_source.get_historical_trades_between_dates(
                 base_asset=asset,
                 quote_asset=quote,
                 data_datetime_start=data_datetime_start,
                 data_datetime_end=data_datetime_end,
             )
+            return result
         else:
             self.logger.error(
                 "The data source does not support fetching historical trades data. "
                 "This feature is currently only available with certain data sources like AlpacaBacktesting."
             )
             return None
+
+    def get_realtime_trades(
+        self,
+        asset,
+        minutes: int = 5,
+    ):
+        """Get real-time trades data for an asset (for paper/live trading).
+        
+        This method uses WebSocket streaming to get real-time market trades.
+        Use this for paper trading and live trading scenarios.
+        
+        Parameters
+        ----------
+        asset : Asset or str
+            The asset to get real-time trades for.
+        minutes : int, default 5
+            Get last N minutes of trades from the stream buffer.
+            
+        Returns
+        -------
+        pandas.DataFrame
+            DataFrame containing real-time trades data indexed by timestamp.
+            Columns: price, size, exchange, trade_id, conditions, tape
+            
+        Raises
+        ------
+        RuntimeError
+            If real-time streaming is not enabled on the data source.
+            
+        Notes
+        -----
+        - This is for PAPER/LIVE trading only, not backtesting
+        - For backtesting, use get_historical_trades() instead
+        - Requires API key/secret (OAuth tokens don't support WebSocket)
+        - The first call will automatically start streaming for the symbol
+        
+        Examples
+        --------
+        >>> # In paper/live trading mode
+        >>> trades = self.get_realtime_trades("AAPL", minutes=5)
+        >>> if not trades.empty:
+        ...     latest_price = trades['price'].iloc[-1]
+        ...     volume = trades['size'].sum()
+        """
+        asset = self._sanitize_user_asset(asset)
+        symbol = asset.symbol if hasattr(asset, 'symbol') else str(asset)
+        
+        # Check if data source supports real-time streaming
+        if hasattr(self.broker.data_source, "get_realtime_trades"):
+            return self.broker.data_source.get_realtime_trades(symbol, minutes=minutes)
+        else:
+            self.logger.error(
+                "The data source does not support real-time trades streaming. "
+                "This feature requires AlpacaData with API key/secret authentication."
+            )
+            return None
+
+    def start_realtime_trades_streaming(self, symbols: list = None):
+        """Start real-time trades streaming for paper/live trading.
+        
+        This enables WebSocket-based real-time market data streaming.
+        Call this in your initialize() method for HFT strategies.
+        
+        Parameters
+        ----------
+        symbols : list, optional
+            List of symbols to stream. You can add more symbols later
+            by calling get_realtime_trades() with new symbols.
+            
+        Returns
+        -------
+        object
+            The streamer instance for advanced usage.
+            
+        Notes
+        -----
+        - Only works with AlpacaData using API key/secret
+        - OAuth tokens do not support WebSocket streaming
+        - The streamer runs in a background thread
+        
+        Examples
+        --------
+        >>> def initialize(self):
+        ...     # Start streaming for HFT
+        ...     self.start_realtime_trades_streaming(["AAPL", "TSLA"])
+        ...
+        >>> def on_trading_iteration(self):
+        ...     # Get real-time trades
+        ...     trades = self.get_realtime_trades("AAPL", minutes=1)
+        """
+        if hasattr(self.broker.data_source, "start_realtime_trades_streaming"):
+            return self.broker.data_source.start_realtime_trades_streaming(symbols or [])
+        else:
+            self.logger.error(
+                "The data source does not support real-time trades streaming. "
+                "This feature requires AlpacaData with API key/secret authentication."
+            )
+            return None
+
+    def stop_realtime_trades_streaming(self):
+        """Stop real-time trades streaming.
+        
+        Call this in your on_strategy_end() or when you no longer need
+        real-time data to free up resources.
+        """
+        if hasattr(self.broker.data_source, "stop_realtime_trades_streaming"):
+            self.broker.data_source.stop_realtime_trades_streaming()
+        else:
+            self.logger.warning("Data source does not support real-time streaming")
 
     def get_trade_history(self):
         """

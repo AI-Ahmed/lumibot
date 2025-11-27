@@ -27,7 +27,7 @@ from .indicators import (
 )
 
 
-# =================== 🔥 INSTITUTIONAL HFT SOLUTION 🔥 ===================
+# =================== INSTITUTIONAL HFT SOLUTION ===================
 
 class DualTrackAnalyzer:
     """
@@ -112,11 +112,11 @@ class DualTrackAnalyzer:
             return self._forward_fill_alignment()
         elif method == 'period_end':
             return self._period_end_alignment()
-        elif method == 'synthetic_bars':
-            return self._synthetic_benchmark_bars()
+        elif method in ('synthetic_bars', 'benchmark_aligned'):
+            return self._benchmark_aligned_bars()
         else:
-            logger.warning(f"Unknown alignment method: {method}, using synthetic_bars")
-            return self._synthetic_benchmark_bars()
+            logger.warning(f"Unknown alignment method: {method}, using benchmark_aligned")
+            return self._benchmark_aligned_bars()
     
     def _get_information_driven_benchmark(self):
         """Get benchmark data using ORIGINAL information-driven bar timing (no synthetic alignment)."""
@@ -155,9 +155,21 @@ class DualTrackAnalyzer:
             'benchmark_returns': benchmark_returns
         }
     
-    def _synthetic_benchmark_bars(self):
-        """🎯 MOST SOPHISTICATED: Create synthetic benchmark bars matching strategy timing."""
-        logger.info("🔬 Creating synthetic benchmark bars using strategy timing...")
+    def _benchmark_aligned_bars(self):
+        """
+        Align benchmark data to strategy bar timestamps.
+        
+        This method resamples the REAL benchmark data (e.g., SPY) to match the 
+        strategy's information-driven bar timestamps. It does NOT create synthetic
+        data - it uses the benchmark prices at the nearest available times.
+        
+        Returns
+        -------
+        dict
+            Dictionary with 'strategy_returns' and 'benchmark_returns' aligned
+            to the same timestamps.
+        """
+        logger.info("📊 Aligning benchmark data to strategy bar timestamps...")
         
         # Get strategy timestamps
         strategy_times = self.strategy_data.index
@@ -166,25 +178,25 @@ class DualTrackAnalyzer:
         # First, ensure benchmark data is properly sorted by time
         benchmark_sorted = self.benchmark_data.sort_index()
         
-        # Use interpolation to get benchmark values at exact strategy timestamps
-        # This creates realistic benchmark returns that align with strategy timing
+        # Align benchmark values at strategy bar timestamps using nearest-neighbor
+        # This uses benchmark data, not synthetic/generated data
         if 'symbol_cumprod' in benchmark_sorted.columns:
-            # Interpolate benchmark values at strategy times
-            benchmark_interpolated = benchmark_sorted['symbol_cumprod'].reindex(
+            # Reindex benchmark values at strategy times using nearest available data
+            benchmark_aligned = benchmark_sorted['symbol_cumprod'].reindex(
                 strategy_times, method='nearest', tolerance=pd.Timedelta('1h')
             ).ffill().bfill()
             
-            # Calculate benchmark returns using interpolated values
-            benchmark_returns = benchmark_interpolated.pct_change().fillna(0)
+            # Calculate benchmark returns using aligned values
+            benchmark_returns = benchmark_aligned.pct_change().fillna(0)
         else:
             # Handle other benchmark data structures
             numeric_cols = benchmark_sorted.select_dtypes(include=[np.number]).columns
             if len(numeric_cols) > 0:
                 benchmark_col = numeric_cols[0]
-                benchmark_interpolated = benchmark_sorted[benchmark_col].reindex(
+                benchmark_aligned = benchmark_sorted[benchmark_col].reindex(
                     strategy_times, method='nearest', tolerance=pd.Timedelta('1h')
                 ).ffill().bfill()
-                benchmark_returns = benchmark_interpolated.pct_change().fillna(0)
+                benchmark_returns = benchmark_aligned.pct_change().fillna(0)
             else:
                 logger.error("No numeric columns found in benchmark data")
                 benchmark_returns = pd.Series(0, index=strategy_times)
@@ -192,13 +204,16 @@ class DualTrackAnalyzer:
         # Calculate strategy returns
         strategy_returns = self.strategy_data['portfolio_value'].pct_change().fillna(0)
         
-        logger.debug(f"📊 Synthetic bars created: {len(strategy_returns)} strategy points, {len(benchmark_returns)} benchmark points")
+        logger.debug(f"📊 Benchmark-aligned bars: {len(strategy_returns)} strategy points, {len(benchmark_returns)} benchmark points")
         logger.debug(f"📊 Benchmark return stats: mean={benchmark_returns.mean():.6f}, std={benchmark_returns.std():.6f}")
         
         return {
             'strategy_returns': strategy_returns,
             'benchmark_returns': benchmark_returns
         }
+    
+    # Alias for backward compatibility
+    _synthetic_benchmark_bars = _benchmark_aligned_bars
     
     def _forward_fill_alignment(self):
         """Forward-fill strategy values to benchmark timestamps."""
@@ -493,8 +508,42 @@ def create_institutional_hft_tearsheet(
     return result
 
 
-def create_information_structure_report(info_metrics, aligned_metrics, output_file, bar_type, strategy_name):
-    """Create a separate report focused on information-driven analysis."""
+def create_information_structure_report(
+    info_metrics, aligned_metrics, output_file, bar_type, strategy_name,
+    benchmark_name="Benchmark", returns_df=None
+):
+    """
+    Create a professional information-driven analysis report with FPAP statistical metrics.
+    
+    Parameters
+    ----------
+    info_metrics : dict
+        Information-driven metrics from DualTrackAnalyzer
+    aligned_metrics : dict
+        Benchmark-aligned metrics from DualTrackAnalyzer
+    output_file : str
+        Output file path for the HTML report
+    bar_type : str
+        Type of information bars (volume, dollar, imbalance, etc.)
+    strategy_name : str
+        Name of the strategy
+    benchmark_name : str, optional
+        Name of the benchmark asset (e.g., 'SPY')
+    returns_df : pd.DataFrame, optional
+        DataFrame with 'strategy' and 'benchmark' returns for FPAP metrics
+    """
+    # Calculate FPAP production-grade metrics if returns data is available
+    fpap_metrics = _calculate_fpap_metrics(returns_df) if returns_df is not None else {}
+    
+    # Format alignment method for display (rename synthetic_bars to benchmark-aligned)
+    alignment_display = aligned_metrics.get('alignment_method', 'benchmark_aligned')
+    if alignment_display in ('synthetic_bars', 'benchmark_aligned'):
+        alignment_display = f"Benchmark-Aligned ({benchmark_name})"
+    else:
+        alignment_display = alignment_display.replace('_', ' ').title()
+    
+    # Build FPAP metrics section HTML
+    fpap_section = _build_fpap_section_html(fpap_metrics) if fpap_metrics else ""
     
     html_content = f"""
     <!DOCTYPE html>
@@ -506,15 +555,15 @@ def create_information_structure_report(info_metrics, aligned_metrics, output_fi
             body {{ 
                 font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
                 margin: 40px; 
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
                 color: #333;
             }}
             .container {{
                 background: white;
                 padding: 40px;
                 border-radius: 15px;
-                box-shadow: 0 20px 40px rgba(0,0,0,0.1);
-                max-width: 1200px;
+                box-shadow: 0 20px 40px rgba(0,0,0,0.3);
+                max-width: 1400px;
                 margin: 0 auto;
             }}
             .header {{ 
@@ -542,7 +591,7 @@ def create_information_structure_report(info_metrics, aligned_metrics, output_fi
             }}
             .metric-grid {{
                 display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+                grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
                 gap: 20px;
                 margin: 20px 0;
             }}
@@ -553,18 +602,42 @@ def create_information_structure_report(info_metrics, aligned_metrics, output_fi
                 box-shadow: 0 4px 6px rgba(0,0,0,0.1);
                 border-top: 4px solid #28a745;
             }}
+            .metric-card.warning {{
+                border-top-color: #ffc107;
+            }}
+            .metric-card.danger {{
+                border-top-color: #dc3545;
+            }}
+            .metric-card.info {{
+                border-top-color: #17a2b8;
+            }}
             .metric-label {{
                 font-weight: bold;
                 color: #495057;
-                font-size: 14px;
+                font-size: 13px;
                 text-transform: uppercase;
                 letter-spacing: 0.5px;
                 margin-bottom: 8px;
             }}
             .metric-value {{
-                font-size: 28px;
+                font-size: 26px;
                 font-weight: bold;
                 color: #28a745;
+            }}
+            .metric-value.warning {{
+                color: #ffc107;
+            }}
+            .metric-value.danger {{
+                color: #dc3545;
+            }}
+            .metric-value.info {{
+                color: #17a2b8;
+            }}
+            .metric-description {{
+                font-size: 11px;
+                color: #6c757d;
+                margin-top: 8px;
+                line-height: 1.4;
             }}
             .comparison-table {{
                 width: 100%;
@@ -592,7 +665,10 @@ def create_information_structure_report(info_metrics, aligned_metrics, output_fi
             .highlight {{
                 color: #28a745;
                 font-weight: bold;
-                font-size: 18px;
+                font-size: 16px;
+            }}
+            .highlight.negative {{
+                color: #dc3545;
             }}
             .footer {{
                 text-align: center;
@@ -604,6 +680,38 @@ def create_information_structure_report(info_metrics, aligned_metrics, output_fi
                 font-size: 1.2em;
                 margin-right: 8px;
             }}
+            .stats-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+                gap: 15px;
+                margin: 20px 0;
+            }}
+            .stat-row {{
+                display: flex;
+                justify-content: space-between;
+                padding: 10px 15px;
+                background: white;
+                border-radius: 6px;
+                margin: 5px 0;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+            }}
+            .stat-label {{
+                font-weight: 600;
+                color: #495057;
+            }}
+            .stat-value {{
+                font-weight: bold;
+                color: #2E86AB;
+            }}
+            .reference-note {{
+                font-size: 12px;
+                color: #6c757d;
+                font-style: italic;
+                margin-top: 15px;
+                padding: 10px;
+                background: #f1f3f4;
+                border-radius: 6px;
+            }}
         </style>
     </head>
     <body>
@@ -611,7 +719,7 @@ def create_information_structure_report(info_metrics, aligned_metrics, output_fi
             <div class="header">
                 🔬 Information Structure Analysis<br>
                 <div style="font-size: 24px; color: #6c757d; margin-top: 10px;">
-                    {strategy_name} • {bar_type.upper()} Bars
+                    {strategy_name} • {bar_type.upper()} Bars vs {benchmark_name}
                 </div>
             </div>
             
@@ -623,40 +731,46 @@ def create_information_structure_report(info_metrics, aligned_metrics, output_fi
                     <div class="metric-card">
                         <div class="metric-label">Information Sharpe Ratio</div>
                         <div class="metric-value">{info_metrics['information_sharpe']:.4f}</div>
+                        <div class="metric-description">Annualized risk-adjusted return using {bar_type} bar structure</div>
                     </div>
-                    <div class="metric-card">
+                    <div class="metric-card info">
                         <div class="metric-label">Total Information Bars</div>
-                        <div class="metric-value">{info_metrics['total_bars']:,}</div>
+                        <div class="metric-value info">{info_metrics['total_bars']:,}</div>
+                        <div class="metric-description">Number of {bar_type} bars generated during backtest</div>
                     </div>
-                    <div class="metric-card">
+                    <div class="metric-card {'warning' if info_metrics['bar_efficiency_score'] < 0.4 else ''}">
                         <div class="metric-label">Bar Efficiency Score</div>
-                        <div class="metric-value">{info_metrics['bar_efficiency_score']:.4f}</div>
+                        <div class="metric-value {'warning' if info_metrics['bar_efficiency_score'] < 0.4 else ''}">{info_metrics['bar_efficiency_score']:.4f}</div>
+                        <div class="metric-description">Measures timing consistency (1.0 = perfectly uniform)</div>
                     </div>
                     <div class="metric-card">
                         <div class="metric-label">Information Density</div>
                         <div class="metric-value">{info_metrics['information_density']:.2f}/day</div>
+                        <div class="metric-description">Average number of bars per trading day</div>
                     </div>
                     <div class="metric-card">
                         <div class="metric-label">Average Bar Duration</div>
                         <div class="metric-value">{info_metrics['average_bar_duration']:.1f}s</div>
+                        <div class="metric-description">Mean time between consecutive bars</div>
                     </div>
                     <div class="metric-card">
                         <div class="metric-label">Temporal Clustering</div>
                         <div class="metric-value">{info_metrics['temporal_clustering']:.4f}</div>
+                        <div class="metric-description">Autocorrelation of bar intervals (-1 to 1)</div>
                     </div>
                 </div>
             </div>
             
             <div class="section">
                 <div class="section-title">
-                    <span class="emoji">⚖️</span>Dual-Track Comparison
+                    <span class="emoji">⚖️</span>Benchmark Comparison: {benchmark_name}
                 </div>
                 <table class="comparison-table">
                     <thead>
                         <tr>
                             <th>Metric</th>
                             <th>Information-Driven</th>
-                            <th>Time-Aligned</th>
+                            <th>{alignment_display}</th>
                             <th>Difference</th>
                         </tr>
                     </thead>
@@ -670,66 +784,46 @@ def create_information_structure_report(info_metrics, aligned_metrics, output_fi
                         <tr>
                             <td><strong>Analysis Method</strong></td>
                             <td>Original {bar_type.upper()} Structure</td>
-                            <td>{aligned_metrics['alignment_method'].replace('_', ' ').title()}</td>
+                            <td>{alignment_display}</td>
                             <td>-</td>
                         </tr>
                         <tr>
-                            <td><strong>Beta vs Benchmark</strong></td>
-                            <td>{info_metrics['info_beta']:.4f} (Info-Driven)</td>
+                            <td><strong>Beta vs {benchmark_name}</strong></td>
+                            <td>{info_metrics['info_beta']:.4f}</td>
                             <td>{aligned_metrics['beta']:.4f}</td>
-                            <td class="highlight">{info_metrics['info_beta'] - aligned_metrics['beta']:+.4f}</td>
+                            <td class="highlight {'negative' if abs(info_metrics['info_beta'] - aligned_metrics['beta']) > 0.5 else ''}">{info_metrics['info_beta'] - aligned_metrics['beta']:+.4f}</td>
                         </tr>
                         <tr>
-                            <td><strong>Alpha vs Benchmark</strong></td>
-                            <td>{info_metrics['info_alpha']:.6f} (Info-Driven)</td>
+                            <td><strong>Alpha vs {benchmark_name}</strong></td>
+                            <td>{info_metrics['info_alpha']:.6f}</td>
                             <td>{aligned_metrics['alpha']:.6f}</td>
                             <td class="highlight">{info_metrics['info_alpha'] - aligned_metrics['alpha']:+.6f}</td>
                         </tr>
                         <tr>
                             <td><strong>Information Ratio</strong></td>
-                            <td>{info_metrics['info_information_ratio']:.4f} (Info-Driven)</td>
+                            <td>{info_metrics['info_information_ratio']:.4f}</td>
                             <td>{aligned_metrics['information_ratio']:.4f}</td>
                             <td class="highlight">{info_metrics['info_information_ratio'] - aligned_metrics['information_ratio']:+.4f}</td>
                         </tr>
                         <tr>
-                            <td><strong>Tracking Error</strong></td>
-                            <td>{info_metrics['info_tracking_error']:.4f} (Info-Driven)</td>
+                            <td><strong>Tracking Error (Ann.)</strong></td>
+                            <td>{info_metrics['info_tracking_error']:.4f}</td>
                             <td>{aligned_metrics['tracking_error']:.4f}</td>
                             <td class="highlight">{info_metrics['info_tracking_error'] - aligned_metrics['tracking_error']:+.4f}</td>
                         </tr>
                     </tbody>
                 </table>
+                <div class="reference-note">
+                    Note: Benchmark-aligned metrics use actual {benchmark_name} data resampled to match strategy bar timestamps.
+                </div>
             </div>
             
-            <div class="section">
-                <div class="section-title">
-                    <span class="emoji">🎯</span>Bar Characteristics Analysis
-                </div>
-                <p style="font-size: 16px; line-height: 1.6; color: #495057;">
-                    <strong>{bar_type.upper()} bars</strong> capture information through non-uniform sampling based on {bar_type} thresholds 
-                    rather than fixed time intervals. This approach provides several advantages:
-                </p>
-                <ul style="font-size: 16px; line-height: 1.8; color: #495057;">
-                    <li><strong>Information Density:</strong> Higher concentration of trading signals during active periods</li>
-                    <li><strong>Noise Reduction:</strong> Filters out low-activity periods that add little information</li>
-                    <li><strong>Market Microstructure:</strong> Better captures true market dynamics and liquidity patterns</li>
-                    <li><strong>Adaptive Sampling:</strong> Automatically adjusts to market volatility and activity levels</li>
-                </ul>
-                
-                <div style="background: #e7f3ff; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #007bff;">
-                    <h4 style="color: #007bff; margin: 0 0 10px 0;">💡 Key Insight</h4>
-                    <p style="margin: 0; font-size: 16px; color: #495057;">
-                        The Bar Efficiency Score of <strong>{info_metrics['bar_efficiency_score']:.4f}</strong> indicates 
-                        {'high' if info_metrics['bar_efficiency_score'] > 0.7 else 'moderate' if info_metrics['bar_efficiency_score'] > 0.4 else 'low'} 
-                        efficiency in capturing information through {bar_type} sampling. 
-                        {'This suggests the strategy effectively utilizes information-driven timing.' if info_metrics['bar_efficiency_score'] > 0.5 else 'Consider optimizing bar thresholds for better information capture.'}
-                    </p>
-                </div>
-            </div>
+            {fpap_section}
             
             <div class="footer">
                 🏛️ Generated by Institutional HFT Analysis Framework<br>
-                Professional-grade performance evaluation for information-driven strategies
+                Professional-grade performance evaluation powered by FPAP statistical methods<br>
+                <small>Reference: López de Prado, M. (2018). Advances in Financial Machine Learning. Wiley.</small>
             </div>
         </div>
     </body>
@@ -740,6 +834,294 @@ def create_information_structure_report(info_metrics, aligned_metrics, output_fi
         f.write(html_content)
     
     logger.info(f"📄 Information structure report created: {output_file}")
+
+
+def _calculate_fpap_metrics(returns_df):
+    """
+    Calculate production-grade FPAP statistical metrics.
+    
+    Uses fpap.backtests.statistics for professional backtest analysis:
+    - HHI Bets Concentration (positive/negative/time)
+    - Drawdown and Time Under Water (95th percentile)
+    - Probabilistic Sharpe Ratio (PSR)
+    - Deflated Sharpe Ratio (DSR)
+    - Minimum Track Record Length (MinTRL)
+    
+    Parameters
+    ----------
+    returns_df : pd.DataFrame
+        DataFrame with 'strategy' column containing returns
+        
+    Returns
+    -------
+    dict
+        Dictionary containing FPAP metrics
+    """
+    if returns_df is None or returns_df.empty:
+        return {}
+    
+    try:
+        from fpap.backtests.statistics import (
+            get_all_bets_concentration,
+            drawdown_n_time_under_water,
+            compute_psr,
+            compute_dsr,
+            MinTRL,
+            compute_moments,
+            sharpe_ratio as fpap_sharpe,
+        )
+        
+        # Get strategy returns
+        if 'strategy' in returns_df.columns:
+            returns = returns_df['strategy'].dropna()
+        else:
+            returns = returns_df.iloc[:, 0].dropna()
+        
+        if len(returns) < 10:
+            logger.warning("Insufficient data for FPAP metrics (need at least 10 observations)")
+            return {}
+        
+        # Calculate moments for PSR/DSR
+        m1, m2, m3, m4 = compute_moments(returns)
+        
+        # Estimate frequency (entries per year)
+        if hasattr(returns.index, 'to_series'):
+            freq_mode = returns.index.to_series().diff().dropna().mode()
+            if len(freq_mode) > 0 and hasattr(freq_mode.iloc[0], 'days'):
+                days_per_obs = max(freq_mode.iloc[0].days, 1/1440)  # At least 1 minute
+                entries_per_year = 252 / days_per_obs if days_per_obs > 0 else 252
+            else:
+                entries_per_year = 252  # Default to daily
+        else:
+            entries_per_year = 252
+        
+        # Calculate Sharpe Ratio
+        sr = fpap_sharpe(returns, int(entries_per_year), 0.0)
+        
+        # HHI Concentration
+        hhi_pos, hhi_neg, hhi_time = get_all_bets_concentration(returns, frequency='ME')
+        
+        # Drawdown and Time Under Water
+        cumulative_returns = (1 + returns).cumprod()
+        dd, tuw = drawdown_n_time_under_water(cumulative_returns)
+        dd_95 = np.quantile(dd, 0.95) if len(dd) > 0 else 0
+        tuw_95 = np.quantile(tuw, 0.95) if len(tuw) > 0 else 0
+        
+        # Probabilistic Sharpe Ratio (vs SR=0 benchmark)
+        psr_stat, psr = compute_psr(
+            sr_estimates=sr / np.sqrt(entries_per_year),
+            skew=m3,
+            kurtosis=m4,
+            sample_length=len(returns),
+            sr_ref=0.0
+        )
+        
+        # Deflated Sharpe Ratio (assuming 100 trials)
+        N_trials = 100
+        backtest_var = m2 ** 2
+        em_sr, dsr = compute_dsr(
+            sr_estimates=sr,
+            backtest_var=backtest_var,
+            sample_length=len(returns),
+            N_trials=N_trials,
+            skewness_of_returns=m3,
+            kurtosis_of_returns=m4,
+            freq=entries_per_year
+        )
+        
+        # Minimum Track Record Length (years needed for 90% confidence)
+        min_trl = MinTRL(
+            sr_estimates=sr / np.sqrt(entries_per_year),
+            skew=m3,
+            kurtosis=m4,
+            benchmark_sr=0.0,
+            confidence_lv=0.90
+        )
+        
+        # Current track record in years
+        if len(returns) > 1:
+            track_record_years = (returns.index[-1] - returns.index[0]).days / 365.25
+        else:
+            track_record_years = 0
+        
+        return {
+            'sharpe_ratio': sr,
+            'mean_return': m1,
+            'std_return': m2,
+            'skewness': m3,
+            'kurtosis': m4,
+            'hhi_positive': hhi_pos,
+            'hhi_negative': hhi_neg,
+            'hhi_time': hhi_time,
+            'drawdown_95': dd_95,
+            'tuw_95': tuw_95,
+            'psr_stat': psr_stat,
+            'psr': psr,
+            'dsr': dsr,
+            'expected_max_sr': em_sr,
+            'min_trl': min_trl,
+            'track_record_years': track_record_years,
+            'sample_size': len(returns),
+            'entries_per_year': entries_per_year,
+        }
+        
+    except ImportError as e:
+        logger.warning(f"FPAP package not available for advanced metrics: {e}")
+        return {}
+    except Exception as e:
+        logger.warning(f"Error calculating FPAP metrics: {e}")
+        return {}
+
+
+def _build_fpap_section_html(fpap_metrics):
+    """
+    Build the HTML section for FPAP statistical metrics.
+    
+    Parameters
+    ----------
+    fpap_metrics : dict
+        Dictionary containing FPAP metrics from _calculate_fpap_metrics
+        
+    Returns
+    -------
+    str
+        HTML string for the FPAP metrics section
+    """
+    if not fpap_metrics:
+        return ""
+    
+    # Determine PSR status
+    psr = fpap_metrics.get('psr', 0)
+    psr_status = "success" if psr > 0.95 else "warning" if psr > 0.5 else "danger"
+    psr_class = "" if psr_status == "success" else psr_status
+    
+    # Determine DSR status
+    dsr = fpap_metrics.get('dsr', 0)
+    dsr_status = "success" if dsr > 0.95 else "warning" if dsr > 0.5 else "danger"
+    dsr_class = "" if dsr_status == "success" else dsr_status
+    
+    # Determine MinTRL status
+    min_trl = fpap_metrics.get('min_trl', float('inf'))
+    track_years = fpap_metrics.get('track_record_years', 0)
+    trl_status = "success" if track_years >= min_trl else "warning" if track_years >= min_trl * 0.5 else "danger"
+    trl_class = "" if trl_status == "success" else trl_status
+    
+    # Format HHI values
+    hhi_pos = fpap_metrics.get('hhi_positive')
+    hhi_neg = fpap_metrics.get('hhi_negative')
+    hhi_time = fpap_metrics.get('hhi_time')
+    
+    hhi_pos_str = f"{hhi_pos:.4f}" if hhi_pos is not None else "N/A"
+    hhi_neg_str = f"{hhi_neg:.4f}" if hhi_neg is not None else "N/A"
+    hhi_time_str = f"{hhi_time:.4f}" if hhi_time is not None else "N/A"
+    
+    return f"""
+            <div class="section">
+                <div class="section-title">
+                    <span class="emoji">📈</span>Production-Grade Statistical Analysis (FPAP)
+                </div>
+                
+                <div class="metric-grid">
+                    <div class="metric-card {psr_class}">
+                        <div class="metric-label">Probabilistic Sharpe Ratio (PSR)</div>
+                        <div class="metric-value {psr_class}">{psr:.4f}</div>
+                        <div class="metric-description">
+                            Probability that true SR > 0. Values > 0.95 indicate statistical significance.
+                            PSR Statistic: {fpap_metrics.get('psr_stat', 0):.4f}
+                        </div>
+                    </div>
+                    
+                    <div class="metric-card {dsr_class}">
+                        <div class="metric-label">Deflated Sharpe Ratio (DSR)</div>
+                        <div class="metric-value {dsr_class}">{dsr:.4f}</div>
+                        <div class="metric-description">
+                            Adjusts for multiple testing (N=100 trials assumed).
+                            Expected Max SR: {fpap_metrics.get('expected_max_sr', 0):.4f}
+                        </div>
+                    </div>
+                    
+                    <div class="metric-card {trl_class}">
+                        <div class="metric-label">Minimum Track Record Length</div>
+                        <div class="metric-value {trl_class}">{min_trl:.2f} yrs</div>
+                        <div class="metric-description">
+                            Years needed for 90% confidence. Current: {track_years:.2f} yrs
+                            {'✓ Sufficient' if track_years >= min_trl else '⚠ Insufficient'}
+                        </div>
+                    </div>
+                    
+                    <div class="metric-card">
+                        <div class="metric-label">95th Percentile Drawdown</div>
+                        <div class="metric-value">{fpap_metrics.get('drawdown_95', 0):.2%}</div>
+                        <div class="metric-description">
+                            Maximum expected drawdown at 95% confidence level
+                        </div>
+                    </div>
+                    
+                    <div class="metric-card">
+                        <div class="metric-label">95th Percentile Time Under Water</div>
+                        <div class="metric-value">{fpap_metrics.get('tuw_95', 0):.1f} months</div>
+                        <div class="metric-description">
+                            Maximum expected recovery time at 95% confidence level
+                        </div>
+                    </div>
+                    
+                    <div class="metric-card info">
+                        <div class="metric-label">Sample Size</div>
+                        <div class="metric-value info">{fpap_metrics.get('sample_size', 0):,}</div>
+                        <div class="metric-description">
+                            Number of return observations ({fpap_metrics.get('entries_per_year', 252):.0f}/year)
+                        </div>
+                    </div>
+                </div>
+                
+                <div style="margin-top: 25px;">
+                    <h4 style="color: #2E86AB; margin-bottom: 15px;">HHI Bets Concentration Analysis</h4>
+                    <div class="stats-grid">
+                        <div class="stat-row">
+                            <span class="stat-label">Positive Returns Concentration</span>
+                            <span class="stat-value">{hhi_pos_str}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Negative Returns Concentration</span>
+                            <span class="stat-value">{hhi_neg_str}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Time Concentration (Monthly)</span>
+                            <span class="stat-value">{hhi_time_str}</span>
+                        </div>
+                    </div>
+                    <div class="reference-note">
+                        HHI ranges from 0 (perfectly diversified) to 1 (concentrated). 
+                        Low values indicate well-distributed returns across bets and time periods.
+                    </div>
+                </div>
+                
+                <div style="margin-top: 25px;">
+                    <h4 style="color: #2E86AB; margin-bottom: 15px;">Return Distribution Moments</h4>
+                    <div class="stats-grid">
+                        <div class="stat-row">
+                            <span class="stat-label">Mean Return (per observation)</span>
+                            <span class="stat-value">{fpap_metrics.get('mean_return', 0):.6f}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Standard Deviation</span>
+                            <span class="stat-value">{fpap_metrics.get('std_return', 0):.6f}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Skewness</span>
+                            <span class="stat-value">{fpap_metrics.get('skewness', 0):.4f}</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Kurtosis</span>
+                            <span class="stat-value">{fpap_metrics.get('kurtosis', 0):.4f}</span>
+                        </div>
+                    </div>
+                    <div class="reference-note">
+                        Negative skewness indicates left-tail risk. Kurtosis > 3 indicates fat tails (higher tail risk than normal distribution).
+                    </div>
+                </div>
+            </div>
+    """
 
 
 def create_tearsheet(
@@ -753,19 +1135,31 @@ def create_tearsheet(
     risk_free_rate: float,
     strategy_parameters: dict = None,
     resample_rule: str = "D",  # Add resample_rule parameter with default "D" for daily
+    bar_type: str = "volume",  # Explicit bar type: 'volume', 'dollar', 'imbalance', 'runs', 'time', or 'auto'
 ):
     """
-    🔥 ENHANCED TEARSHEET WITH INSTITUTIONAL HFT SUPPORT
+    ENHANCED TEARSHEET WITH INSTITUTIONAL HFT SUPPORT
     
     Auto-detects HFT strategies and applies appropriate analysis method.
     Fully integrated with lumibot's data processing framework.
+    
+    Parameters
+    ----------
+    bar_type : str, default 'volume'
+        Type of information-driven bars used in the strategy:
+        - 'volume': Volume bars (default for HFT strategies)
+        - 'dollar': Dollar bars
+        - 'imbalance': Imbalance bars
+        - 'runs': Runs bars
+        - 'time': Time-based bars
+        - 'auto': Auto-detect based on timing patterns (may be inaccurate)
     """
     # If show tearsheet is False, then we don't want to open the tearsheet in the browser
     if not save_tearsheet:
         logger.info("save_tearsheet is False, not creating the tearsheet file.")
         return
 
-    logger.info("\n🔥 Creating Enhanced Tearsheet with HFT Support...")
+    logger.info("\nCreating Enhanced Tearsheet with HFT Support...")
 
     # Check if df1 or df2 are empty and return if they are
     if strategy_df is None or benchmark_df is None or strategy_df.empty or benchmark_df.empty:
@@ -818,9 +1212,15 @@ def create_tearsheet(
         df_final["benchmark"].name = str(benchmark_asset)
         df_final["strategy"].name = strat_name
 
-        # Auto-detect bar type
-        analyzer = DualTrackAnalyzer(strategy_df, benchmark_df)
-        detected_bar_type = analyzer.detect_bar_type()
+        # Use explicit bar_type if provided, otherwise auto-detect
+        analyzer = DualTrackAnalyzer(strategy_df, benchmark_df, bar_type=bar_type)
+        if bar_type == "auto":
+            detected_bar_type = analyzer.detect_bar_type()
+            analyzer.bar_type = detected_bar_type
+            logger.info(f"🔍 Auto-detected bar type: {detected_bar_type.upper()}")
+        else:
+            detected_bar_type = bar_type
+            logger.info(f"📊 Using explicit bar type: {detected_bar_type.upper()}")
         
         # Enhanced parameters with HFT metrics
         if strategy_parameters is None:
@@ -860,8 +1260,11 @@ def create_tearsheet(
         
         # Calculate dual-track metrics for supplementary report
         info_metrics = analyzer.calculate_information_driven_metrics()
-        aligned_metrics = analyzer.calculate_time_aligned_metrics('synthetic_bars')
-        create_information_structure_report(info_metrics, aligned_metrics, info_driven_file, detected_bar_type, strat_name)
+        aligned_metrics = analyzer.calculate_time_aligned_metrics('benchmark_aligned')
+        create_information_structure_report(
+            info_metrics, aligned_metrics, info_driven_file, 
+            detected_bar_type, strat_name, str(benchmark_asset), df_final
+        )
 
         if show_tearsheet:
             url = "file://" + os.path.abspath(str(tearsheet_file))
@@ -1524,7 +1927,7 @@ def calculate_run_length_distribution(strategy_data):
         return {'mean_run_length': 1, 'std_run_length': 0, 'max_run_length': 1}
 
 
-# =================== 🔥 PENDULUM TIME UTILITIES FOR HFT 🔥 ===================
+# =================== PENDULUM TIME UTILITIES FOR HFT ===================
 
 def get_hft_timezone(timezone_str=None):
     """

@@ -78,8 +78,11 @@ class TradesDataStrategy(Strategy):
         # Set the trading frequency
         self.sleeptime = "15M"  # 15 minutes
         
-        # Set the stock to trade
+        # Set the stock to trade (can be single symbol or list)
         self.symbol = self.parameters.get("symbol", "AAPL")
+        
+        # Normalize symbols to always be a list for consistent handling
+        self.symbols = self.symbol if isinstance(self.symbol, list) else [self.symbol]
         
         # Parameters for feature engineering
         self.volume_bar_threshold = self.parameters.get("volume_bar_threshold", 10000)
@@ -90,16 +93,26 @@ class TradesDataStrategy(Strategy):
         self.vwap_threshold = self.parameters.get("vwap_threshold", 0.0001)  # 0.01% threshold for VWAP crossover
         self.allow_short = self.parameters.get("allow_short", False)  # Default to not allowing short positions
         
-        # Store the last computed indicators
+        # Per-symbol indicator storage for multi-asset HFT
+        self.last_vwaps = {}  # {symbol: vwap_value}
+        self.last_signals = {}  # {symbol: signal} - per-symbol signal tracking
+        
+        # Legacy single-symbol support (for backward compatibility)
         self.last_vwap = None
-        self.last_signal = None  # Track the last trading signal
+        self.last_signal = None
         
         # Initialize counters for debugging
         self.sell_signals_count = 0
         self.buy_signals_count = 0
         
     def on_trading_iteration(self):
-        """Main trading logic executed on each iteration."""
+        """Main trading logic executed on each iteration.
+        
+        For multi-symbol strategies, this processes each symbol independently:
+        1. Fetches trades for each symbol separately
+        2. Computes per-symbol volume bars and VWAP
+        3. Makes independent trading decisions per symbol
+        """
         # Get the current datetime
         current_dt = self.get_datetime()
         
@@ -130,23 +143,35 @@ class TradesDataStrategy(Strategy):
         if not hasattr(self.broker.data_source, "get_historical_trades_between_dates"):
             self.logger.info("This data source does not support fetching trades data")
             return
-            
-        # Get historical trades
+        
+        # Process each symbol independently for correct per-symbol indicators
+        for symbol in self.symbols:
+            self._process_symbol_iteration(symbol, start_dt, current_dt)
+    
+    def _process_symbol_iteration(self, symbol, start_dt, current_dt):
+        """Process a single symbol's trading iteration.
+        
+        Parameters
+        ----------
+        symbol : str
+            The symbol to process
+        start_dt : datetime
+            Start datetime for trades lookup
+        current_dt : datetime
+            Current datetime (end of trades lookup)
+        """
+        # Get historical trades for THIS symbol only
         trades_df = self.get_historical_trades(
-            asset=self.symbol,
+            asset=symbol,  # Single symbol, not list
             data_datetime_start=start_dt,
             data_datetime_end=current_dt
         )
         
         # Skip if no trades data available
         if trades_df is None or trades_df.empty:
-            self.logger.info("Trades DataFrame is empty")
+            self.logger.debug(f"No trades data for {symbol}")
             return
             
-        # Log trades dataframe structure for debugging
-        # self.logger.info(f"Trades DataFrame columns: {trades_df.columns.tolist()}")
-        # self.logger.info(f"Trades DataFrame first row: {trades_df.iloc[0].to_dict()}")
-        
         # Process trades to create volume bars
         if volume_bars:
             volume_bar = volume_bars(trades_df, self.volume_bar_threshold, datetime_col='timestamp')
@@ -154,26 +179,32 @@ class TradesDataStrategy(Strategy):
             volume_bar = self._create_volume_bars(trades_df)
             
         if volume_bar is None or volume_bar.empty:
+            self.logger.debug(f"No volume bars created for {symbol}")
             return
             
-        # Calculate VWAP
+        # Calculate VWAP for this symbol
         if volume_bars:
             vwap = volume_bar['VWAP']
         else:
             vwap = self.compute_vwap(volume_bar)
         if vwap is None:
-            self.logger.warning("VWAP calculation failed")
+            self.logger.warning(f"VWAP calculation failed for {symbol}")
             return
             
         try:
-            self.last_vwap = vwap.iloc[-1]            
-
-            self.process_and_store_bars(volume_bar, self.symbol, current_dt)
+            # Store per-symbol VWAP
+            symbol_vwap = vwap.iloc[-1]
+            self.last_vwaps[symbol] = symbol_vwap
             
-            # Make trading decisions based on the indicators
-            self.make_trading_decisions(volume_bar)
+            # Also update legacy single-symbol variable for backward compatibility
+            self.last_vwap = symbol_vwap
+
+            self.process_and_store_bars(volume_bar, symbol, current_dt)
+            
+            # Make trading decision for this specific symbol
+            self._make_symbol_trading_decision(symbol, volume_bar)
         except Exception as e:
-            self.logger.error(f"Error processing VWAP: {e}")
+            self.logger.error(f"Error processing VWAP for {symbol}: {e}")
     
     def _create_volume_bars(self, trades_df):
         """Create volume bars from trades data."""
@@ -497,9 +528,39 @@ class TradesDataStrategy(Strategy):
             self.logger.error(f"Error computing VWAP: {str(e)}")
             return None
     
+    def _make_symbol_trading_decision(self, symbol, volume_bar):
+        """Make trading decision for a specific symbol using its per-symbol VWAP.
+        
+        Parameters
+        ----------
+        symbol : str
+            The symbol to make trading decision for
+        volume_bar : pandas.DataFrame
+            DataFrame containing volume bars for this symbol
+        """
+        # Get the per-symbol VWAP
+        symbol_vwap = self.last_vwaps.get(symbol)
+        
+        if symbol_vwap is None or volume_bar.empty:
+            self.logger.debug(f"Skipping trading decision for {symbol}: VWAP is None or volume bar is empty")
+            return
+        
+        # Get the last price for this specific symbol
+        last_price = self.get_last_price(symbol)
+        if last_price is None:
+            self.logger.warning(f"Could not get last price for {symbol}")
+            return
+        
+        # Process trading decision with per-symbol VWAP
+        self._process_trading_decision(symbol, last_price, symbol_vwap)
+    
     def make_trading_decisions(self, volume_bar):
         """
         Make trading decisions based on VWAP and price relationship.
+        
+        Note: This method is kept for backward compatibility. For multi-symbol
+        strategies, use _make_symbol_trading_decision() which is called from
+        _process_symbol_iteration().
         
         This method implements a simple VWAP-based strategy:
         - Buy when price crosses above VWAP by threshold percentage
@@ -528,19 +589,20 @@ class TradesDataStrategy(Strategy):
                 self.logger.warning(f"Could not get last prices for {self.symbol}")
                 return
             
-            # Process each symbol individually
+            # Process each symbol individually with their per-symbol VWAP
             for symbol, price in last_prices.items():
-                self._process_trading_decision(symbol, price)
+                symbol_vwap = self.last_vwaps.get(symbol, self.last_vwap)
+                self._process_trading_decision(symbol, price, symbol_vwap)
             
             # Return after processing all symbols
             return
         
         # For single symbol case, process the trading decision
-        self._process_trading_decision(self.symbol, last_price)
+        self._process_trading_decision(self.symbol, last_price, self.last_vwap)
 
-    def _process_trading_decision(self, symbol, last_price):
+    def _process_trading_decision(self, symbol, last_price, symbol_vwap=None):
         """
-        Process trading decision for a single symbol.
+        Process trading decision for a single symbol using its per-symbol VWAP.
         
         Parameters
         ----------
@@ -548,7 +610,12 @@ class TradesDataStrategy(Strategy):
             The symbol to process
         last_price : float
             The last price for the symbol
+        symbol_vwap : float, optional
+            The per-symbol VWAP to use. If None, falls back to self.last_vwap
         """
+        # Use per-symbol VWAP if provided, otherwise fall back to legacy single VWAP
+        vwap = symbol_vwap if symbol_vwap is not None else self.last_vwap
+        
         # Get current positions and portfolio value
         positions = self.get_positions()
         portfolio_value = self.get_portfolio_value()
@@ -571,12 +638,15 @@ class TradesDataStrategy(Strategy):
             self.logger.warning(f"Unexpected negative position for {symbol}: {position_quantity}. Skipping trading decision.")
             return
         
+        # Get the per-symbol signal (or use legacy single signal)
+        last_signal = self.last_signals.get(symbol, self.last_signal)
+        
         # Safety check for VWAP and calculate deviation
         signal = None
         vwap_deviation = None
         
-        if self.last_vwap is None or not isinstance(self.last_vwap, (int, float)) or self.last_vwap <= 0:
-            self.logger.warning(f"DEBUG: Invalid VWAP value: {self.last_vwap}. Cannot calculate deviation.")
+        if vwap is None or not isinstance(vwap, (int, float)) or vwap <= 0:
+            self.logger.warning(f"DEBUG: Invalid VWAP value for {symbol}: {vwap}. Cannot calculate deviation.")
             # Force a sell signal if we have a position and VWAP is invalid
             if position_quantity > 0:
                 signal = "sell"
@@ -584,10 +654,10 @@ class TradesDataStrategy(Strategy):
                 self.logger.info(f"DEBUG: Forced SELL signal #{self.sell_signals_count} for {symbol} due to invalid VWAP")
         else:
             # Calculate price deviation from VWAP as a percentage
-            vwap_deviation = (last_price - self.last_vwap) / self.last_vwap
+            vwap_deviation = (last_price - vwap) / vwap
             
             # Log current state for debugging
-            self.logger.info(f"Trading decision: Price={last_price:.2f}, VWAP={self.last_vwap:.2f}, "
+            self.logger.info(f"[{symbol}] Trading decision: Price={last_price:.2f}, VWAP={vwap:.2f}, "
                             f"Deviation={vwap_deviation:.4f} ({vwap_deviation*100:.2f}%), Current position={position_quantity}")
             
             # Determine the signal based on price-VWAP relationship
@@ -601,7 +671,7 @@ class TradesDataStrategy(Strategy):
                 self.sell_signals_count += 1
         
         # Only trade if we have a new signal or need to exit a position
-        if signal == "buy" and (position_quantity <= 0 or self.last_signal != signal):
+        if signal == "buy" and (position_quantity <= 0 or last_signal != signal):
             # Close any existing short position first
             if position_quantity < 0:
                 self.logger.info(f"Closing existing short position of {position_quantity} shares for {symbol}")
@@ -614,42 +684,54 @@ class TradesDataStrategy(Strategy):
                 position_value = portfolio_value * self.position_size
                 buy_quantity = max(1, int(position_value / last_price))
                 
-                self.logger.info(f"BUY SIGNAL: Buying {buy_quantity} shares of {symbol} at ${last_price:.2f} (VWAP: ${self.last_vwap:.2f})")
+                self.logger.info(f"🟢 [{symbol}] BUY SIGNAL: Buying {buy_quantity} shares at ${last_price:.2f} (VWAP: ${vwap:.2f})")
                 
                 # Create and submit buy order
                 order = self.create_order(symbol, buy_quantity, "buy")
                 self.submit_order(order)
-                self.last_signal = "buy"
+                
+                # Update per-symbol signal tracking
+                self.last_signals[symbol] = "buy"
+                self.last_signal = "buy"  # Legacy support
         
         elif signal == "sell":
-            self.logger.info(f"🔴 SELL SIGNAL detected for {symbol}: Price=${last_price:.2f}, VWAP=${self.last_vwap:.2f}, Position={position_quantity}")
+            self.logger.info(f"🔴 [{symbol}] SELL SIGNAL detected: Price=${last_price:.2f}, VWAP=${vwap:.2f}, Position={position_quantity}")
             
             # Close any existing long position first
             if position_quantity > 0:
-                self.logger.info(f"🔴 Closing existing long position of {position_quantity} shares for {symbol}")
+                self.logger.info(f"🔴 [{symbol}] Closing existing long position of {position_quantity} shares")
                 order = self.create_order(symbol, position_quantity, "sell")
                 self.submit_order(order)
-                self.last_signal = "sell"
+                
+                # Update per-symbol signal tracking
+                self.last_signals[symbol] = "sell"
+                self.last_signal = "sell"  # Legacy support
             # Only create short positions if explicitly allowed
-            elif position_quantity == 0 and self.allow_short and self.last_signal != signal:
+            elif position_quantity == 0 and self.allow_short and last_signal != signal:
                 # Calculate position size based on portfolio value and position sizing parameter
                 position_value = portfolio_value * self.position_size
                 sell_quantity = max(1, int(position_value / last_price))
                 
-                self.logger.info(f"🔴 SELL SIGNAL: Selling {sell_quantity} shares of {symbol} at ${last_price:.2f} (VWAP: ${self.last_vwap:.2f})")
+                self.logger.info(f"🔴 [{symbol}] SELL SIGNAL: Selling {sell_quantity} shares at ${last_price:.2f} (VWAP: ${vwap:.2f})")
                 
                 # Create and submit sell order
                 order = self.create_order(symbol, sell_quantity, "sell")
                 self.submit_order(order)
-                self.last_signal = "sell"
+                
+                # Update per-symbol signal tracking
+                self.last_signals[symbol] = "sell"
+                self.last_signal = "sell"  # Legacy support
             # Only log the sell signal if we don't have a position to close and shorts aren't allowed
-            elif position_quantity == 0 and not self.allow_short and self.last_signal != signal:
-                self.logger.info(f"🔴 SELL SIGNAL received but no position to close for {symbol} at ${last_price:.2f} (VWAP: ${self.last_vwap:.2f})")
-                self.last_signal = "sell"
+            elif position_quantity == 0 and not self.allow_short and last_signal != signal:
+                self.logger.info(f"🔴 [{symbol}] SELL SIGNAL received but no position to close at ${last_price:.2f} (VWAP: ${vwap:.2f})")
+                
+                # Update per-symbol signal tracking
+                self.last_signals[symbol] = "sell"
+                self.last_signal = "sell"  # Legacy support
         else:
             # Log when no signal is generated for debugging
             if vwap_deviation is not None:
-                self.logger.debug(f"No signal for {symbol}: deviation {vwap_deviation:.4f} within threshold ±{self.vwap_threshold:.4f}")
+                self.logger.debug(f"[{symbol}] No signal: deviation {vwap_deviation:.4f} within threshold ±{self.vwap_threshold:.4f}")
 
 
 
@@ -665,7 +747,7 @@ if __name__ == "__main__":
     
     # Original longer test periods (commented out for debugging)
     backtesting_start = eastern.localize(datetime(2024, 5, 1))  # Monday
-    backtesting_end = eastern.localize(datetime(2024, 8, 9))    # Wednesday
+    backtesting_end = eastern.localize(datetime(2024, 5, 9))    # Wednesday
     # backtesting_start = eastern.localize(datetime(2023, 5, 1))  # Monday
     # backtesting_end = eastern.localize(datetime(2024, 5, 1))    # Wednesday
     
@@ -678,7 +760,9 @@ if __name__ == "__main__":
         backtesting_start=backtesting_start,
         backtesting_end=backtesting_end,
         parameters={
-            "symbol": ["AAPL"],
+            # "symbol": ["AAPL"], # test with single symbol
+            "symbol": ["AAPL", "MSFT", "GOOGL", "NVDA", "TSLA", "TSM"], # test with multiple symbols
+            "bar_type": "volume",
             "volume_bar_threshold": 100_000,
             "vwap_window": 100,
             "allow_short": False,  # Set to False to prevent short positions

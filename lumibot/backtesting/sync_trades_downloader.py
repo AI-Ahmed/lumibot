@@ -354,9 +354,9 @@ class SyncTradesDownloader:
         
         Parameters
         ----------
-        trades_response : dict
+        trades_response : TradeSet
             Response from Alpaca SDK get_stock_trades()
-            Format: {symbol: [Trade, Trade, ...]} or empty dict
+            TradeSet is a pydantic model with .data attribute containing Dict[str, List[Trade]]
         start : DateTime
             Start of range (for filtering)
         end : DateTime
@@ -369,7 +369,7 @@ class SyncTradesDownloader:
             
         Notes
         -----
-        The Alpaca SDK returns Trade objects with attributes:
+        The Alpaca SDK returns TradeSet with Trade objects having attributes:
         - timestamp: datetime
         - price: float
         - size: int
@@ -381,8 +381,8 @@ class SyncTradesDownloader:
         if not trades_response:
             return pd.DataFrame()
         
-        # Get trades for our symbol from SDK response
-        symbol_trades = trades_response.get(self.asset.symbol, [])
+        # Get trades for our symbol from SDK response (TradeSet uses .data or __getitem__)
+        symbol_trades = trades_response[self.asset.symbol] if self.asset.symbol in trades_response.data else []
         if not symbol_trades:
             return pd.DataFrame()
         

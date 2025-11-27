@@ -439,7 +439,12 @@ def print_progress_bar(
             progress_line += f" {portfolio_info}"
         
         # Truncate if over terminal width (ANSI codes aren't counted)
-        max_allowed = os.get_terminal_size().columns if 'TERM' in os.environ else 120
+        try:
+            max_allowed = os.get_terminal_size().columns if 'TERM' in os.environ else 120
+        except OSError:
+            # Environments without a real TTY (CI, some IDE terminals) can raise OSError
+            max_allowed = 120
+        
         progress_line = progress_line[:max_allowed]
         
         file.write(progress_line)
