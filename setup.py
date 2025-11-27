@@ -50,6 +50,7 @@ install_requires = [
     "numpy>=1.26.4",
     "pandas>=2.2.0",
     "pandas-market-calendars==5.1.1",
+    "pendulum>=3.1.0",
     "plotly>=5.18.0",
     "sqlalchemy",
     "bcrypt",
@@ -80,6 +81,7 @@ install_requires = [
     "free-proxy",
     "requests-oauthlib",
     "tenacity>=8.0.0",
+    "aiohttp>=3.9.0",
 ]
 
 # Handle TA libraries with dependency conflict awareness
@@ -125,7 +127,7 @@ extras_require = {
 setuptools.setup(
     # Basic package information
     name="lumibot",
-    version="3.18.6",
+    version="3.18.7",
     author="Robert Grzesik",
     author_email="rob@lumiwealth.com",
     description="Backtesting and Trading Library, Made by Lumiwealth.",

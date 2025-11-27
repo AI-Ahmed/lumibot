@@ -6,7 +6,7 @@ actual Quant Dev would do.
 HFT Performance Tracking & Enhanced Data Processing:
 
 This file demonstrates the use of enhanced HFT performance tracking in Lumibot
-with the new processed bars functionality.
+with the new processed bars functionality and progressive trades loading.
 
 The modifications include:
 
@@ -17,6 +17,7 @@ The modifications include:
 5. Processed bars storage with custom indicators using set_processed_bars()
 6. Additional columns preservation (custom indicators, momentum, etc.)
 7. Non-uniform timestep support with 'custom' timestep
+8. **NEW: Progressive trades loading** - Downloads trades data in background to prevent freezing
 
 Key Features Demonstrated:
 - Volume bars creation from trades data (trades → volume bars instead of time bars)
@@ -24,12 +25,22 @@ Key Features Demonstrated:
 - Processed bars storage with set_processed_bars() method for strategy data
 - Additional columns preservation in processed bars
 - Benchmark uses standard pipeline (benchmark_asset="SPY" parameter)
+- **Progressive trades loading** - Backtest starts immediately, data downloads in background
+
+Progressive Loading Benefits:
+- No terminal freezing: Backtest starts immediately with first chunk of data
+- Memory efficient: Old trades automatically trimmed via sliding window
+- Better UX: Progress feedback as data downloads in background
+- Scalable: Works with large portfolios and long backtest periods
 
 These modifications address the issue where HFT strategies showed 0% returns
 in performance metrics despite active trading, due to daily resampling that
 erased evidence of intraday trading activity. The new processed bars functionality
 allows strategies to use custom processed bars (volume bars, information-driven bars, etc.) 
 instead of standard time-based bars for better HFT performance.
+
+The progressive loading system prevents the terminal from freezing when downloading
+millions of trades records for HFT strategies.
 """
 
 from datetime import datetime, timedelta, time
@@ -103,6 +114,17 @@ class TradesDataStrategy(Strategy):
         
         # Fetch and process trades data for the last 10 minutes
         start_dt = current_dt - timedelta(minutes=10)
+        
+        # Constrain to market hours (never request pre-market data)
+        market_open_dt = current_dt.replace(hour=9, minute=30, second=0, microsecond=0)
+        if start_dt < market_open_dt:
+            start_dt = market_open_dt
+            self.logger.debug(f"Adjusted lookback start to market open: {start_dt}")
+        
+        # Additional safety: Skip if current_dt is at or before market open
+        if current_dt <= market_open_dt:
+            self.logger.info(f"Current time {current_dt} is at or before market open, skipping")
+            return
         
         # Only attempt to get trades data if we're using a data source that supports it
         if not hasattr(self.broker.data_source, "get_historical_trades_between_dates"):
@@ -384,11 +406,13 @@ class TradesDataStrategy(Strategy):
             if 'timestamp' not in result.columns and result.index.name == 'timestamp':
                 result = result.reset_index()
             
-            # Map columns if needed
+            # SyncTradesDownloader now returns: price, size, exchange, trade_id, conditions, tape
             column_mapping = {
+                'price': 'Price',    # From renamed Alpaca column (p -> price -> Price)
+                'size': 'Volume',    # From renamed Alpaca column (s -> size -> Volume)
+                'Price': 'Price',    # Keep as-is if already correct
+                'Volume': 'Volume',  # Keep as-is if already correct
                 'Tick': 'Symbol',
-                'Price': 'Price',  # Keep as is if exists
-                'Volume': 'Volume', # Keep as is if exists
             }
             
             # Rename columns that need renaming
@@ -404,7 +428,7 @@ class TradesDataStrategy(Strategy):
             if 'Price' not in result.columns:
                 # Try to find a column that might contain price data
                 price_column = next((col for col in result.columns if 
-                                     'price' in col.lower() or 'close' in col.lower() or 'p' == col.lower()), None)
+                                     col.lower() == 'price' or col.lower() == 'close' or col == 'p'), None)
                 
                 if price_column:
                     self.logger.info(f"Using {price_column} as Price column")
@@ -419,8 +443,15 @@ class TradesDataStrategy(Strategy):
             
             # Ensure we have Volume column
             if 'Volume' not in result.columns:
-                self.logger.info("Setting default Volume to 1")
-                result['Volume'] = 1
+                # Try to find size column first
+                size_column = next((col for col in result.columns if 
+                                   col.lower() == 'size' or col == 's'), None)
+                if size_column:
+                    self.logger.info(f"Using {size_column} as Volume column")
+                    result['Volume'] = result[size_column]
+                else:
+                    self.logger.info("Setting default Volume to 1")
+                    result['Volume'] = 1
                 
             # self.logger.info(f"Processed data shape: {result.shape}")
             return result
@@ -628,19 +659,26 @@ if __name__ == "__main__":
     import pytz
     eastern = pytz.timezone('US/Eastern')
     
-    # Wednesday to Friday in one year
+    # REDUCED TEST PERIOD for faster debugging (2 days instead of 3+ months)
+    # backtesting_start = eastern.localize(datetime(2024, 5, 1))  # Wednesday
+    # backtesting_end = eastern.localize(datetime(2024, 5, 2))    # Thursday
+    
+    # Original longer test periods (commented out for debugging)
     backtesting_start = eastern.localize(datetime(2024, 5, 1))  # Monday
     backtesting_end = eastern.localize(datetime(2024, 8, 9))    # Wednesday
     # backtesting_start = eastern.localize(datetime(2023, 5, 1))  # Monday
     # backtesting_end = eastern.localize(datetime(2024, 5, 1))    # Wednesday
+    
+    print(f"🔵 [TEST] Starting backtest from {backtesting_start} to {backtesting_end}")
+    print(f"🔵 [TEST] Market hours: 9:30 AM - 4:00 PM ET")
+    print(f"🔵 [TEST] Strategy sleeptime: 15M (first iteration expected at ~9:45 AM)")
 
     TradesDataStrategy.run_backtest(
         datasource_class=AlpacaBacktesting,
         backtesting_start=backtesting_start,
         backtesting_end=backtesting_end,
         parameters={
-            "symbol": ["AAPL", "MSFT", "GOOGL", "TSLA"],
-            # "symbol": ["AAPL"],
+            "symbol": ["AAPL"],
             "volume_bar_threshold": 100_000,
             "vwap_window": 100,
             "allow_short": False,  # Set to False to prevent short positions
@@ -650,10 +688,9 @@ if __name__ == "__main__":
         benchmark_asset="SPY",
         risk_free_rate=0.025,
         show_progress_bar=True,
-        quiet_logs=False,
-        save_logfile=False,
+        quiet_logs=False,  # Set to False for debugging - shows INFO logs
+        save_logfile=True,
         resample_rule="1min",  # Use 1-minute resampling for HFT strategy
         timestep="minute",  # IMPORTANT: for `AlpacaBacktesting` to work for HFT strategies
-        # minutes_before_opening=30,  # Start checking 30 minutes before market open
-        # minutes_before_closing=5    # Stop trading 5 minutes before market close
+        refresh_cache=False,
     ) 

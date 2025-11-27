@@ -4,14 +4,20 @@ import signal
 import atexit
 import threading
 import bisect
-import numpy as np
+import traceback
 from typing import Optional
 from collections import OrderedDict
 from contextlib import contextmanager
 
+import numpy as np
+
+import pendulum
+from pendulum import DateTime
+
 import pytz
 from datetime import datetime, timedelta
 from decimal import Decimal
+
 
 import pandas as pd
 from alpaca.data.historical import CryptoHistoricalDataClient, StockHistoricalDataClient
@@ -51,6 +57,7 @@ except ImportError:
 logger = get_logger(__name__)
 
 from lumibot.tools.alpaca_helpers import sanitize_base_and_quote_asset
+from lumibot.backtesting.sync_trades_downloader import SyncTradesDownloader, MultiAssetTradesDownloader
 from lumibot.credentials import (
     ALPACA_CONFIG,
     DEFAULT_END_SHIFT_DAYS,
@@ -63,6 +70,9 @@ from lumibot.credentials import (
     DEFAULT_API_RETRY_MAX_WAIT,
     DATA_QUALITY_DROP_THRESHOLD,
     CACHE_VERSION,
+    DEFAULT_TRADES_LOOKAHEAD_HOURS,
+    DEFAULT_TRADES_MEMORY_WINDOW_HOURS,
+    DEFAULT_TRADES_CHUNK_SIZE_HOURS,
 )
 
 
@@ -171,6 +181,42 @@ class BoundedDataCache:
         """
         with self._lock:
             return self._current_bytes / 1024 / 1024
+
+    # --- Dict-like compatibility methods for backward compatibility ---
+    def keys(self):
+        """Return a list of keys currently in the cache (thread-safe)."""
+        with self._lock:
+            return list(self._cache.keys())
+
+    def items(self):
+        """Return a list of (key, value) pairs (thread-safe snapshot)."""
+        with self._lock:
+            return list(self._cache.items())
+
+    def values(self):
+        """Return a list of cached values (thread-safe snapshot)."""
+        with self._lock:
+            return list(self._cache.values())
+
+    def __contains__(self, key: str) -> bool:
+        return self.contains(key)
+
+    def __getitem__(self, key: str) -> pd.DataFrame:
+        value = self.get(key)
+        if value is None:
+            raise KeyError(key)
+        return value
+
+    def __setitem__(self, key: str, value: pd.DataFrame) -> None:
+        self.set(key, value)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._cache)
+
+    def __iter__(self):
+        # Iterate over a stable snapshot of keys to avoid concurrency issues
+        return iter(self.keys())
 
 
 class DataQualityTracker:
@@ -365,6 +411,18 @@ class AlpacaBacktesting(DataSourceBacktesting):
         # Data quality tracking
         self._data_quality_tracker = DataQualityTracker()
         
+        # Progressive trades downloader configuration
+        self._trades_downloaders: dict = {}  # Maps asset keys to ProgressiveTradesDownloader instances
+        self._trades_downloaders_lock = threading.Lock()
+        self._enable_progressive_trades = kwargs.get('enable_progressive_trades', True)
+        self._trades_lookahead_hours = kwargs.get('trades_lookahead_hours', DEFAULT_TRADES_LOOKAHEAD_HOURS)
+        self._trades_memory_window_hours = kwargs.get('trades_memory_window_hours', DEFAULT_TRADES_MEMORY_WINDOW_HOURS)
+        self._trades_chunk_size_hours = kwargs.get('trades_chunk_size_hours', DEFAULT_TRADES_CHUNK_SIZE_HOURS)
+        # chunk_size_minutes: Will be auto-configured from strategy's sleeptime
+        # Default 15 minutes matches common HFT sleeptime intervals until configured
+        self._trades_chunk_size_minutes = 15
+        self._sleeptime_configured = False  # Track if we've configured from sleeptime
+        
         # Graceful interruption support
         self._interrupted = False
         self._setup_signal_handlers()
@@ -382,6 +440,10 @@ class AlpacaBacktesting(DataSourceBacktesting):
         oauth_token = config.get("OAUTH_TOKEN")
         api_key = config.get("API_KEY")
         api_secret = config.get("API_SECRET")
+        
+        # Store API credentials for raw HTTP calls in HFT trades downloader
+        self._api_key = api_key
+        self._api_secret = api_secret
         
         if oauth_token:
             self._crypto_client = CryptoHistoricalDataClient(oauth_token=oauth_token)
@@ -538,10 +600,13 @@ class AlpacaBacktesting(DataSourceBacktesting):
         
         Notes
         -----
-        Called automatically on exit or when interrupted. Clears cache
-        and logs final data quality metrics.
+        Called automatically on exit or when interrupted. Clears cache,
+        stops progressive downloaders, and logs final data quality metrics.
         """
         try:
+            # Stop all progressive trades downloaders
+            self._cleanup_trades_downloaders()
+            
             # Log data quality report
             if hasattr(self, '_data_quality_tracker'):
                 report = self._data_quality_tracker.get_report()
@@ -555,6 +620,38 @@ class AlpacaBacktesting(DataSourceBacktesting):
                 
         except Exception as e:
             logger.debug(f"Error during cleanup: {e}")
+    
+    def _cleanup_trades_downloaders(self) -> None:
+        """Stop all progressive trades downloaders gracefully.
+        
+        Notes
+        -----
+        This method stops all background download threads and logs statistics.
+        Called automatically during cleanup or can be called manually.
+        """
+        if not hasattr(self, '_trades_downloaders'):
+            return
+            
+        with self._trades_downloaders_lock:
+            if not self._trades_downloaders:
+                return
+            
+            logger.debug(f"Stopping {len(self._trades_downloaders)} trades downloaders...")
+            
+            for key, downloader in self._trades_downloaders.items():
+                try:
+                    stats = downloader.get_statistics()
+
+                    # Close the downloader (SyncTradesDownloader uses close(), not stop())
+                    if hasattr(downloader, 'close'):
+                        downloader.close()
+                    elif hasattr(downloader, 'stop'):
+                        downloader.stop(timeout=5.0)
+                except Exception as e:
+                    logger.error(f"Error stopping downloader {key}: {e}")
+            
+            self._trades_downloaders.clear()
+            logger.info("All trades downloaders stopped")
             
     def _check_interrupted(self) -> None:
         """Check if operation was interrupted.
@@ -566,6 +663,82 @@ class AlpacaBacktesting(DataSourceBacktesting):
         """
         if self._interrupted:
             raise KeyboardInterrupt("Operation interrupted by user")
+
+    @staticmethod
+    def _sleeptime_to_minutes(sleeptime) -> int:
+        """Convert sleeptime string/int to minutes.
+        
+        Uses the same parsing logic as Lumibot's strategy_executor._sleeptime_to_seconds().
+        
+        Parameters
+        ----------
+        sleeptime : int or str
+            Sleeptime value. Int is interpreted as minutes.
+            String format: number followed by unit (S=seconds, M=minutes, H=hours, D=days)
+            Examples: "15M", "300S", "1H", 15
+            
+        Returns
+        -------
+        int
+            Sleeptime converted to minutes (minimum 1 minute)
+            
+        Notes
+        -----
+        This aligns chunk_size_minutes with the strategy's sleeptime for efficient
+        data fetching during sleep periods.
+        """
+        if isinstance(sleeptime, int):
+            # Integer is interpreted as minutes (same as Lumibot)
+            return max(1, sleeptime)
+        elif isinstance(sleeptime, str):
+            unit = sleeptime[-1].upper()
+            try:
+                value = float(sleeptime[:-1])
+            except ValueError:
+                logger.warning(f"Invalid sleeptime format: {sleeptime}, using default 15 minutes")
+                return 15
+            
+            if unit == 'S':
+                # Seconds -> convert to minutes (minimum 1 minute)
+                return max(1, int(value / 60))
+            elif unit == 'M':
+                return max(1, int(value))
+            elif unit == 'H':
+                return max(1, int(value * 60))
+            elif unit == 'D':
+                return max(1, int(value * 60 * 24))
+            else:
+                logger.warning(f"Unknown sleeptime unit: {unit}, using default 15 minutes")
+                return 15
+        else:
+            logger.warning(f"Invalid sleeptime type: {type(sleeptime)}, using default 15 minutes")
+            return 15
+
+    def configure_from_sleeptime(self, sleeptime) -> None:
+        """Configure chunk size based on strategy's sleeptime.
+        
+        This method should be called when the strategy is initialized to align
+        the trades data chunk size with the strategy's iteration frequency.
+        
+        Parameters
+        ----------
+        sleeptime : int or str
+            The strategy's sleeptime value.
+            
+        Notes
+        -----
+        Aligning chunk_size with sleeptime allows efficient data fetching:
+        - While strategy sleeps, we can fetch the next chunk of data
+        - When strategy wakes up, data is already available
+        - Reduces latency and improves HFT performance
+        """
+        if self._sleeptime_configured:
+            return  # Already configured
+            
+        chunk_minutes = self._sleeptime_to_minutes(sleeptime)
+        self._trades_chunk_size_minutes = chunk_minutes
+        self._sleeptime_configured = True
+        logger.info(f"Configured trades chunk size to {chunk_minutes} minutes based on sleeptime: {sleeptime}")
 
     def _sanitize_base_and_quote_asset(self, base_asset, quote_asset) -> tuple[Asset, Asset]:
         """Sanitize base and quote assets.
@@ -1339,7 +1512,7 @@ class AlpacaBacktesting(DataSourceBacktesting):
                                         tzinfo: pytz.tzinfo = None,
                                         data_datetime_start: datetime = None,
                                         data_datetime_end: datetime = None) -> pd.DataFrame:
-        """Download and cache trades data for an asset.
+        """Download and cache trades data for an asset using progressive loading.
         
         Parameters
         ----------
@@ -1363,15 +1536,16 @@ class AlpacaBacktesting(DataSourceBacktesting):
 
         Notes
         -----
-        This method handles is similar to ``_download_and_cache_ohlcv_data`` but
-        uses the ``StockTradesRequest`` instead of ``StockBarsRequest`` to collect trades data.
+        This method uses synchronous on-demand loading to download trades data.
+        It downloads data when requested and caches it for future use.
+        
+        For HFT strategies with millions of trades, this approach:
+        - Downloads data on-demand (no complex background threading)
+        - Caches downloaded chunks to avoid re-fetching
+        - Uses sliding window memory management
+        - Supports parallel downloads for multi-asset portfolios
         """
-        # Log information for user awareness
-        logger.warning(
-            "Fetching trades data. Note: It's the strategy's responsibility to process "
-            "this raw trades data for feature engineering or custom bar construction."
-        )
-
+        # Validate parameters
         if base_asset is None:
             raise ValueError("The parameter 'base_asset' cannot be None.")
         if quote_asset is None:
@@ -1384,174 +1558,158 @@ class AlpacaBacktesting(DataSourceBacktesting):
             raise ValueError("The parameter 'data_datetime_start' cannot be None.")
         if data_datetime_end is None:
             raise ValueError("The parameter 'data_datetime_end' cannot be None.")
-
-        key = self._get_asset_key(
-            base_asset=base_asset,
-            quote_asset=quote_asset,
-            timestep="fractional",
-            market=market,
-            tzinfo=tzinfo,
-            data_datetime_start=data_datetime_start,
-            data_datetime_end=data_datetime_end,
+        
+        # Check if progressive loading is enabled (use new sync downloader)
+        if not self._enable_progressive_trades:
+            return self._download_trades_synchronous(
+                base_asset=base_asset,
+                quote_asset=quote_asset,
+                market=market,
+                tzinfo=tzinfo,
+                data_datetime_start=data_datetime_start,
+                data_datetime_end=data_datetime_end
+            )
+        
+        # Get or create synchronous downloader for this asset
+        downloader_key = f"{base_asset.symbol}_{quote_asset.symbol}_{market}"
+        
+        with self._trades_downloaders_lock:
+            if downloader_key not in self._trades_downloaders:                
+                # Create downloader with API credentials
+                # chunk_size_minutes aligns with strategy's sleeptime for efficient data fetching
+                # during sleep periods (fetch next chunk while strategy sleeps)
+                downloader = SyncTradesDownloader(
+                    asset=base_asset,
+                    backtest_start=self._data_datetime_start,
+                    backtest_end=self._data_datetime_end,
+                    api_key=self._api_key,
+                    api_secret=self._api_secret,
+                    tzinfo=str(tzinfo) if tzinfo else "America/New_York",
+                    memory_window_hours=self._trades_memory_window_hours,
+                    chunk_size_minutes=self._trades_chunk_size_minutes,
+                )
+                
+                self._trades_downloaders[downloader_key] = downloader
+            else:
+                downloader = self._trades_downloaders[downloader_key]
+        
+        # Simply get the data - downloader handles caching and downloading
+        logger.debug(f"Requesting trades for {base_asset.symbol} [{data_datetime_start} to {data_datetime_end}]")
+        
+        try:
+            result = downloader.get_trades(data_datetime_start, data_datetime_end)
+            
+            # Trim old data to manage memory
+            if hasattr(self, '_datetime') and self._datetime:
+                cutoff = pendulum.instance(self._datetime).subtract(hours=self._trades_memory_window_hours)
+                downloader.trim_old_data(cutoff)
+            
+            logger.debug(f"Retrieved {len(result)} trades for {base_asset.symbol}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error downloading trades for {base_asset.symbol}: {e}")
+            return pd.DataFrame()
+    
+    def _download_trades_synchronous(
+        self,
+        *,
+        base_asset: Asset,
+        quote_asset: Asset,
+        market: str,
+        tzinfo: pytz.tzinfo,
+        data_datetime_start: datetime,
+        data_datetime_end: datetime
+    ) -> pd.DataFrame:
+        """Fallback synchronous trades download method.
+        
+        This method downloads all trades data in one blocking operation.
+        Used when progressive loading is disabled.
+        
+        Parameters
+        ----------
+        base_asset : Asset
+            Base asset of the trading pair.
+        quote_asset : Asset
+            Quote asset of the trading pair.
+        market : str
+            Market or exchange identifier.
+        tzinfo : pytz.tzinfo
+            Timezone information for the data.
+        data_datetime_start : datetime
+            Start date of the data for backtesting.
+        data_datetime_end : datetime
+            End date of the data for backtesting (inclusive).
+            
+        Returns
+        -------
+        pandas.DataFrame
+            DataFrame containing the downloaded trades data.
+        
+        Notes
+        -----
+        This is the old synchronous method kept for compatibility.
+        For HFT strategies, progressive loading is strongly recommended.
+        """
+        logger.warning(
+            f"Using synchronous download for {base_asset.symbol}. "
+            f"This may take several minutes and block the backtest. "
+            f"Consider enabling progressive loading (enable_progressive_trades=True)."
         )
-
-        # Directory to save cached data.
-        cache_dir = os.path.join(LUMIBOT_CACHE_FOLDER, self.CACHE_SUBFOLDER)
-        os.makedirs(cache_dir, exist_ok=True)
-
-        # File path based on the unique key
-        filename = f"{key}.parquet"
-        filepath = os.path.join(cache_dir, filename)
-
-        logger.info(f"Fetching and caching data for {key}")
-
-        client = self._stock_client
-
+        
+        # Download all data at once (blocking)
+        dt_start = pendulum.instance(data_datetime_start) if not isinstance(data_datetime_start, pendulum.DateTime) else data_datetime_start
+        dt_end = pendulum.instance(data_datetime_end) if not isinstance(data_datetime_end, pendulum.DateTime) else data_datetime_end
+        end_with_buffer = dt_end.add(minutes=1)
+        
         request_params = StockTradesRequest(
             symbol_or_symbols=base_asset.symbol,
-            start=data_datetime_start,
-            end=data_datetime_end + timedelta(minutes=1),  # alpaca end dates are exclusive, but we want to include the last bar
-            currency=quote_asset.symbol,  # Use symbol as currency
+            start=dt_start,
+            end=end_with_buffer,
+            currency=quote_asset.symbol,
         )
-
+        
         try:
-            trades = self._api_call_with_retry(client.get_stock_trades, request_params)
-        except Exception as e:
-            error_msg = (
-                f"Failed to fetch trades data for {base_asset.symbol} "
-                f"[{data_datetime_start} to {data_datetime_end}]. "
-                f"Error: {e}. "
-                f"Suggestion: Check API credentials, verify asset supports trade data, and check Alpaca service status."
+            trades = self._api_call_with_retry(
+                self._stock_client.get_stock_trades,
+                request_params
             )
-            raise RuntimeError(error_msg) from e
-
-        df = trades.df.reset_index()
-
-        if df.empty:
-            raise RuntimeError(f"No data fetched for {key}.")
-
-        # Process the data
-        try:
-            if data_prep is not None:
-                try:
-                    # To be compatible with fpap, we need to keep the following columns
-                    df = df[['timestamp', 'symbol', 'id', 'price', 'size', 'exchange', 'tape', 'conditions']]
-                    df = data_prep(df)
-
-                    # Normalize column names back to lowercase after data_prep
-                    # data_prep may rename: Datetime->timestamp, Price->price, Volume->size
-                    column_mapping = {
-                        'Datetime': 'timestamp',
-                        'Price': 'price',
-                        'Volume': 'size'
-                    }
-                    df = df.rename(columns=column_mapping)
-                except Exception as e:
-                    logger.warning(f"Error in data_prep: {e}. Falling back to default processing.")
-                    # Fallback to default processing
             
-            # Based on the API response structure, the timestamp is in column 't'
-            # Price is in column 'p', size is in column 's'
-            if 't' in df.columns and 'timestamp' not in df.columns:
-                df = df.rename(columns={'t': 'timestamp', 'p': 'price', 's': 'size'})
+            if trades is None or trades.df.empty:
+                logger.warning(f"No trades data returned for {base_asset.symbol}")
+                return pd.DataFrame()
             
-            # Ensure 'timestamp' column exists and is properly formatted
+            df = trades.df.reset_index()
+            
+            # Ensure timestamp column
             if 'timestamp' not in df.columns:
-                # If timestamp is the index, reset it to make it a column
                 if df.index.name == 'timestamp':
                     df = df.reset_index()
-                # If timestamp is still not a column, check for alternative column names
-                elif 'time' in df.columns:
-                    df = df.rename(columns={'time': 'timestamp'})
-                elif 'date' in df.columns:
-                    df = df.rename(columns={'date': 'timestamp'})
-                elif 'datetime' in df.columns:
-                    df = df.rename(columns={'datetime': 'timestamp'})
                 else:
-                    # If no suitable column is found, use the first column as timestamp
-                    df = df.reset_index()
-                    df = df.rename(columns={df.columns[0]: 'timestamp'})
+                    logger.error(f"No timestamp column in trades data for {base_asset.symbol}")
+                    raise ValueError(f"No timestamp column in trades data for {base_asset.symbol}")
             
-            # Convert timestamp to datetime
+            # Convert timestamp
             df['timestamp'] = pd.to_datetime(df['timestamp'])
+            if df['timestamp'].dt.tz is None:
+                df['timestamp'] = df['timestamp'].dt.tz_localize(tzinfo)
+            else:
+                df['timestamp'] = df['timestamp'].dt.tz_convert(tzinfo)
+            
+            # Set as index
+            df.set_index('timestamp', inplace=True)
+            
+            # Remove duplicates
+            if not df.empty:
+                df = df[~df.index.duplicated(keep='last')]
+            
+            return df
             
         except Exception as e:
-            logger.warning(f"Error processing dataframe: {e}. Creating empty dataframe.")
-            # Return an empty dataframe with the right structure based on the API response
-            df = pd.DataFrame(columns=['timestamp', 'price', 'size'])
-            # Initialize with empty values to avoid timestamp conversion error
-            df['timestamp'] = []
-            
-        # Sometime there are duplicated records due to the nature of the HFT data
-        # We need to drop them
-        if not df.empty:
-            original_count = len(df)
-            df = df[~df.timestamp.duplicated(keep='last')]
-            duplicates = original_count - len(df)
-            
-            if duplicates > 0:
-                self._data_quality_tracker.record_invalid_data(duplicates=duplicates)
-                logger.debug(f"Removed {duplicates} duplicate trade records")
-            
-            # Ensure we have the minimum required columns for trades data
-            required_columns = ['timestamp', 'price', 'size']
-            missing_columns = [col for col in required_columns if col not in df.columns]
-            if missing_columns:
-                logger.error(f"Missing required columns in trades data: {missing_columns}")
-                # Create a minimal DataFrame with required columns
-                df = pd.DataFrame(columns=required_columns)
-                df['timestamp'] = pd.to_datetime([])
-                df['price'] = pd.Series([], dtype=float)
-                df['size'] = pd.Series([], dtype=float)
-            
-            # Validate data types and remove invalid rows
-            if not df.empty:
-                # Remove rows with invalid prices or sizes
-                original_count = len(df)
-                df_clean = df.dropna(subset=['price', 'size'])
-                invalid_na = original_count - len(df_clean)
-                
-                df_valid_price = df_clean[df_clean['price'] > 0]
-                invalid_price = len(df_clean) - len(df_valid_price)
-                
-                df_valid = df_valid_price[df_valid_price['size'] > 0]
-                invalid_size = len(df_valid_price) - len(df_valid)
-                
-                df = df_valid
-                
-                total_invalid = invalid_na + invalid_price + invalid_size
-                if total_invalid > 0:
-                    self._data_quality_tracker.record_invalid_data(
-                        invalid_prices=invalid_price,
-                        invalid_sizes=invalid_size
-                    )
-                    self._data_quality_tracker.record_data_load(
-                        original_count, total_invalid, "invalid prices/sizes"
-                    )
-                    logger.warning(
-                        f"Removed {total_invalid} invalid trade records "
-                        f"({invalid_price} invalid prices, {invalid_size} invalid sizes, {invalid_na} NaN)"
-                    )
-        
-        # Save to cache (parquet is faster than csv for large datasets) only if we have data
-        if not df.empty:
-            df.to_parquet(filepath, index=False)
-            self._save_checksum(filepath)
-            
-            # Store in _data_store (bounded cache)
-            df.set_index('timestamp', inplace=True)
-            self._data_store.set(key, df)
-            
-            memory_mb = self._data_store.get_memory_usage_mb()
-            logger.info(f"Finished fetching and caching data for {key} - {len(df)} trades. Cache memory: {memory_mb:.2f} MB")
-        else:
-            # Store empty DataFrame to avoid repeated attempts
-            empty_df = pd.DataFrame(columns=['price', 'size'])
-            empty_df.index = pd.DatetimeIndex([], name='timestamp')
-            self._data_store.set(key, empty_df)
-            logger.warning(f"No valid trades data available for {key}")
-        
-        return self._data_store.get(key)
+            logger.error(
+                f"Failed to download trades for {base_asset.symbol}: {e}"
+            )
+            raise traceback.format_exc() from e
 
     def _load_ohlcv_into_data_store(self, key: str) -> bool:
         """Load OHLCV data from cache into the data store.
@@ -1919,6 +2077,7 @@ class AlpacaBacktesting(DataSourceBacktesting):
         
         Currently only supports stock assets, not crypto.
         """
+        
         if base_asset is None:
             raise ValueError("Base asset must be provided.")
 
@@ -1934,24 +2093,35 @@ class AlpacaBacktesting(DataSourceBacktesting):
         # Store the requested datetime range for filtering
         requested_start = data_datetime_start if data_datetime_start is not None else self._data_datetime_start
         requested_end = data_datetime_end if data_datetime_end is not None else self._data_datetime_end
+        
+        # Trigger memory trimming based on current backtest time
+        if hasattr(self, '_datetime') and self._datetime:
+            dt_pendulum = pendulum.instance(self._datetime) if not isinstance(self._datetime, pendulum.DateTime) else self._datetime
+            cutoff_time = dt_pendulum.subtract(hours=self._trades_memory_window_hours)
+            
+            with self._trades_downloaders_lock:
+                for downloader in self._trades_downloaders.values():
+                    try:
+                        downloader.trim_old_data(cutoff_time)
+                    except Exception as e:
+                        logger.debug(f"Error trimming old data: {e}")
 
         # Use backtest-wide dates for caching (one cache per symbol for entire backtest period)
         cache_start = self._data_datetime_start
         cache_end = self._data_datetime_end
 
-        # Handle list of assets (optimized with list accumulation)
+        # Handle list of assets with PARALLEL downloading
         if isinstance(base_asset, list):
-            all_trades_dfs = []
-            assets = [self._sanitize_base_and_quote_asset(asset, quote_asset) for asset in base_asset]
-
-            # Pre-allocate list for better performance
-            all_trades_dfs = []
+            from concurrent.futures import ThreadPoolExecutor, as_completed
             
-            for asset, quote in assets:
-                self._check_interrupted()  # Check for interruption in loop
-                
-                # Get trades for each asset individually
-                asset_trades_df = self.get_historical_trades_between_dates(
+            logger.debug(f"Processing list of {len(base_asset)} assets in parallel")
+            assets = [self._sanitize_base_and_quote_asset(asset, quote_asset) for asset in base_asset]
+            
+            # Define download function for each asset
+            def download_asset_trades(asset_quote_tuple):
+                asset, quote = asset_quote_tuple
+                self._check_interrupted()
+                return self.get_historical_trades_between_dates(
                     base_asset=asset,
                     quote_asset=quote,
                     market=market,
@@ -1959,16 +2129,33 @@ class AlpacaBacktesting(DataSourceBacktesting):
                     data_datetime_start=requested_start,
                     data_datetime_end=requested_end
                 )
-                
-                if not asset_trades_df.empty:
-                    all_trades_dfs.append(asset_trades_df)
             
-            # Combine all dataframes efficiently (single concat operation)
+            # Download all assets in parallel (max 4 workers to respect API limits)
+            all_trades_dfs = []
+            max_workers = min(len(assets), 4)
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(download_asset_trades, (asset, quote)): asset.symbol 
+                          for asset, quote in assets}
+                
+                for future in as_completed(futures):
+                    symbol = futures[future]
+                    try:
+                        asset_trades_df = future.result()
+                        if not asset_trades_df.empty:
+                            logger.debug(f"Got {len(asset_trades_df)} trades for {symbol}")
+                            all_trades_dfs.append(asset_trades_df)
+                        else:
+                            logger.debug(f"No trades for {symbol}")
+                    except Exception as e:
+                        logger.error(f"Error downloading trades for {symbol}: {e}")
+            
+            # Combine all dataframes efficiently
             if all_trades_dfs:
-                # Use copy=False to avoid unnecessary copying
                 combined_df = pd.concat(all_trades_dfs, axis=0, copy=False)
                 return combined_df.sort_index()
             else:
+                logger.warning(f"No trades data for any asset")
                 return pd.DataFrame()
 
         asset, quote = self._sanitize_base_and_quote_asset(base_asset, quote_asset)
@@ -1987,6 +2174,21 @@ class AlpacaBacktesting(DataSourceBacktesting):
             data_datetime_end=cache_end        # Use backtest-wide dates
         )
 
+        # Use progressive downloader if enabled
+        if self._enable_progressive_trades:
+            # Progressive loading path - data comes from downloader
+            trades_df = self._download_and_cache_trades_data(
+                base_asset=asset,
+                quote_asset=quote,
+                market=market,
+                tzinfo=tzinfo,
+                data_datetime_start=requested_start,  # Request only what we need
+                data_datetime_end=requested_end
+            )
+            
+            return trades_df if not trades_df.empty else pd.DataFrame()
+        
+        # Traditional caching path (when progressive loading is disabled)
         # Thread-safe check and update of refreshed keys
         with self._refreshed_keys_lock:
             need_refresh = self._refresh_cache and trades_key not in self._refreshed_keys

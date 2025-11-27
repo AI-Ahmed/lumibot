@@ -16,3 +16,4 @@ from .schwab_data import SchwabData
 from .bitunix_data import BitunixData
 from .databento_data import DataBentoData
 from .projectx_data import ProjectXData
+from .alpaca_trades_streamer import AlpacaTimeTradesStreamer, MultiSymbolTradesStreamer

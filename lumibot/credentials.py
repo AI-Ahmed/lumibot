@@ -662,3 +662,10 @@ DEFAULT_API_RETRY_MIN_WAIT = 4
 DEFAULT_API_RETRY_MAX_WAIT = 10
 DATA_QUALITY_DROP_THRESHOLD = 0.05  # 5% threshold for data quality warnings
 CACHE_VERSION = "v1"  # For cache invalidation when format changes
+
+# HFT Trades Progressive Loading Configuration
+# Note: For HFT strategies, we work with hours/minutes, not days (days would be millions of records)
+DEFAULT_TRADES_LOOKAHEAD_HOURS = 24  # Download 24 hours ahead of current backtest iteration
+DEFAULT_TRADES_MEMORY_WINDOW_HOURS = 48  # Keep last 48 hours of trades in memory
+DEFAULT_TRADES_CHUNK_SIZE_HOURS = 1  # Download 1 hour of trades at a time (legacy, use MINUTES for HFT)
+ALPACA_HISTORICAL_RATE_LIMIT = 200  # 200 requests per minute for historical data

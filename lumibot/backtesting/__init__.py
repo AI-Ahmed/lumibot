@@ -8,3 +8,4 @@ from .yahoo_backtesting import YahooDataBacktesting
 from .ccxt_backtesting import CcxtBacktesting
 from .interactive_brokers_rest_backtesting import InteractiveBrokersRESTBacktesting
 from .databento_backtesting import DataBentoDataBacktesting
+from .sync_trades_downloader import SyncTradesDownloader, MultiAssetTradesDownloader

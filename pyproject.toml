@@ -5,6 +5,12 @@
 requires = ["setuptools>=61.0", "wheel", "python-dotenv"]
 build-backend = "setuptools.build_meta"
 
+[project]
+name = "lumibot"
+version = "3.18.7"
+description = "Backtesting and Trading Library, Made by Lumiwealth."
+requires-python = ">=3.10"
+
 
 # Ruff is a tool that combines several linters into one including Flake8 and isort.
 # Runs much faster than running them individually.
