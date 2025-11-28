@@ -10,6 +10,8 @@ name = "lumibot"
 version = "3.18.8"
 description = "Backtesting and Trading Library, Made by Lumiwealth."
 requires-python = ">=3.10"
+# Fields defined dynamically in setup.py
+dynamic = ["readme", "license", "authors", "classifiers", "dependencies", "optional-dependencies"]
 
 
 # Ruff is a tool that combines several linters into one including Flake8 and isort.
