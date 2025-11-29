@@ -1178,6 +1178,12 @@ class StrategyExecutor(Thread):
 
         if self.broker.IS_BACKTESTING_BROKER:
             self.broker.process_pending_orders(strategy=self.strategy)
+            # Process the event queue to ensure cash is updated from filled orders
+            # before recalculating portfolio value
+            self.process_queue()
+            # Recalculate portfolio value AFTER orders are filled and cash is updated
+            # This ensures the progress bar shows accurate portfolio value
+            self.strategy._update_portfolio_value()
     
     def _should_continue_trading_loop(self, jobs, is_continuous_market, should_we_stop):
         """Determine if the trading loop should continue based on various conditions"""
@@ -1298,6 +1304,12 @@ class StrategyExecutor(Thread):
 
             if self.broker.IS_BACKTESTING_BROKER:
                 self.broker.process_pending_orders(strategy=self.strategy)
+                # Process the event queue to ensure cash is updated from filled orders
+                # before recalculating portfolio value
+                self.process_queue()
+                # Recalculate portfolio value AFTER orders are filled and cash is updated
+                # This ensures the progress bar shows accurate portfolio value
+                self.strategy._update_portfolio_value()
 
             # Sleep until the next trading iteration
             sleep_result = self._strategy_sleep()

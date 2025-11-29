@@ -258,7 +258,12 @@ class Strategy(_Strategy):
 
         """
 
-        self.update_broker_balances(force_update=False)
+        if self.is_backtesting:
+            # During backtesting, always recalculate for accuracy
+            # This ensures portfolio value reflects the latest positions and prices
+            self._update_portfolio_value()
+        else:
+            self.update_broker_balances(force_update=False)
 
         return self._portfolio_value
 
