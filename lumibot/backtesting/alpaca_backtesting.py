@@ -2061,8 +2061,12 @@ class AlpacaBacktesting(DataSourceBacktesting):
         Returns
         -------
         pandas.DataFrame
-            DataFrame containing the historical trades data indexed by timestamp.
-            If base_asset is a list, returns a concatenated DataFrame with all assets.
+            DataFrame containing the historical trades data.
+            
+            - For a single asset: DataFrame indexed by timestamp with columns
+              [price, size, exchange, trade_id, conditions, tape].
+            - For a list of assets: DataFrame with MultiIndex (symbol, timestamp)
+              and columns [price, size, exchange, trade_id, conditions, tape].
             
         Raises
         ------
@@ -2076,6 +2080,27 @@ class AlpacaBacktesting(DataSourceBacktesting):
         appropriately in their strategy.
         
         Currently only supports stock assets, not crypto.
+        
+        Examples
+        --------
+        Single asset:
+        
+        >>> trades_df = data_source.get_historical_trades_between_dates(
+        ...     base_asset=Asset("AAPL", "stock"),
+        ...     data_datetime_start=start_dt,
+        ...     data_datetime_end=end_dt
+        ... )
+        >>> trades_df.index  # DatetimeIndex
+        
+        Multiple assets:
+        
+        >>> trades_df = data_source.get_historical_trades_between_dates(
+        ...     base_asset=[Asset("AAPL", "stock"), Asset("MSFT", "stock")],
+        ...     data_datetime_start=start_dt,
+        ...     data_datetime_end=end_dt
+        ... )
+        >>> trades_df.index  # MultiIndex (symbol, timestamp)
+        >>> trades_df.loc["AAPL"]  # Get trades for AAPL only
         """
         
         if base_asset is None:
@@ -2117,11 +2142,11 @@ class AlpacaBacktesting(DataSourceBacktesting):
             logger.debug(f"Processing list of {len(base_asset)} assets in parallel")
             assets = [self._sanitize_base_and_quote_asset(asset, quote_asset) for asset in base_asset]
             
-            # Define download function for each asset
+            # Define download function for each asset (returns tuple of symbol and df)
             def download_asset_trades(asset_quote_tuple):
                 asset, quote = asset_quote_tuple
                 self._check_interrupted()
-                return self.get_historical_trades_between_dates(
+                df = self.get_historical_trades_between_dates(
                     base_asset=asset,
                     quote_asset=quote,
                     market=market,
@@ -2129,6 +2154,7 @@ class AlpacaBacktesting(DataSourceBacktesting):
                     data_datetime_start=requested_start,
                     data_datetime_end=requested_end
                 )
+                return asset.symbol, df
             
             # Download all assets in parallel (max 4 workers to respect API limits)
             all_trades_dfs = []
@@ -2141,19 +2167,32 @@ class AlpacaBacktesting(DataSourceBacktesting):
                 for future in as_completed(futures):
                     symbol = futures[future]
                     try:
-                        asset_trades_df = future.result()
+                        returned_symbol, asset_trades_df = future.result()
                         if not asset_trades_df.empty:
-                            logger.debug(f"Got {len(asset_trades_df)} trades for {symbol}")
+                            # Add symbol column for MultiIndex creation
+                            asset_trades_df = asset_trades_df.copy()
+                            asset_trades_df['symbol'] = returned_symbol
+                            logger.debug(f"Got {len(asset_trades_df)} trades for {returned_symbol}")
                             all_trades_dfs.append(asset_trades_df)
                         else:
                             logger.debug(f"No trades for {symbol}")
                     except Exception as e:
                         logger.error(f"Error downloading trades for {symbol}: {e}")
             
-            # Combine all dataframes efficiently
+            # Combine all dataframes and create MultiIndex (symbol, timestamp)
             if all_trades_dfs:
                 combined_df = pd.concat(all_trades_dfs, axis=0, copy=False)
-                return combined_df.sort_index()
+                
+                # Reset index to make timestamp a column, then create MultiIndex
+                if combined_df.index.name == 'timestamp' or combined_df.index.name is None:
+                    combined_df = combined_df.reset_index()
+                    # Rename index column to 'timestamp' if it's unnamed
+                    if 'index' in combined_df.columns:
+                        combined_df = combined_df.rename(columns={'index': 'timestamp'})
+                
+                # Create MultiIndex (symbol, timestamp)
+                combined_df = combined_df.set_index(['symbol', 'timestamp']).sort_index()
+                return combined_df
             else:
                 logger.warning(f"No trades data for any asset")
                 return pd.DataFrame()
