@@ -1572,6 +1572,80 @@ class Strategy(_Strategy):
         #self.log_message("Warning: `submit_orders` is deprecated, please use `submit_order` instead.")
         return self.submit_order(orders, **kwargs)
 
+    def flush_orders(self):
+        """
+        Manually trigger processing of all pending orders.
+        
+        This convenience method forces the broker to immediately evaluate and execute
+        any pending orders (LIMIT, STOP, STOP_LIMIT, TRAIL) that meet their execution
+        criteria at the current market conditions. This is particularly useful in HFT
+        strategies where you want explicit control over when pending orders are processed.
+        
+        Returns
+        -------
+        None
+        
+        Notes
+        -----
+        - In HFT mode with `hft_immediate_execution=True`, MARKET orders are already
+          filled immediately when submitted via `submit_order()`, so this method
+          primarily processes non-MARKET order types
+        - Safe to call multiple times - only processes orders that are still pending
+        - This method is synchronous and will block until all order processing completes
+        - Only available in backtesting mode (BacktestingBroker)
+        - In live/paper trading, this method has no effect since orders are processed
+          by the broker in real-time
+        
+        Examples
+        --------
+        >>> # Example 1: Simple HFT strategy with mixed order types
+        >>> def on_trading_iteration(self):
+        >>>     # Market orders execute immediately in HFT mode
+        >>>     market_order = self.create_order("SPY", 100, "buy")
+        >>>     self.submit_order(market_order)  # Fills instantly
+        >>>     
+        >>>     # Limit orders remain pending
+        >>>     limit_order = self.create_order("SPY", 50, "buy", limit_price=450.00)
+        >>>     self.submit_order(limit_order)  # Pending until price reaches 450
+        >>>     
+        >>>     # ... more strategy logic ...
+        >>>     
+        >>>     # Force processing of pending orders
+        >>>     self.flush_orders()  # Evaluates limit order at current price
+        
+        >>> # Example 2: HFT strategy with data generator yielding
+        >>> def on_trading_iteration(self):
+        >>>     # Create and submit orders
+        >>>     order = self.create_order("AAPL", 99, "buy")
+        >>>     self.submit_order(order)  # Market order fills immediately
+        >>>     
+        >>>     # Yield data from custom stream (e.g., FPAP bars)
+        >>>     for bar in self.custom_data_stream:
+        >>>         # Process bar data...
+        >>>         pass
+        >>>     
+        >>>     # After yielding, manually flush any pending orders
+        >>>     self.flush_orders()
+        
+        >>> # Example 3: Portfolio strategy with batch order management
+        >>> def on_trading_iteration(self):
+        >>>     # Submit multiple limit orders for different assets
+        >>>     for asset in self.portfolio:
+        >>>         limit_order = self.create_order(asset, qty, "buy", limit_price=target_price)
+        >>>         self.submit_order(limit_order)
+        >>>     
+        >>>     # Check if market conditions changed
+        >>>     if self.should_update_orders():
+        >>>         # Force evaluation of all pending limit orders
+        >>>         self.flush_orders()
+        """
+        # Only BacktestingBroker implements flush_pending_orders
+        if hasattr(self.broker, 'flush_pending_orders'):
+            self.broker.flush_pending_orders(self.name)
+        else:
+            # In live/paper trading, this is a no-op since orders are processed in real-time
+            pass
+
     def wait_for_order_registration(self, order: Order):
         """Wait for the order to be registered by the broker
 

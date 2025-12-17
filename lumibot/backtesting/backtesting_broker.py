@@ -19,12 +19,15 @@ class BacktestingBroker(Broker):
     # Metainfo
     IS_BACKTESTING_BROKER = True
 
-    def __init__(self, data_source, option_source=None, connect_stream=True, max_workers=20, config=None, **kwargs):
+    def __init__(self, data_source, option_source=None, connect_stream=True, max_workers=20, config=None, hft_immediate_execution=False, **kwargs):
         super().__init__(name="backtesting", data_source=data_source,
                          option_source=option_source, connect_stream=connect_stream, **kwargs)
         # Calling init methods
         self.max_workers = max_workers
         self.option_source = option_source
+        
+        # HFT immediate execution mode for market orders
+        self.hft_immediate_execution = hft_immediate_execution
 
         # Legacy strategy.backtest code will always pass in a config even for Brokers that don't need it, so
         # catch it here and ignore it in this class. Child classes that need it should error check it themselves.
@@ -568,6 +571,16 @@ class BacktestingBroker(Broker):
                 wait_until_complete=True,
                 order=order,
             )
+            
+            # HFT Mode: Immediately execute MARKET orders
+            # This simulates real-world HFT where market orders execute instantly
+            # Only applies to simple market orders (not OCO/Bracket/OTO parent orders)
+            if (self.hft_immediate_execution and 
+                order.order_type == Order.OrderType.MARKET and
+                order.order_class in [Order.OrderClass.SIMPLE, None]):
+                
+                # Execute the market order immediately at current market price
+                self._execute_market_order_immediately(order, order.strategy)
 
         # Only an OCO order submits the child orders immediately. Bracket/OTO child orders are not submitted until
         # the parent order is filled
@@ -616,6 +629,13 @@ class BacktestingBroker(Broker):
                     wait_until_complete=True,
                     order=child,
                 )
+                
+                # HFT Mode: Immediately execute MARKET child orders in OCO
+                if (self.hft_immediate_execution and 
+                    child.order_type == Order.OrderType.MARKET):
+                    
+                    # Execute the market child order immediately at current market price
+                    self._execute_market_order_immediately(child, child.strategy)
 
         return order
 
@@ -822,6 +842,111 @@ class BacktestingBroker(Broker):
 
         return trade_cost
 
+    def _get_current_fill_price(self, order):
+        """
+        Get the current fill price for an order during immediate execution.
+        Uses the latest available price from the data source.
+        
+        Parameters
+        ----------
+        order : Order
+            The order to get the fill price for
+            
+        Returns
+        -------
+        float or None
+            The current fill price (open price of current bar), or None if price unavailable
+        """
+        asset = order.asset if order.asset.asset_type != "crypto" else (order.asset, order.quote)
+        
+        # Determine timeshift based on data source
+        data_source_name = self.data_source.SOURCE.upper()
+        if data_source_name in ["CCXT", "ALPACA"]:
+            # CCXT and Alpaca don't need timeshift - fill at current bar's open
+            timeshift = None
+        elif data_source_name == "YAHOO":
+            # Yahoo requires negative timedelta to get current day
+            timeshift = timedelta(days=-1)
+        else:
+            # PANDAS and others
+            timeshift = None
+        
+        try:
+            # Get OHLC data for current time
+            ohlc = self.data_source.get_historical_prices(
+                asset=asset,
+                length=1,
+                quote=order.quote,
+                timeshift=timeshift,
+            )
+            
+            if ohlc is None or ohlc.df.empty:
+                logger.warning(f"No price data available for immediate fill of order {order.identifier}")
+                return None
+            
+            # Use open price for market orders (simulates immediate market execution)
+            return float(ohlc.df['open'].iloc[-1])
+            
+        except Exception as e:
+            logger.error(f"Error getting current fill price for order {order.identifier}: {e}")
+            return None
+
+    def _execute_market_order_immediately(self, order, strategy):
+        """
+        Execute a market order immediately in HFT mode.
+        
+        This method fills market orders synchronously at the current market price,
+        simulating real-world HFT execution where market orders execute instantly.
+        Transaction costs (TradingFee) are applied during the fill process.
+        
+        Parameters
+        ----------
+        order : Order
+            The market order to execute immediately
+        strategy : Strategy
+            The strategy that submitted the order
+            
+        Returns
+        -------
+        bool
+            True if order was successfully filled, False otherwise
+            
+        Notes
+        -----
+        - Only MARKET orders should be passed to this method
+        - Fills at the current bar's open price (simulates instant execution)
+        - Transaction costs are automatically applied via the standard fill logic
+        - Order validation (cash, position checks) must be done before calling
+        """
+        # Get current fill price
+        fill_price = self._get_current_fill_price(order)
+        
+        if fill_price is None:
+            logger.error(f"Cannot immediately fill order {order.identifier}: No price data available")
+            order.status = "error"
+            order.error_message = "No price data available for immediate fill"
+            return False
+        
+        # Calculate filled quantity (for market orders, always fill the full quantity)
+        filled_quantity = abs(order.quantity)
+        
+        # Generate batch ID for this immediate execution
+        batch_id = str(uuid.uuid4())
+        
+        # Dispatch fill event synchronously (wait_until_complete=True)
+        # This ensures the order is fully processed before returning
+        self.stream.dispatch(
+            self.FILLED_ORDER,
+            wait_until_complete=True,  # Synchronous execution for HFT
+            order=order,
+            price=fill_price,
+            filled_quantity=filled_quantity,
+            batch_id=batch_id,
+        )
+        
+        logger.debug(f"Immediately filled market order {order.identifier} at ${fill_price:.2f}")
+        return True
+
     def process_pending_orders(self, strategy):
         """Used to evaluate and execute open orders in backtesting.
 
@@ -1023,6 +1148,39 @@ class BacktestingBroker(Broker):
                 )
             else:
                 continue
+
+    def flush_pending_orders(self, strategy):
+        """
+        Manually trigger processing of all pending orders.
+        
+        This method provides explicit control over when pending orders are evaluated
+        and executed in backtesting. It's particularly useful in HFT strategies where
+        you want to ensure all pending orders are processed at specific points in your
+        trading logic.
+        
+        Parameters
+        ----------
+        strategy : Strategy
+            The strategy whose pending orders should be processed
+            
+        Notes
+        -----
+        - This method is a convenience wrapper around `process_pending_orders()`
+        - In HFT mode with `hft_immediate_execution=True`, MARKET orders are already
+          filled immediately when submitted, so this mainly processes LIMIT, STOP,
+          STOP_LIMIT, and TRAIL orders
+        - Safe to call multiple times - only processes orders that are still pending
+        - This method is synchronous and will block until all order processing completes
+        
+        Examples
+        --------
+        >>> # In your strategy's on_trading_iteration:
+        >>> self.submit_order(market_order)  # Fills immediately in HFT mode
+        >>> self.submit_order(limit_order)   # Remains pending
+        >>> # ... more strategy logic ...
+        >>> self.flush_orders()  # Process any pending limit/stop orders
+        """
+        self.process_pending_orders(strategy)
 
     def limit_order(self, limit_price, side, open_, high, low):
         """Limit order logic."""
