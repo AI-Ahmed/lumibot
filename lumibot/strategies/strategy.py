@@ -1641,7 +1641,7 @@ class Strategy(_Strategy):
         """
         # Only BacktestingBroker implements flush_pending_orders
         if hasattr(self.broker, 'flush_pending_orders'):
-            self.broker.flush_pending_orders(self.name)
+            self.broker.flush_pending_orders(self)
         else:
             # In live/paper trading, this is a no-op since orders are processed in real-time
             pass
