@@ -456,6 +456,30 @@ class LumibotLogger(logging.Logger):
         super().__init__(name, level)
 
 
+class ProgressBarAwareHandler(logging.Handler):
+    """
+    Handler that ensures progress bar is cleared before any log output.
+    
+    This handler should be added to the root logger to catch ALL log messages
+    from any package (including external packages like fpap, databento, etc.)
+    and ensure they don't corrupt the progress bar display.
+    """
+    
+    def emit(self, record):
+        """
+        Clear progress bar before any log is emitted.
+        
+        This ensures visual consistency regardless of which package
+        generates the log message.
+        """
+        try:
+            from lumibot.tools.helpers import clear_progress_bar_for_logging
+            clear_progress_bar_for_logging()
+        except ImportError:
+            # If helpers module isn't available, continue without clearing
+            pass
+
+
 class LumibotFormatter(logging.Formatter):
     """
     Custom formatter for Lumibot that provides consistent formatting
@@ -486,6 +510,8 @@ class LumibotFormatter(logging.Formatter):
     
     def format(self, record):
         # Check if we need to clear progress bar before logging
+        # Note: ProgressBarAwareHandler also does this, but we keep it here
+        # as a defensive measure for direct formatter usage
         try:
             from lumibot.tools.helpers import clear_progress_bar_for_logging
             clear_progress_bar_for_logging()
@@ -627,6 +653,21 @@ def _ensure_handlers_configured():
         # Create console handler with our custom formatter
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setFormatter(LumibotFormatter())
+        
+        # Install progress bar aware handler on the Python root logger
+        # This catches ALL log messages from any package
+        python_root_logger = logging.getLogger()
+        
+        # Check if we already have a ProgressBarAwareHandler
+        has_progress_bar_handler = any(
+            isinstance(h, ProgressBarAwareHandler) 
+            for h in python_root_logger.handlers
+        )
+        
+        if not has_progress_bar_handler:
+            progress_bar_handler = ProgressBarAwareHandler()
+            progress_bar_handler.setLevel(logging.DEBUG)  # Catch all levels
+            python_root_logger.addHandler(progress_bar_handler)
 
         # Set default level (can be overridden by environment variable)
         default_level = os.environ.get('LUMIBOT_LOG_LEVEL', 'INFO').upper()

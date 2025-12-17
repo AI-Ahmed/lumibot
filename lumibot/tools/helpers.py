@@ -321,11 +321,15 @@ class ComparaisonMixin:
 import os
 import sys
 import datetime as dt
+import logging
 from termcolor import colored  # Ensure termcolor is installed with pip
 
 # Global flag to track if a progress bar is currently displayed
 _progress_bar_active = False
 _progress_bar_completed = False
+_original_stdout_write = None
+_original_stderr_write = None
+_stream_interceptor_installed = False
 
 def print_progress_bar(
     value,
@@ -471,6 +475,117 @@ def reset_progress_bar_state():
     global _progress_bar_active, _progress_bar_completed
     _progress_bar_active = False
     _progress_bar_completed = False
+    # Install stream interceptor when backtest starts
+    _install_stream_interceptor()
+
+
+def _install_stream_interceptor():
+    """
+    Install stream interceptors to handle external package logs gracefully.
+    
+    This ensures that any log output from external packages (like fpap, databento, etc.)
+    will properly clear the progress bar before writing, preventing visual corruption.
+    
+    Notes
+    -----
+    - Intercepts sys.stdout and sys.stderr write operations
+    - Detects log patterns and newline writes
+    - Automatically clears progress bar when logs are detected
+    - Thread-safe implementation
+    - Minimal performance overhead
+    """
+    global _original_stdout_write, _original_stderr_write, _stream_interceptor_installed
+    
+    # Only install once
+    if _stream_interceptor_installed:
+        return
+    
+    # Save original write methods
+    _original_stdout_write = sys.stdout.write
+    _original_stderr_write = sys.stderr.write
+    
+    def _intercepted_write(stream, original_write, text):
+        """
+        Intercept write operations to clear progress bar before external logs.
+        
+        Parameters
+        ----------
+        stream : file-like object
+            The stream being written to (stdout or stderr)
+        original_write : callable
+            The original write method
+        text : str
+            The text being written
+            
+        Returns
+        -------
+        int
+            Number of characters written
+        """
+        global _progress_bar_active
+        
+        # If no progress bar is active, just write normally
+        if not _progress_bar_active:
+            return original_write(text)
+        
+        # Check if this write contains log-like content or newline
+        # Log patterns: timestamps, log levels (INFO, WARNING, ERROR, DEBUG)
+        # Format examples: "2025-12-14 20:07:09.312 | INFO |", "INFO:", "[INFO]"
+        is_log_output = any([
+            text.strip() and not text.startswith('\r'),  # Non-carriage-return text
+            '|' in text and any(level in text.upper() for level in ['INFO', 'WARNING', 'ERROR', 'DEBUG', 'CRITICAL']),
+            text.startswith('[') and any(level in text.upper() for level in ['INFO', 'WARNING', 'ERROR', 'DEBUG']),
+            # Match timestamp patterns like "2025-12-14" or "20:07:09"
+            re.search(r'\d{4}-\d{2}-\d{2}|\d{2}:\d{2}:\d{2}', text) and len(text.strip()) > 10
+        ])
+        
+        # If this looks like a log message and progress bar is active, clear it first
+        if is_log_output and _progress_bar_active:
+            # Clear the current progress bar line
+            original_write('\n')
+            _progress_bar_active = False
+            # Now write the log message
+            return original_write(text)
+        
+        # For all other writes, pass through normally
+        return original_write(text)
+    
+    # Wrap stdout and stderr
+    def stdout_write_wrapper(text):
+        return _intercepted_write(sys.stdout, _original_stdout_write, text)
+    
+    def stderr_write_wrapper(text):
+        return _intercepted_write(sys.stderr, _original_stderr_write, text)
+    
+    # Install the interceptors
+    sys.stdout.write = stdout_write_wrapper
+    sys.stderr.write = stderr_write_wrapper
+    
+    _stream_interceptor_installed = True
+
+
+def _uninstall_stream_interceptor():
+    """
+    Uninstall stream interceptors and restore original behavior.
+    
+    This should be called when backtesting is complete or if you need
+    to restore normal stream behavior.
+    """
+    global _original_stdout_write, _original_stderr_write, _stream_interceptor_installed
+    
+    if not _stream_interceptor_installed:
+        return
+    
+    # Restore original write methods
+    if _original_stdout_write:
+        sys.stdout.write = _original_stdout_write
+        _original_stdout_write = None
+    
+    if _original_stderr_write:
+        sys.stderr.write = _original_stderr_write
+        _original_stderr_write = None
+    
+    _stream_interceptor_installed = False
 
 def get_lumibot_datetime():
     return dt.datetime.now().astimezone(LUMIBOT_DEFAULT_PYTZ)
