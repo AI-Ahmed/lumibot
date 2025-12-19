@@ -487,6 +487,9 @@ def create_institutional_hft_tearsheet(
             parameters=strategy_parameters,
         )
     
+    # =================== SECTION 5.5: POST-PROCESS TEARSHEET FOR RESPONSIVE PARAMETERS ===================
+    _enhance_tearsheet_parameters(tearsheet_file)
+    
     # =================== SECTION 6: CREATE SUPPLEMENTARY REPORTS ===================
     info_driven_file = tearsheet_file.replace('.html', '_information_structure.html')
     create_information_structure_report(info_metrics, aligned_metrics, info_driven_file, bar_type, strat_name)
@@ -506,6 +509,310 @@ def create_institutional_hft_tearsheet(
     # Return result consistent with original indicators.py behavior
     # QuantStats returns DataFrame with to_csv method, just like the original
     return result
+
+
+def _enhance_tearsheet_parameters(tearsheet_file):
+    """
+    Post-process QuantStats tearsheet HTML to enhance parameter display with professional responsive design.
+    
+    Implements:
+    - Responsive font sizing based on content length
+    - Path truncation for long file paths
+    - Tooltip on hover for full values
+    - Professional word-wrapping
+    - Dynamic table layout
+    
+    Parameters
+    ----------
+    tearsheet_file : str
+        Path to the tearsheet HTML file to enhance
+        
+    Notes
+    -----
+    This function modifies the HTML file in-place to add custom CSS and JavaScript
+    for better parameter visualization in the sidebar.
+    """
+    try:
+        # Read the generated HTML
+        with open(tearsheet_file, 'r', encoding='utf-8') as f:
+            html_content = f.read()
+        
+        # CSS for responsive parameter display
+        enhanced_css = """
+        <style>
+        /* =================== ENHANCED PARAMETER TABLE STYLING =================== */
+        /* Only target the Parameters Used table, not other tables in the tearsheet */
+        
+        /* Target only the Parameters Used section */
+        .params-table-enhanced table {
+            width: 100% !important;
+            table-layout: fixed !important;
+            border-collapse: collapse !important;
+        }
+        
+        /* Parameter table cells - only in enhanced section */
+        .params-table-enhanced table td {
+            padding: 8px 6px !important;
+            vertical-align: top !important;
+            position: relative !important;
+        }
+        
+        /* Parameter name column (left) - keep original font size */
+        .params-table-enhanced table td:first-child {
+            width: 40% !important;
+            word-wrap: break-word !important;
+            overflow-wrap: break-word !important;
+            hyphens: auto !important;
+        }
+        
+        /* Parameter value column (right) */
+        .params-table-enhanced table td:last-child {
+            width: 60% !important;
+            position: relative !important;
+        }
+        
+        /* Value wrapper for truncation */
+        .params-table-enhanced table td:last-child .param-value {
+            display: block !important;
+            max-width: 100% !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+            white-space: nowrap !important;
+            line-height: 1.4 !important;
+            cursor: help !important;
+        }
+        
+        /* Long value handling (paths, large numbers) */
+        .params-table-enhanced table td:last-child .param-value.long-value {
+            white-space: normal !important;
+            word-break: break-all !important;
+            font-size: 11px !important;
+            line-height: 1.3 !important;
+        }
+        
+        /* Very long value handling (>100 chars) */
+        .params-table-enhanced table td:last-child .param-value.very-long-value {
+            font-size: 10px !important;
+            max-height: 60px !important;
+            overflow-y: auto !important;
+            white-space: pre-wrap !important;
+            word-break: break-all !important;
+        }
+        
+        /* Tooltip styling */
+        .params-table-enhanced table td:last-child .param-value:hover::after {
+            content: attr(data-full-value) !important;
+            position: absolute !important;
+            left: 0 !important;
+            top: 100% !important;
+            z-index: 1000 !important;
+            background: #2c3e50 !important;
+            color: white !important;
+            padding: 10px 14px !important;
+            border-radius: 6px !important;
+            font-size: 12px !important;
+            white-space: pre-wrap !important;
+            word-break: break-word !important;
+            max-width: 350px !important;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3) !important;
+            margin-top: 4px !important;
+            line-height: 1.5 !important;
+        }
+        
+        /* Path truncation for file paths */
+        .params-table-enhanced table td:last-child .param-value.path-value {
+            font-family: 'Courier New', monospace !important;
+            direction: rtl !important;
+            text-align: left !important;
+            unicode-bidi: plaintext !important;
+            font-size: 11px !important;
+        }
+        
+        /* Numeric value styling - keep normal size */
+        .params-table-enhanced table td:last-child .param-value.numeric-value {
+            font-family: inherit !important;
+        }
+        
+        /* Emoji preservation */
+        .params-table-enhanced table td .param-value {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 
+                         'Helvetica Neue', Arial, sans-serif, 'Apple Color Emoji', 
+                         'Segoe UI Emoji', 'Segoe UI Symbol' !important;
+        }
+        
+        /* Scrollbar styling for very long values */
+        .params-table-enhanced table td:last-child .param-value.very-long-value::-webkit-scrollbar {
+            width: 5px !important;
+            height: 5px !important;
+        }
+        
+        .params-table-enhanced table td:last-child .param-value.very-long-value::-webkit-scrollbar-track {
+            background: #f1f1f1 !important;
+            border-radius: 3px !important;
+        }
+        
+        .params-table-enhanced table td:last-child .param-value.very-long-value::-webkit-scrollbar-thumb {
+            background: #888 !important;
+            border-radius: 3px !important;
+        }
+        
+        .params-table-enhanced table td:last-child .param-value.very-long-value::-webkit-scrollbar-thumb:hover {
+            background: #555 !important;
+        }
+        </style>
+        """
+        
+        # JavaScript for dynamic value classification and truncation
+        enhanced_js = """
+        <script>
+        (function() {
+            'use strict';
+            
+            // Wait for DOM to be fully loaded
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', enhanceParameters);
+            } else {
+                enhanceParameters();
+            }
+            
+            function enhanceParameters() {
+                // Find the Parameters Used section specifically
+                const allElements = document.querySelectorAll('*');
+                let paramsSection = null;
+                
+                // Look for "Parameters Used" heading or table
+                for (let elem of allElements) {
+                    const text = elem.textContent || '';
+                    if (text.includes('Parameters Used') && 
+                        (elem.tagName === 'H2' || elem.tagName === 'H3' || elem.tagName === 'DIV')) {
+                        paramsSection = elem;
+                        break;
+                    }
+                }
+                
+                // If we found the section, find the table after it
+                let paramsTable = null;
+                if (paramsSection) {
+                    let nextElem = paramsSection.nextElementSibling;
+                    while (nextElem) {
+                        if (nextElem.tagName === 'TABLE') {
+                            paramsTable = nextElem;
+                            break;
+                        }
+                        // Check if table is inside a container
+                        const tableInside = nextElem.querySelector('table');
+                        if (tableInside) {
+                            paramsTable = tableInside;
+                            break;
+                        }
+                        nextElem = nextElem.nextElementSibling;
+                    }
+                }
+                
+                // Fallback: look for table with PARAMETER/VALUE headers
+                if (!paramsTable) {
+                    const tables = document.querySelectorAll('table');
+                    for (let table of tables) {
+                        const headers = table.querySelectorAll('th');
+                        for (let header of headers) {
+                            const headerText = header.textContent.trim().toUpperCase();
+                            if (headerText === 'PARAMETER' || headerText === 'VALUE') {
+                                paramsTable = table;
+                                break;
+                            }
+                        }
+                        if (paramsTable) break;
+                    }
+                }
+                
+                if (!paramsTable) {
+                    console.log('⚠️ Parameters table not found, skipping enhancement');
+                    return;
+                }
+                
+                // Wrap the table in a special container for targeted styling
+                if (!paramsTable.parentElement.classList.contains('params-table-enhanced')) {
+                    const wrapper = document.createElement('div');
+                    wrapper.className = 'params-table-enhanced';
+                    paramsTable.parentNode.insertBefore(wrapper, paramsTable);
+                    wrapper.appendChild(paramsTable);
+                }
+                
+                // Process only this table
+                const rows = paramsTable.querySelectorAll('tr');
+                
+                rows.forEach(row => {
+                    const cells = row.querySelectorAll('td');
+                    if (cells.length >= 2) {
+                        const valueCell = cells[cells.length - 1];
+                        const originalValue = valueCell.textContent.trim();
+                        
+                        // Skip if already processed
+                        if (valueCell.querySelector('.param-value')) {
+                            return;
+                        }
+                        
+                        // Create wrapper span
+                        const wrapper = document.createElement('span');
+                        wrapper.className = 'param-value';
+                        wrapper.setAttribute('data-full-value', originalValue);
+                        
+                        // Classify and truncate value
+                        let displayValue = originalValue;
+                        const valueLength = originalValue.length;
+                        
+                        // Path detection (contains / or \\)
+                        if (originalValue.includes('/') || originalValue.includes('\\\\')) {
+                            wrapper.classList.add('path-value');
+                            
+                            // Truncate path intelligently - show last 2 parts
+                            if (valueLength > 60) {
+                                const parts = originalValue.split(/[\\/\\\\]/);
+                                if (parts.length > 3) {
+                                    displayValue = '.../' + parts.slice(-2).join('/');
+                                }
+                                wrapper.classList.add('long-value');
+                            }
+                        }
+                        // Numeric detection
+                        else if (!isNaN(originalValue) || /^[\\d,\\.]+$/.test(originalValue)) {
+                            wrapper.classList.add('numeric-value');
+                        }
+                        // Long text handling
+                        else if (valueLength > 100) {
+                            wrapper.classList.add('very-long-value');
+                        } else if (valueLength > 60) {
+                            wrapper.classList.add('long-value');
+                        }
+                        
+                        wrapper.textContent = displayValue;
+                        valueCell.textContent = '';
+                        valueCell.appendChild(wrapper);
+                    }
+                });
+                
+                console.log('✅ Tearsheet parameters enhanced for responsive display');
+            }
+        })();
+        </script>
+        """
+        
+        # Insert enhanced CSS and JS before closing head tag
+        if '</head>' in html_content:
+            html_content = html_content.replace('</head>', f'{enhanced_css}\n{enhanced_js}\n</head>')
+        else:
+            # Fallback: insert at the beginning of body
+            html_content = html_content.replace('<body>', f'<body>\n{enhanced_css}\n{enhanced_js}')
+        
+        # Write enhanced HTML back
+        with open(tearsheet_file, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        
+        logger.info(f"✅ Enhanced tearsheet parameters for responsive display: {tearsheet_file}")
+        
+    except Exception as e:
+        logger.warning(f"Could not enhance tearsheet parameters (non-critical): {e}")
+        # Non-critical error, tearsheet still works without enhancement
 
 
 def create_information_structure_report(
@@ -1254,6 +1561,9 @@ def create_tearsheet(
                 rf=risk_free_rate,
                 parameters=strategy_parameters,
             )
+        
+        # Post-process tearsheet for responsive parameters
+        _enhance_tearsheet_parameters(tearsheet_file)
 
         # Generate supplementary HFT analysis report
         info_driven_file = tearsheet_file.replace('.html', '_information_structure.html')
