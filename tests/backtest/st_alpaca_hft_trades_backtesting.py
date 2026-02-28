@@ -92,6 +92,7 @@ class TradesDataStrategy(Strategy):
         self.position_size = self.parameters.get("position_size", 0.1)  # 10% of portfolio per trade
         self.vwap_threshold = self.parameters.get("vwap_threshold", 0.0001)  # 0.01% threshold for VWAP crossover
         self.allow_short = self.parameters.get("allow_short", False)  # Default to not allowing short positions
+        self.min_hold_bars = self.parameters.get("min_hold_bars", 1)  # Min bars to hold before selling (prevents fast flip-flop)
         
         # Per-symbol indicator storage for multi-asset HFT
         self.last_vwaps = {}  # {symbol: vwap_value}
@@ -105,6 +106,10 @@ class TradesDataStrategy(Strategy):
         self.sell_signals_count = 0
         self.buy_signals_count = 0
         
+        # Track bar index when each symbol was last bought (for min_hold_bars)
+        self._last_buy_bar_index = {}  # {symbol: bar_index}
+        self._iteration_count = 0
+        
     def on_trading_iteration(self):
         """Main trading logic executed on each iteration.
         
@@ -113,6 +118,7 @@ class TradesDataStrategy(Strategy):
         2. Computes per-symbol volume bars and VWAP
         3. Makes independent trading decisions per symbol
         """
+        self._iteration_count += 1
         # Get the current datetime
         current_dt = self.get_datetime()
         
@@ -229,8 +235,11 @@ class TradesDataStrategy(Strategy):
                 'Volume': 'sum'
             }).reset_index(drop=True)
             
-            # Drop the first level of columns
+            # Drop the first level of columns (e.g. Price.open -> open)
             volume_bar.columns = volume_bar.columns.droplevel(0)
+            # Rename agg result columns: 'last' -> 'timestamp', 'sum' -> 'Volume'
+            # (droplevel(0) leaves 'last', 'open','high','low','close','sum')
+            volume_bar = volume_bar.rename(columns={'last': 'timestamp', 'sum': 'Volume'})
             
             # Log data after groupby
             # self.logger.info(f"After groupby - volume_bar shape: {volume_bar.shape}")
@@ -315,9 +324,9 @@ class TradesDataStrategy(Strategy):
                 if vwap is not None:
                     enhanced['VWAP'] = vwap
             
-            # Add custom HFT indicators
+            # Add custom HFT indicators (use per-symbol signal for multi-asset HFT)
             enhanced['symbol'] = symbol
-            enhanced['strategy_signal'] = self.last_signal if self.last_signal else 'none'
+            enhanced['strategy_signal'] = self.last_signals.get(symbol, self.last_signal or 'none')
             
             # Add price momentum indicator
             if 'close' in enhanced.columns and len(enhanced) > 1:
@@ -690,17 +699,41 @@ class TradesDataStrategy(Strategy):
                 order = self.create_order(symbol, buy_quantity, "buy")
                 self.submit_order(order)
                 
-                # Update per-symbol signal tracking
+                # Update per-symbol signal tracking and hold-period tracking
                 self.last_signals[symbol] = "buy"
                 self.last_signal = "buy"  # Legacy support
+                self._last_buy_bar_index[symbol] = self._iteration_count
         
         elif signal == "sell":
             self.logger.info(f"🔴 [{symbol}] SELL SIGNAL detected: Price=${last_price:.2f}, VWAP=${vwap:.2f}, Position={position_quantity}")
             
-            # Close any existing long position first
+            # CRITICAL: Never create sell order when position <= 0 and shorts not allowed (short-selling prevention)
+            if position_quantity <= 0 and not self.allow_short:
+                self.logger.debug(f"[{symbol}] Sell signal ignored: no position (position_quantity={position_quantity})")
+                self.last_signals[symbol] = "sell"
+                self.last_signal = "sell"
+                return
+            
+            # Close any existing long position (with min_hold_bars and short-selling safeguards)
             if position_quantity > 0:
-                self.logger.info(f"🔴 [{symbol}] Closing existing long position of {position_quantity} shares")
-                order = self.create_order(symbol, position_quantity, "sell")
+                # Min hold period: prevent fast selling right after a buy
+                last_buy_bar = self._last_buy_bar_index.get(symbol, 0)
+                bars_held = self._iteration_count - last_buy_bar
+                if bars_held < self.min_hold_bars:
+                    self.logger.info(
+                        f"🔴 [{symbol}] SELL signal held: min_hold_bars={self.min_hold_bars}, "
+                        f"bars_held={bars_held} (skip fast sell)"
+                    )
+                    return
+                
+                # Use integer quantity for stocks (avoids fractional-share edge cases)
+                sell_quantity = max(1, int(round(position_quantity)))
+                if sell_quantity <= 0:
+                    self.logger.warning(f"[{symbol}] Invalid sell quantity {sell_quantity}, skipping")
+                    return
+                    
+                self.logger.info(f"🔴 [{symbol}] Closing existing long position of {sell_quantity} shares")
+                order = self.create_order(symbol, sell_quantity, "sell")
                 self.submit_order(order)
                 
                 # Update per-symbol signal tracking
@@ -768,6 +801,7 @@ if __name__ == "__main__":
             "allow_short": False,  # Set to False to prevent short positions
             "position_size": 0.1,
             "vwap_threshold": 0.001,  # Increased from 0.0001 to 0.001 (0.1%) for more realistic signals
+            "min_hold_bars": 1,  # Min bars before selling (1=can sell next bar; 2+=prevents fast flip-flop)
         },
         benchmark_asset="SPY",
         risk_free_rate=0.025,
