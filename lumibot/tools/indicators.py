@@ -1,8 +1,10 @@
 import contextlib
 import math
-import numpy as np
 import os
+import re
 import webbrowser
+
+import numpy as np
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
@@ -91,6 +93,25 @@ def sharpe(_df, risk_free_rate):
     return sharpe
 
 
+def sortino(_df, risk_free_rate):
+    """Calculate the Sortino ratio: (CAGR - risk_free_rate) / downside deviation.
+    The dataframe _df must include a column "return" that
+    has the return for that time period (eg. daily).
+    """
+    ret = cagr(_df)
+    df = _df.copy()
+    df = df.sort_index(ascending=True)
+    downside = df["return"][df["return"] < 0]
+    if downside.empty or downside.std() == 0:
+        return 0.0
+    start = datetime.fromtimestamp(df.index.values[0].astype("O") / 1e9, pytz.UTC)
+    end = datetime.fromtimestamp(df.index.values[-1].astype("O") / 1e9, pytz.UTC)
+    period_years = max((end - start).days / 365.25, 1e-9)
+    ratio_to_annual = df["return"].count() / period_years
+    downside_vol = downside.std() * math.sqrt(ratio_to_annual)
+    return (ret - risk_free_rate) / downside_vol
+
+
 def max_drawdown(_df):
     """Calculate the Max Drawdown, or the biggest percentage drop
     from peak to trough.
@@ -128,6 +149,87 @@ def romad(_df):
         return 0
     romad = ret / mdd["drawdown"]
     return romad
+
+
+def longest_drawdown_days(_df):
+    """Calculate the longest drawdown period in number of days (or observations).
+    The dataframe _df must include a column "return" that has the return for that time period.
+    Returns the length of the longest contiguous period where equity was below the running peak.
+    """
+    if _df is None or _df.shape[0] < 2:
+        return 0
+    df = _df.copy()
+    df = df.sort_index(ascending=True)
+    df["cum_return"] = (1 + df["return"]).cumprod()
+    df["cum_return_max"] = df["cum_return"].cummax()
+    df["drawdown_pct"] = 1 - df["cum_return"] / df["cum_return_max"]
+    in_dd = df["drawdown_pct"] > 0
+    if not in_dd.any():
+        return 0
+    # Find longest run of True (in drawdown)
+    runs = in_dd.ne(in_dd.shift()).cumsum()
+    run_lengths = in_dd.groupby(runs).sum()
+    return int(run_lengths.max()) if len(run_lengths) > 0 else 0
+
+
+def _returns_series_from_df(_df):
+    """Return a pandas Series of returns for use with quantstats (e.g. PSR)."""
+    if _df is None or _df.empty or "return" not in _df.columns:
+        return None
+    return _df["return"].dropna()
+
+
+def psr(_df, risk_free_rate, periods_per_year=252):
+    """Probabilistic Sharpe Ratio (probability that true SR > 0).
+    Uses quantstats. Returns a float in [0, 1] or 0 if computation fails.
+    """
+    series = _returns_series_from_df(_df)
+    if series is None or len(series) < 2:
+        return 0.0
+    try:
+        return float(qs.stats.probabilistic_sharpe_ratio(series, rf=risk_free_rate, periods=periods_per_year))
+    except Exception:
+        return 0.0
+
+
+def dsr(_df, risk_free_rate, n_trials=100, periods_per_year=252):
+    """Deflated Sharpe Ratio (adjusts for multiple testing).
+    Uses FPAP if available, else returns None (caller may show '—').
+    """
+    series = _returns_series_from_df(_df)
+    if series is None or len(series) < 10:
+        return None
+    sr = sharpe(_df, risk_free_rate)
+    return _compute_dsr_from_series(series, risk_free_rate, periods_per_year, sr_estimates=sr, n_trials=n_trials)
+
+
+def _compute_dsr_from_series(series, risk_free_rate, periods_per_year, sr_estimates=None, n_trials=100):
+    """Compute Deflated Sharpe Ratio from returns series. Uses FPAP if available.
+    sr_estimates: annualized Sharpe (e.g. from QuantStats) for consistency; if None, uses Lumibot sharpe().
+    """
+    if series is None or len(series) < 10:
+        return None
+    try:
+        from fpap.backtests.statistics import compute_dsr, compute_moments
+
+        m1, m2, m3, m4 = compute_moments(series)
+        if sr_estimates is None:
+            _df = pd.DataFrame({"return": series})
+            sr_estimates = sharpe(_df, risk_free_rate)
+        # FPAP compute_dsr: backtest_var is variance of SR estimate; m2 is second moment (variance)
+        backtest_var = m2**2
+        em_sr, dsr_val = compute_dsr(
+            sr_estimates=sr_estimates,
+            backtest_var=backtest_var,
+            sample_length=len(series),
+            N_trials=n_trials,
+            skewness_of_returns=m3,
+            kurtosis_of_returns=m4,
+            freq=periods_per_year,
+        )
+        return float(dsr_val)
+    except Exception:
+        return None
 
 
 def stats_summary(_df, risk_free_rate):
@@ -1180,6 +1282,318 @@ def _enhance_tearsheet_parameters(tearsheet_file):
         # Non-critical error, tearsheet still works without enhancement
 
 
+def _get_quantstats_metrics_for_summary(strategy_ser, benchmark_ser, risk_free_rate):
+    """
+    Prepare strategy and benchmark exactly like QuantStats html(), call metrics(),
+    and return mtrx plus resolved benchmark/strategy column names.
+
+    Uses quantstats_lumi private APIs (_prepare_returns, _prepare_benchmark, _match_dates).
+    Risk: package upgrades may change these; then Summary/KPM alignment could break.
+
+    Returns
+    -------
+    tuple or None
+        (mtrx, b_col, s_col, returns_m, benchmark_m) or None on error.
+        returns_m, benchmark_m are the prepared+matched series (for DSR).
+    """
+    if strategy_ser is None or strategy_ser.empty or benchmark_ser is None or benchmark_ser.empty:
+        return None
+    try:
+        from quantstats_lumi import utils as _qs_utils
+        from quantstats_lumi.reports import _match_dates, metrics as qs_metrics
+
+        # Replicate html() flow: dropna, prepare_returns, prepare_benchmark, match_dates
+        returns = strategy_ser.dropna()
+        if returns.empty:
+            return None
+        returns = _qs_utils._prepare_returns(returns)
+        benchmark = _qs_utils._prepare_benchmark(benchmark_ser, returns.index, risk_free_rate)
+        returns, benchmark = _match_dates(returns, benchmark)
+        if returns.empty or benchmark.empty:
+            return None
+
+        benchmark_title = str(benchmark_ser.name) if getattr(benchmark_ser, "name", None) else "Benchmark"
+        strategy_title = str(strategy_ser.name) if getattr(strategy_ser, "name", None) else "Strategy"
+        benchmark.name = benchmark_title
+        returns.name = strategy_title
+
+        result = qs_metrics(
+            returns=returns,
+            benchmark=benchmark,
+            rf=risk_free_rate,
+            display=False,
+            mode="full",
+            sep=True,
+            internal="True",
+            compounded=True,
+            periods_per_year=365,
+            prepare_returns=False,
+            benchmark_title=benchmark_title,
+            strategy_title=strategy_title,
+        )
+        mtrx = result[2:]
+
+        # Resolve columns by name (order varies)
+        if benchmark_title in mtrx.columns:
+            b_col = benchmark_title
+        elif len(mtrx.columns) >= 2:
+            b_col = mtrx.columns[1] if mtrx.columns[0] == strategy_title else mtrx.columns[0]
+        else:
+            b_col = mtrx.columns[0]
+        if strategy_title in mtrx.columns:
+            s_col = strategy_title
+        elif len(mtrx.columns) >= 2:
+            s_col = mtrx.columns[0] if b_col == mtrx.columns[1] else mtrx.columns[1]
+        else:
+            s_col = mtrx.columns[0]
+        return (mtrx, b_col, s_col, returns, benchmark)
+    except Exception as e:
+        logger.warning(f"Could not get QuantStats metrics for summary: {e}")
+        return None
+
+
+def _inject_benchmark_into_summary_metrics(tearsheet_file, df_stats_final, risk_free_rate):
+    """
+    Post-process the tearsheet HTML so the summary metrics block shows benchmark/strategy
+    for each metric (e.g. Sharpe as 1.72/0.51). Uses QuantStats metrics() for consistency
+    with Key Performance Metrics table. Also appends PSR and DSR rows if computed.
+
+    Summary block must use the same prepared series and metrics contract as QuantStats
+    html() so values match the Key Performance Metrics table.
+
+    Parameters
+    ----------
+    tearsheet_file : str
+        Path to the generated tearsheet HTML file.
+    df_stats_final : pd.DataFrame
+        DataFrame with "strategy" and "benchmark" columns (return series).
+    risk_free_rate : float
+        Annualized risk-free rate.
+
+    Notes
+    -----
+    QuantStats html() data flow (must replicate for Summary/KPM alignment):
+    1. if match_dates: returns = returns.dropna()
+    2. returns = _utils._prepare_returns(returns)
+    3. benchmark = _utils._prepare_benchmark(benchmark, returns.index, rf)
+    4. if match_dates: returns, benchmark = _match_dates(returns, benchmark)
+    5. metrics(returns, benchmark, prepare_returns=False, periods_per_year=365, ...)
+    With prepare_returns=False, metrics() uses the already-prepared series. Column order
+    in mtrx: identify by name (benchmark_title, strategy_title), not by index.
+    Row names: CAGR% (Annual Return), Total Return, Max Drawdown, RoMaD, Longest DD Days,
+    Sharpe, Sortino, Prob. Sharpe Ratio (or Prob. Sharpe Ratio %).
+    """
+    if df_stats_final is None or df_stats_final.empty:
+        return
+    if "strategy" not in df_stats_final.columns or "benchmark" not in df_stats_final.columns:
+        return
+
+    strategy_ser = df_stats_final["strategy"]
+    benchmark_ser = df_stats_final["benchmark"]
+
+    result = _get_quantstats_metrics_for_summary(strategy_ser, benchmark_ser, risk_free_rate)
+    if result is None:
+        return
+    mtrx, b_col, s_col, returns_m, benchmark_m = result
+
+    # Row names: QuantStats uses trailing spaces and %; try variants for robustness
+    ROWS = {
+        "cagr": ("CAGR% (Annual Return)", "CAGR% (Annual Return) "),
+        "total_return": ("Total Return",),
+        "max_drawdown": ("Max Drawdown", "Max Drawdown %"),
+        "romad": ("RoMaD",),
+        "longest_dd": ("Longest DD Days",),
+        "sharpe": ("Sharpe",),
+        "sortino": ("Sortino",),
+        "prob_sr": ("Prob. Sharpe Ratio", "Prob. Sharpe Ratio %"),
+    }
+
+    def _extract(mtrx, row_names, col, as_pct=False):
+        """Extract value from mtrx. If as_pct=True, return decimal (e.g. 0.0655 for 6.55%).
+        Tries each row_name and variants (strip, rstrip) for index lookup.
+        """
+        names = row_names if isinstance(row_names, (list, tuple)) else (row_names,)
+        for rn in names:
+            for row_name in (rn, rn.strip(), rn.rstrip(), rn.replace(" %", "")):
+                try:
+                    if row_name not in mtrx.index:
+                        continue
+                    v = mtrx.loc[row_name, col]
+                    if v == "-" or (isinstance(v, float) and (pd.isna(v) or abs(v) == np.inf)):
+                        return None
+                    s = str(v).replace("%", "").replace(",", "").strip()
+                    if not s or s == "-":
+                        return None
+                    x = float(s)
+                    if as_pct:
+                        return x / 100.0  # QuantStats stores 6.55 for 6.55%
+                    return x
+                except (KeyError, TypeError, ValueError):
+                    continue
+        return None
+
+    def _fmt_pct(bm, st):
+        bm_s = "—" if bm is None else f"{bm * 100:.2f}%"
+        st_s = "—" if st is None else f"{st * 100:.2f}%"
+        return f"{bm_s}/{st_s}"
+
+    def _fmt_num(bm, st, decimals=2):
+        bm_s = "—" if bm is None else f"{bm:.{decimals}f}"
+        st_s = "—" if st is None else f"{st:.{decimals}f}"
+        return f"{bm_s}/{st_s}"
+
+    def _fmt_int(bm, st):
+        bm_s = "—" if bm is None else str(int(bm))
+        st_s = "—" if st is None else str(int(st))
+        return f"{bm_s}/{st_s}"
+
+    annual_ret = _fmt_pct(
+        _extract(mtrx, ROWS["cagr"], b_col, as_pct=True),
+        _extract(mtrx, ROWS["cagr"], s_col, as_pct=True),
+    )
+    total_ret = _fmt_pct(
+        _extract(mtrx, ROWS["total_return"], b_col, as_pct=True),
+        _extract(mtrx, ROWS["total_return"], s_col, as_pct=True),
+    )
+    b_mdd = _extract(mtrx, ROWS["max_drawdown"], b_col, as_pct=True)
+    s_mdd = _extract(mtrx, ROWS["max_drawdown"], s_col, as_pct=True)
+    max_dd = _fmt_pct(b_mdd, s_mdd)  # QuantStats stores negative; show as-is to match KPM
+    romad_val = _fmt_num(
+        _extract(mtrx, ROWS["romad"], b_col),
+        _extract(mtrx, ROWS["romad"], s_col),
+    )
+    longest_dd = _fmt_int(
+        _extract(mtrx, ROWS["longest_dd"], b_col),
+        _extract(mtrx, ROWS["longest_dd"], s_col),
+    )
+    sharpe_val = _fmt_num(
+        _extract(mtrx, ROWS["sharpe"], b_col),
+        _extract(mtrx, ROWS["sharpe"], s_col),
+    )
+    sortino_val = _fmt_num(
+        _extract(mtrx, ROWS["sortino"], b_col),
+        _extract(mtrx, ROWS["sortino"], s_col),
+    )
+    # PSR: QuantStats stores 0–100; display as scale 100 + %
+    b_psr = _extract(mtrx, ROWS["prob_sr"], b_col)
+    s_psr = _extract(mtrx, ROWS["prob_sr"], s_col)
+    psr_bm_s = "—" if b_psr is None else f"{b_psr:.2f}%"
+    psr_st_s = "—" if s_psr is None else f"{s_psr:.2f}%"
+    psr_val = f"{psr_bm_s}/{psr_st_s}"
+
+    # DSR: FPAP returns 0–1; display as scale 100 + %
+    periods_per_year = 365
+    b_sharpe = _extract(mtrx, ROWS["sharpe"], b_col)
+    s_sharpe = _extract(mtrx, ROWS["sharpe"], s_col)
+    b_dsr = _compute_dsr_from_series(
+        benchmark_m, risk_free_rate, periods_per_year, sr_estimates=b_sharpe
+    )
+    s_dsr = _compute_dsr_from_series(
+        returns_m, risk_free_rate, periods_per_year, sr_estimates=s_sharpe
+    )
+    dsr_bm = "—" if b_dsr is None else f"{b_dsr * 100:.2f}%"
+    dsr_st = "—" if s_dsr is None else f"{s_dsr * 100:.2f}%"
+    dsr_val = f"{dsr_bm}/{dsr_st}"
+
+    try:
+        with open(tearsheet_file, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception as e:
+        logger.warning(f"Could not read tearsheet for benchmark summary injection: {e}")
+        return
+
+    right_start = content.find('<div id="right">')
+    params_start = content.find("<!-- Parameters section -->")
+    if right_start == -1 or params_start == -1:
+        return
+
+    block = content[right_start:params_start]
+
+    # Replace h1 (Annual Return) in metric-main. Use \g<1>/\g<3> to avoid \12 being parsed as group 12
+    block = re.sub(
+        r"(<div class=\"metric-main\">.*?<h1>)(.*?)(</h1>)",
+        r"\g<1>" + annual_ret + r"\g<3>",
+        block,
+        count=1,
+        flags=re.DOTALL,
+    )
+
+    # Replace each metric-sub h2 by matching the preceding metric-title (avoids wrong h2 matches)
+    # Note: HTML has class="metric-title">Title <span... so we match metric-title">Title
+    replacements = [
+        (r'(metric-title">Total Return.*?</div>\s*<h2>)(.*?)(</h2>)', total_ret),
+        (r'(metric-title">Max Drawdown.*?</div>\s*<h2>)(.*?)(</h2>)', max_dd),
+        (r'(metric-title">RoMaD.*?</div>\s*<h2>)(.*?)(</h2>)', romad_val),
+        (r'(metric-title">Longest DD Days.*?</div>\s*<h2>)(.*?)(</h2>)', longest_dd),
+        (r'(metric-title">Sharpe.*?</div>\s*<h2>)(.*?)(</h2>)', sharpe_val),
+        (r'(metric-title">Sortino.*?</div>\s*<h2>)(.*?)(</h2>)', sortino_val),
+    ]
+    for pattern, val in replacements:
+        block = re.sub(pattern, r"\g<1>" + val + r"\g<3>", block, count=1, flags=re.DOTALL)
+
+    # Insert PSR and DSR metric-sub divs before closing metric-sub-container
+    # Block ends before "<!-- Parameters section -->", so we match the container's closing </div> and trailing whitespace
+    psr_dsr_html = f"""
+                <div class="metric-sub">
+                    <div class="metric-title">PSR <span class="info-icon" title="Probabilistic Sharpe Ratio: probability that true SR > 0.">&#9432;</span></div>
+                    <h2>{psr_val}</h2>
+                </div>
+                <div class="metric-sub">
+                    <div class="metric-title">DSR <span class="info-icon" title="Deflated Sharpe Ratio: adjusts for multiple testing.">&#9432;</span></div>
+                    <h2>{dsr_val}</h2>
+                </div>
+            </div>
+
+            """
+
+    # Replace the closing </div> of metric-sub-container (last in block) with PSR/DSR divs + same closing
+    # Block excludes the comment; it ends with "            </div>\n\n            " (trailing spaces before comment)
+    old_close = re.compile(
+        r"(\n            </div>\s*\n\s*\n\s*)$",
+        re.MULTILINE,
+    )
+    if old_close.search(block):
+        block = old_close.sub(
+            psr_dsr_html.rstrip() + r"\n\n            ",
+            block,
+            count=1,
+        )
+
+    content = content[:right_start] + block + content[params_start:]
+
+    # Inject DSR row into KPM table so Summary and KPM show same DSR (scale 100 + %)
+    dsr_bm_cell = dsr_bm if dsr_bm != "—" else "-"
+    dsr_st_cell = dsr_st if dsr_st != "—" else "-"
+    dsr_kpm_row = f'<tr><td>DSR</td><td>{dsr_bm_cell}</td><td>{dsr_st_cell}</td></tr>'
+    content = re.sub(
+        r'(<tr><td>Prob\. Sharpe Ratio</td><td>[^<]*</td><td>[^<]*</td></tr>)',
+        r'\1\n' + dsr_kpm_row,
+        content,
+        count=1,
+    )
+
+    # Inject CSS: reduced font size, no truncation, info-icon visible
+    summary_metrics_css = """
+    /* Summary metrics: reduced font size, proportional, no truncation */
+    #right .metric-sub-container { overflow: visible; min-width: 0; }
+    #right .metric-sub { overflow: visible; min-width: 0; }
+    #right .metric-sub h2 { font-size: clamp(0.7em, 1vw, 1.2em); overflow: visible; white-space: nowrap; }
+    #right .metric-main h1 { font-size: clamp(0.9em, 1.5vw, 1.6em); overflow: visible; }
+    #right .metric-sub .metric-title { overflow: visible; }
+    #right .info-icon { pointer-events: auto; position: relative; z-index: 1; }
+    """
+    if "</head>" in content:
+        content = content.replace("</head>", f"<style>{summary_metrics_css}</style>\n</head>", 1)
+    elif "<body>" in content:
+        content = content.replace("<body>", f"<body>\n<style>{summary_metrics_css}</style>", 1)
+
+    try:
+        with open(tearsheet_file, "w", encoding="utf-8") as f:
+            f.write(content)
+    except Exception as e:
+        logger.warning(f"Could not write tearsheet after benchmark summary injection: {e}")
+
+
 def create_tearsheet(
     strategy_df: pd.DataFrame,
     strat_name: str,
@@ -1341,6 +1755,9 @@ def create_tearsheet(
     
     # Post-process tearsheet for responsive parameters
     _enhance_tearsheet_parameters(tearsheet_file)
+
+    # Inject benchmark/strategy summary metrics into the summary block
+    _inject_benchmark_into_summary_metrics(tearsheet_file, df_stats_final, risk_free_rate)
 
     if show_tearsheet:
         url = "file://" + os.path.abspath(str(tearsheet_file))

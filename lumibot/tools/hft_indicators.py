@@ -1475,7 +1475,10 @@ def create_tearsheet(
 
     # =================== USE LUMIBOT'S EXACT DATA PROCESSING ===================
     # Import and use the exact same data processing as indicators.py
-    from .indicators import create_tearsheet as original_create_tearsheet
+    from .indicators import (
+        create_tearsheet as original_create_tearsheet,
+        _inject_benchmark_into_summary_metrics,
+    )
     
     # =================== AUTO-DETECT HFT CHARACTERISTICS ===================
     is_hft = detect_hft_characteristics(strategy_df)
@@ -1564,6 +1567,9 @@ def create_tearsheet(
         
         # Post-process tearsheet for responsive parameters
         _enhance_tearsheet_parameters(tearsheet_file)
+
+        # Inject benchmark/strategy summary metrics into the summary block
+        _inject_benchmark_into_summary_metrics(tearsheet_file, df_final, risk_free_rate)
 
         # Generate supplementary HFT analysis report
         info_driven_file = tearsheet_file.replace('.html', '_information_structure.html')
