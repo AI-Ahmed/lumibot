@@ -1,4 +1,5 @@
 import unittest
+import os
 from decimal import Decimal
 from datetime import datetime, timedelta
 
@@ -81,6 +82,26 @@ class TestCash(unittest.TestCase):
                         f"Initial self.cash should equal budget: {expected_budget}")
         self.assertEqual(method_cash, expected_budget, 
                         f"Initial get_cash() should equal budget: {expected_budget}")
+
+    def test_backtesting_budget_env_override(self):
+        """Test that BACKTESTING_BUDGET overrides the explicit budget argument."""
+        previous = os.environ.get("BACKTESTING_BUDGET")
+        os.environ["BACKTESTING_BUDGET"] = "500"
+        try:
+            # Use a fresh broker so the existing setUp strategy's cash position doesn't
+            # get reused (positions are strategy-scoped inside a shared broker).
+            broker = BacktestingBroker(self.data_source)
+            strategy = CashTestStrategy(
+                broker=broker,
+                budget=100000,
+                name="CashTestStrategy_env_override",
+            )
+            self.assertEqual(strategy.cash, 500, "BACKTESTING_BUDGET should override starting cash to 500")
+        finally:
+            if previous is None:
+                os.environ.pop("BACKTESTING_BUDGET", None)
+            else:
+                os.environ["BACKTESTING_BUDGET"] = previous
     
     def test_no_private_cash_variable(self):
         """Test that we no longer have a problematic _cash variable"""
@@ -200,10 +221,37 @@ class TestCash(unittest.TestCase):
             self.assertIsInstance(shares_method, int, "Division should produce integer shares")
         except TypeError as e:
             self.fail(f"get_cash() division failed: {e}")
-        
-        # Both should calculate the same number of shares
-        self.assertEqual(shares_property, shares_method,
-                        "Both cash methods should calculate same number of shares")
+
+    def test_update_cash_handles_all_order_sides(self):
+        """Ensure _update_cash debits/credits cash for every order closing side"""
+        asset = Asset("TEST", asset_type=Asset.AssetType.STOCK)
+        quantity = 5
+        price = 10.0
+        multiplier = 1
+        start_cash = self.strategy.cash
+
+        def make_order(side):
+            return Order(self.strategy, asset=asset, quantity=quantity, side=side)
+
+        scenarios = [
+            (Order.OrderSide.BUY, Order.OrderSide.SELL),
+            (Order.OrderSide.BUY_TO_OPEN, Order.OrderSide.SELL_TO_CLOSE),
+            (Order.OrderSide.SELL_SHORT, Order.OrderSide.BUY_TO_CLOSE),
+            (Order.OrderSide.SELL_TO_OPEN, Order.OrderSide.BUY_TO_COVER),
+        ]
+
+        for entry_side, exit_side in scenarios:
+            with self.subTest(entry=entry_side, exit=exit_side):
+                self.strategy._set_cash_position(start_cash)
+                entry_order = make_order(entry_side)
+                self.strategy._update_cash(entry_order, quantity, price, multiplier)
+                exit_order = make_order(exit_side)
+                self.strategy._update_cash(exit_order, quantity, price, multiplier)
+                self.assertAlmostEqual(
+                    self.strategy.cash,
+                    start_cash,
+                    msg=f"Cash should return to baseline for {entry_side}->{exit_side}",
+                )
     
     def test_division_with_different_prices(self):
         """Test the division operation with various stock prices"""

@@ -131,6 +131,17 @@ class TestOrderBasics:
         buy_order.avg_fill_price = 50.0
         assert buy_order.get_fill_price() == 50.0
 
+    def test_smart_limit_order_type_in_str(self):
+        asset = Asset("SPY")
+        order = Order(
+            strategy="abc",
+            asset=asset,
+            quantity=10,
+            side="buy",
+            order_type=Order.OrderType.SMART_LIMIT,
+        )
+        assert Order.OrderType.SMART_LIMIT in str(order).lower()
+
     def test_filled(self):
         asset = Asset("SPY")
         order = Order(strategy='abc', asset=asset, side="buy", quantity=100)
@@ -325,4 +336,3 @@ class TestOrderAdvanced:
 
     def test_is_equivalent_status(self):
         assert Order.is_equivalent_status("pending_new", Order.OrderStatus.NEW)
-

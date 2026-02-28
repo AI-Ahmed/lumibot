@@ -1,20 +1,25 @@
 import os
 import re
 import traceback
+import base64
+import json
+import time
+import threading
 from typing import Union
 
 import pandas as pd
-from termcolor import colored
-
-from lumibot.tools.lumibot_logger import get_logger
-from lumibot.brokers import Broker, LumibotBrokerAPIError
-from lumibot.data_sources.tradier_data import TradierData
-from lumibot.entities import Asset, Order, Position
-from lumibot.tools.helpers import create_options_symbol
-from lumibot.trading_builtins import PollingStream
+import requests
 from lumiwealth_tradier import Tradier as _Tradier
 from lumiwealth_tradier.base import TradierApiError
 from lumiwealth_tradier.orders import OrderLeg
+from termcolor import colored
+
+from .broker import Broker, LumibotBrokerAPIError
+from lumibot.data_sources.tradier_data import TradierData
+from lumibot.entities import Asset, Order, Position
+from lumibot.tools.helpers import create_options_symbol
+from lumibot.tools.lumibot_logger import get_logger
+from lumibot.trading_builtins import PollingStream
 
 logger = get_logger(__name__)
 
@@ -32,6 +37,189 @@ class Tradier(Broker):
     """
 
     POLL_EVENT = PollingStream.POLL_EVENT
+
+    # OAuth refresh endpoint (only available for approved Tradier partner apps).
+    _OAUTH_REFRESH_URL = "https://api.tradier.com/v1/oauth/refreshtoken"
+    _OAUTH_REFRESH_SKEW_SECONDS = 60  # Refresh a bit early to avoid edge-of-expiry failures.
+
+    @staticmethod
+    def _decode_base64url_json(payload_str: str) -> dict:
+        """Decode a base64url JSON payload (no padding required)."""
+        if not payload_str:
+            raise ValueError("Empty payload string provided.")
+        missing_padding = len(payload_str) % 4
+        if missing_padding:
+            payload_str += "=" * (4 - missing_padding)
+        decoded_bytes = base64.urlsafe_b64decode(payload_str)
+        return json.loads(decoded_bytes.decode("utf-8"))
+
+    @staticmethod
+    def _is_auth_error(err: Exception) -> bool:
+        msg = str(err or "")
+        # lumiwealth_tradier raises: "Error: 401 - <body>"
+        return "Error: 401" in msg or msg.strip().startswith("401")
+
+    def _oauth_enabled(self) -> bool:
+        return bool(getattr(self, "_oauth_token_payload_b64", None))
+
+    def _oauth_token_needs_refresh(self) -> bool:
+        expires_at = getattr(self, "_oauth_token_expires_at", None)
+        if not expires_at:
+            return False
+        return time.time() >= float(expires_at) - self._OAUTH_REFRESH_SKEW_SECONDS
+
+    def _apply_access_token(self, new_access_token: str) -> None:
+        """Update access token across broker + data source Tradier clients (best-effort)."""
+        if not new_access_token or not isinstance(new_access_token, str):
+            return
+
+        self._tradier_access_token = new_access_token
+
+        def _update_client(client) -> None:
+            if client is None:
+                return
+            try:
+                client.AUTH_TOKEN = new_access_token
+            except Exception:
+                pass
+            for attr in ("account", "orders", "market"):
+                try:
+                    part = getattr(client, attr, None)
+                    if part is None:
+                        continue
+                    part.AUTH_TOKEN = new_access_token
+                    headers = getattr(part, "REQUESTS_HEADERS", None)
+                    if isinstance(headers, dict):
+                        headers["Authorization"] = f"Bearer {new_access_token}"
+                except Exception:
+                    continue
+
+        _update_client(getattr(self, "tradier", None))
+
+        ds = getattr(self, "data_source", None)
+        if ds is not None:
+            try:
+                ds.api_key = new_access_token
+            except Exception:
+                pass
+            _update_client(getattr(ds, "tradier", None))
+
+    def _refresh_oauth_token(self, *, force: bool = False) -> bool:
+        """Refresh Tradier OAuth token if possible. Returns True on successful refresh."""
+        if not self._oauth_enabled():
+            return False
+        if not force and not self._oauth_token_needs_refresh():
+            return False
+
+        lock = getattr(self, "_oauth_refresh_lock", None)
+        if lock is None:
+            self._oauth_refresh_lock = threading.Lock()
+            lock = self._oauth_refresh_lock
+
+        with lock:
+            if not force and not self._oauth_token_needs_refresh():
+                return False
+
+            refresh_token = getattr(self, "_oauth_refresh_token", None)
+            client_id = getattr(self, "_oauth_client_id", None)
+            client_secret = getattr(self, "_oauth_client_secret", None)
+
+            if not refresh_token:
+                logger.warning("[Tradier] TRADIER_REFRESH_TOKEN not configured; OAuth access token may expire.")
+                return False
+            if not client_id or not client_secret:
+                logger.warning("[Tradier] TRADIER_OAUTH_CLIENT_ID / TRADIER_OAUTH_CLIENT_SECRET not configured; cannot refresh OAuth token.")
+                return False
+
+            try:
+                resp = requests.post(
+                    self._OAUTH_REFRESH_URL,
+                    auth=(client_id, client_secret),
+                    data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+                    headers={"Accept": "application/json"},
+                    timeout=15,
+                )
+            except Exception as e:
+                logger.warning(f"[Tradier] OAuth refresh request failed: {e}")
+                return False
+
+            if not resp.ok:
+                logger.warning(f"[Tradier] OAuth refresh failed: {resp.status_code} - {resp.text}")
+                return False
+
+            try:
+                token_json = resp.json()
+            except Exception as e:
+                logger.warning(f"[Tradier] OAuth refresh returned non-JSON response: {e}")
+                return False
+
+            now_ms = int(time.time() * 1000)
+            if token_json.get("issued_at") is None:
+                token_json["issued_at"] = now_ms
+
+            new_access_token = token_json.get("access_token")
+            if not new_access_token:
+                logger.warning("[Tradier] OAuth refresh response missing access_token.")
+                return False
+
+            # Refresh token is typically stable for Tradier partner apps, but handle the case where it changes.
+            new_refresh_token = token_json.get("refresh_token")
+            if new_refresh_token and new_refresh_token != refresh_token:
+                logger.warning("[Tradier] OAuth refresh rotated refresh_token; rotation is not persisted in env vars and may require re-linking later.")
+                self._oauth_refresh_token = new_refresh_token
+
+            expires_in = token_json.get("expires_in")
+            try:
+                issued_at_ms = int(token_json.get("issued_at"))
+                expires_in_s = int(float(expires_in)) if expires_in is not None else None
+                if expires_in_s:
+                    self._oauth_token_expires_at = issued_at_ms / 1000.0 + expires_in_s
+            except Exception:
+                # If we can't parse expiry, keep existing best-effort expiry (or none).
+                pass
+
+            self._apply_access_token(new_access_token)
+            return True
+
+    def _install_oauth_refresh_hooks(self) -> None:
+        """Wrap Tradier API calls to refresh on expiry / 401 (best-effort)."""
+        if not self._oauth_enabled():
+            return
+
+        def _wrap_component(component) -> None:
+            if component is None:
+                return
+            if getattr(component, "_lumibot_oauth_wrapped", False):
+                return
+
+            orig_request = getattr(component, "request", None)
+            if not callable(orig_request):
+                return
+
+            def request_with_refresh(*args, **kwargs):
+                # Proactively refresh if near expiry.
+                self._refresh_oauth_token(force=False)
+                try:
+                    return orig_request(*args, **kwargs)
+                except TradierApiError as e:
+                    # Retry once on auth errors after forcing a refresh.
+                    if self._is_auth_error(e) and self._refresh_oauth_token(force=True):
+                        return orig_request(*args, **kwargs)
+                    raise
+
+            component.request = request_with_refresh
+            component._lumibot_oauth_wrapped = True
+
+        # Broker client
+        client = getattr(self, "tradier", None)
+        for attr in ("account", "orders", "market"):
+            _wrap_component(getattr(client, attr, None))
+
+        # Data source client
+        ds = getattr(self, "data_source", None)
+        ds_client = getattr(ds, "tradier", None) if ds is not None else None
+        for attr in ("account", "orders", "market"):
+            _wrap_component(getattr(ds_client, attr, None))
 
     def __init__(
             self,
@@ -73,9 +261,55 @@ class Tradier(Broker):
             account_number = config["ACCOUNT_NUMBER"]
             paper = config["PAPER"]
 
-        # Check if the user has provided the necessary keys
-        elif access_token is None or account_number is None or paper is None:
-            raise Exception("Please provide a config file or access_token, account_number, and paper")
+        # === Optional OAuth payload support (BotSpot deploy integration) ===
+        # When running in BotSpot, the runtime may receive:
+        # - TRADIER_TOKEN: base64url JSON payload from the OAuth token exchange
+        # - TRADIER_REFRESH_TOKEN: optional (partner apps only)
+        # - TRADIER_OAUTH_CLIENT_ID / TRADIER_OAUTH_CLIENT_SECRET: required to refresh
+        self._oauth_token_payload_b64 = None
+        self._oauth_refresh_token = None
+        self._oauth_client_id = None
+        self._oauth_client_secret = None
+        self._oauth_token_expires_at = None  # epoch seconds
+
+        payload_b64 = None
+        try:
+            if isinstance(config, dict):
+                payload_b64 = config.get("TRADIER_TOKEN") or config.get("OAUTH_PAYLOAD")
+        except Exception:
+            payload_b64 = None
+        payload_b64 = payload_b64 or os.environ.get("TRADIER_TOKEN")
+
+        token_json = None
+        if payload_b64:
+            self._oauth_token_payload_b64 = payload_b64
+            try:
+                token_json = self._decode_base64url_json(payload_b64)
+            except Exception as e:
+                logger.warning(f"[Tradier] Failed to decode TRADIER_TOKEN payload: {e}")
+                token_json = None
+
+        if token_json:
+            # Prefer explicit access_token argument/config; fall back to decoded payload.
+            if not access_token:
+                access_token = token_json.get("access_token") or token_json.get("AUTH_TOKEN")
+
+            self._oauth_refresh_token = os.environ.get("TRADIER_REFRESH_TOKEN") or token_json.get("refresh_token")
+            self._oauth_client_id = os.environ.get("TRADIER_OAUTH_CLIENT_ID")
+            self._oauth_client_secret = os.environ.get("TRADIER_OAUTH_CLIENT_SECRET")
+
+            try:
+                issued_at_ms = int(token_json.get("issued_at") or 0)
+                expires_in_s = int(float(token_json.get("expires_in"))) if token_json.get("expires_in") is not None else None
+                if issued_at_ms and expires_in_s:
+                    self._oauth_token_expires_at = issued_at_ms / 1000.0 + expires_in_s
+            except Exception:
+                # No reliable expiry metadata; refresh-on-401 hook still applies.
+                pass
+
+        # Check if the user has provided the necessary keys (after OAuth extraction)
+        if access_token is None or account_number is None or paper is None:
+            raise Exception("Please provide a config file or access_token, account_number, and paper (or set TRADIER_TOKEN for OAuth)")
 
         # Set the values from the keys
         self._tradier_access_token = access_token
@@ -83,18 +317,25 @@ class Tradier(Broker):
         self._tradier_paper = paper
         self.polling_interval = polling_interval
 
+        # If this is an OAuth token, refresh before building API clients (best-effort).
+        self._refresh_oauth_token(force=False)
+
         # Create the Tradier object
-        self.tradier = _Tradier(account_number, access_token, paper)
+        self.tradier = _Tradier(account_number, self._tradier_access_token, paper)
 
         # Check if the user has provided a data source, if not, create one
         if data_source is None:
             data_source = TradierData(
                 account_number=account_number,
-                access_token=access_token,
+                access_token=self._tradier_access_token,
                 paper=paper,
                 max_workers=max_workers,
                 delay=15 if paper else 0,
             )
+
+        # Install request wrappers before Broker initializes streams/threads.
+        self.data_source = data_source
+        self._install_oauth_refresh_hooks()
 
         super().__init__(
             name="Tradier",
@@ -107,6 +348,30 @@ class Tradier(Broker):
 
         # Override default market setting for Tradier to be NYSE, but still respect config/env if set
         self.market = (config.get("MARKET") if config else None) or os.environ.get("MARKET") or "NYSE"
+
+        # Telemetry counters (best-effort; used by runtime telemetry snapshots).
+        self._telemetry_polls_total = 0
+        self._telemetry_events_dispatched_total = 0
+        self._telemetry_orders_seen_max = 0
+
+    def _safe_stream_dispatch(self, event, **kwargs):
+        """Dispatch an event to the stream if it exists.
+
+        Tradier can run in polling mode and/or with `connect_stream=False`. Order submission and polling must not
+        crash purely because a stream is unavailable.
+        """
+
+        stream = getattr(self, "stream", None)
+        if stream is None:
+            return
+        try:
+            try:
+                self._telemetry_events_dispatched_total += 1
+            except Exception:
+                pass
+            stream.dispatch(event, **kwargs)
+        except Exception:
+            return
 
     def cancel_order(self, order: Order):
         """Cancels an order at the broker. Nothing will be done for orders that are already cancelled or filled."""
@@ -224,7 +489,7 @@ class Tradier(Broker):
             raise ValueError(f"Invalid order type '{order_type}' for multi-leg order.")
 
         # Check if the duration is valid
-        if duration not in ["day", "gtc", "pre", "post"]:   
+        if duration not in ["day", "gtc", "pre", "post"]:
             raise ValueError(f"Invalid duration {duration} for multi-leg order.")
 
         # Check if the price is required
@@ -235,8 +500,11 @@ class Tradier(Broker):
         if len(set([order.asset.symbol for order in orders])) > 1:
             raise ValueError("All orders in a multi-leg order must have the same symbol.")
 
-        # Get the symbol from the first order
-        symbol = orders[0].asset.symbol
+        # Use broker-native class-share notation for the underlying symbol.
+        symbol = self._normalize_symbol_for_broker(
+            orders[0].asset.symbol,
+            asset_type=orders[0].asset.asset_type,
+        )
 
         # Create the legs for the multi-leg order
         legs = []
@@ -265,7 +533,9 @@ class Tradier(Broker):
         )
 
         # Each leg uses a different option asset, just use the base symbol. This matches later Tradier API response.
-        parent_asset = Asset(symbol=symbol)
+        parent_asset = Asset(
+            symbol=self._normalize_symbol_for_internal(symbol, asset_type=Asset.AssetType.STOCK)
+        )
         parent_order = Order(
             identifier=order_response["id"],
             asset=parent_asset,
@@ -285,7 +555,7 @@ class Tradier(Broker):
         parent_order.child_orders = orders
         parent_order.update_raw(order_response)  # This marks order as 'transmitted'
         self._unprocessed_orders.append(parent_order)
-        self.stream.dispatch(self.NEW_ORDER, order=parent_order)
+        self._safe_stream_dispatch(self.NEW_ORDER, order=parent_order)
         return parent_order
 
     def _submit_order(self, order: Order):
@@ -320,7 +590,7 @@ class Tradier(Broker):
                     parent_option_symbol = create_options_symbol(
                         order.asset.symbol, order.asset.expiration, order.asset.right, order.asset.strike
                     ) if order.asset.asset_type == Asset.AssetType.OPTION else None
-                    parent_stock_symbol = order.asset.symbol \
+                    parent_stock_symbol = self._normalize_symbol_for_broker(order.asset.symbol, asset_type=order.asset.asset_type) \
                         if order.asset.asset_type != Asset.AssetType.OPTION else None
 
                     # Add the parent order to the legs list
@@ -348,7 +618,7 @@ class Tradier(Broker):
                     child_option_symbol = create_options_symbol(
                         order.asset.symbol, order.asset.expiration, order.asset.right, order.asset.strike
                     ) if child_order.asset.asset_type == Asset.AssetType.OPTION else None
-                    child_stock_symbol = order.asset.symbol \
+                    child_stock_symbol = self._normalize_symbol_for_broker(order.asset.symbol, asset_type=order.asset.asset_type) \
                         if child_order.asset.asset_type != Asset.AssetType.OPTION else None
 
                     # Create the leg
@@ -375,12 +645,11 @@ class Tradier(Broker):
                     )
                 except TradierApiError as e:
                     msg = colored(f"Error submitting order {order}: {e}", color="red")
-                    self.stream.dispatch(self.ERROR_ORDER, order=order, error_msg=msg)
+                    self._safe_stream_dispatch(self.ERROR_ORDER, order=order, error_msg=msg)
                     return None
 
             elif order.asset is not None and order.asset.asset_type == Asset.AssetType.STOCK:
-                # Make sure the symbol is upper case
-                symbol = order.asset.symbol.upper()
+                symbol = self._normalize_symbol_for_broker(order.asset.symbol, asset_type=order.asset.asset_type)
 
                 # Place the order
                 order_response = self.tradier.orders.order(
@@ -396,7 +665,7 @@ class Tradier(Broker):
 
             elif order.asset is not None and order.asset.asset_type == Asset.AssetType.OPTION:
                 tradier_side = self._lumi_side2tradier(order)
-                stock_symbol = order.asset.symbol
+                stock_symbol = self._normalize_symbol_for_broker(order.asset.symbol, asset_type=order.asset.asset_type)
                 option_symbol = create_options_symbol(
                     order.asset.symbol, order.asset.expiration, order.asset.right, order.asset.strike
                 )
@@ -425,11 +694,11 @@ class Tradier(Broker):
             order.status = Order.OrderStatus.SUBMITTED
             order.update_raw(order_response)  # This marks order as 'transmitted'
             self._unprocessed_orders.append(order)
-            self.stream.dispatch(self.NEW_ORDER, order=order)
+            self._safe_stream_dispatch(self.NEW_ORDER, order=order)
 
         except TradierApiError as e:
             msg = colored(f"Error submitting order {order}: {e}", color="red")
-            self.stream.dispatch(self.ERROR_ORDER, order=order, error_msg=msg)
+            self._safe_stream_dispatch(self.ERROR_ORDER, order=order, error_msg=msg)
 
         return order
 
@@ -498,16 +767,23 @@ class Tradier(Broker):
 
         positions_ret = []
 
+        if strategy is None:
+            strategy_name = "Unknown"
+        elif isinstance(strategy, str):
+            strategy_name = strategy
+        else:
+            strategy_name = getattr(strategy, "name", str(strategy))
+
         # Loop through each row in the dataframe
         for _, row in positions_df.iterrows():
             # Get the symbol/quantity and create the position asset
-            symbol = row["symbol"]
+            symbol = self._normalize_symbol_for_internal(row["symbol"], asset_type=Asset.AssetType.STOCK)
             quantity = row["quantity"]
             asset = Asset.symbol2asset(symbol)  # Parse the symbol. Handles 'stock' and 'option' types
 
             # Create the position
             position = Position(
-                strategy=strategy.name if strategy else "Unknown",
+                strategy=strategy_name,
                 asset=asset,
                 quantity=quantity,
             )
@@ -610,7 +886,7 @@ class Tradier(Broker):
         asset = (
             Asset.symbol2asset(option_symbol)
             if option_symbol and not pd.isna(option_symbol)
-            else Asset.symbol2asset(symbol)
+            else Asset.symbol2asset(self._normalize_symbol_for_internal(symbol, asset_type=Asset.AssetType.STOCK))
         )
 
         # Get the reason_description if it exists
@@ -691,7 +967,7 @@ class Tradier(Broker):
         try:
             df = self.tradier.orders.get_orders()
         except Exception as e:
-            logger.error(f"Error pulling orders from Tradier: {e}")
+            logger.info(f"Error pulling orders from Tradier: {e}", exc_info=True)
             return []
 
         # Check if the dataframe is empty or None
@@ -716,11 +992,30 @@ class Tradier(Broker):
         list[dict]
             A list of dictionaries representing the cleaned order records.
         """
-        # The rounding needs to be cell by cell because OCO orders make the dataframe values inconsistent
-        # and the column types will be set to 'object'
-        rounded_df = df.apply(lambda col: col.map(lambda x: round(x, 2) if isinstance(x, float) else x))
-        cleaned_df = rounded_df.replace({pd.NA: None, pd.NaT: None, float('nan'): None})
-        return cleaned_df.to_dict("records")
+        # NOTE: This code path runs in a long-lived polling loop. Avoid full-DataFrame copies (apply/replace),
+        # which can multiply peak memory when Tradier returns many rows.
+        try:
+            records = df.to_dict("records")
+        except Exception:
+            return []
+
+        cleaned: list[dict] = []
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            out: dict = {}
+            for k, v in rec.items():
+                try:
+                    if isinstance(v, float):
+                        v = round(v, 2)
+                    # Handle pandas missing sentinels (NA/NaT/nan) without materializing full copies.
+                    if v is pd.NA or v is pd.NaT or (isinstance(v, float) and pd.isna(v)) or pd.isna(v):
+                        v = None
+                except Exception:
+                    pass
+                out[k] = v
+            cleaned.append(out)
+        return cleaned
 
     def _lumi_side2tradier(self, order: Order) -> str:
         # Make a copy of the side because we will modify it
@@ -823,6 +1118,11 @@ class Tradier(Broker):
         # status in Tradier.
         # df_orders = self.tradier.orders.get_orders()
         raw_orders = self._pull_broker_all_orders()
+        try:
+            self._telemetry_polls_total += 1
+            self._telemetry_orders_seen_max = max(int(self._telemetry_orders_seen_max), len(raw_orders or []))
+        except Exception:
+            pass
         stored_orders = {x.identifier: x for x in self.get_all_orders()}
         for order_row in raw_orders:
             order = self._parse_broker_order_dict(order_row, strategy_name=self._strategy_name)
@@ -836,20 +1136,13 @@ class Tradier(Broker):
                     # If it is the brokers first iteration then fully process the order because it is likely
                     # that the order was filled/canceled/etc before the strategy started.
                     if self._first_iteration:
-                        if order.status == Order.OrderStatus.FILLED:
+                        # IMPORTANT: Avoid ingesting large historical order lists on startup.
+                        # Tradier can return many closed orders; tracking them all in-memory can OOM long-running
+                        # workers. On the first poll, we only need to reconcile currently-active orders.
+                        if order.is_active() or order.status in {Order.OrderStatus.NEW}:
                             self._process_new_order(order)
-                            self._process_filled_order(order, order.avg_fill_price, order.quantity)
-                        elif order.status == Order.OrderStatus.CANCELED:
-                            self._process_new_order(order)
-                            self._process_canceled_order(order)
-                        elif order.status == Order.OrderStatus.PARTIALLY_FILLED:
-                            self._process_new_order(order)
-                            self._process_partially_filled_order(order, order.avg_fill_price, order.quantity)
-                        elif order.status == Order.OrderStatus.NEW:
-                            self._process_new_order(order)
-                        elif order.status == Order.OrderStatus.ERROR:
-                            self._process_new_order(order)
-                            self._process_error_order(order, order.error_message)
+                        else:
+                            continue
                     else:
                         # Add to order in lumibot.
                         self._process_new_order(order)
@@ -875,7 +1168,7 @@ class Tradier(Broker):
                     if not order.equivalent_status(stored_order):
                         match order.status.lower():
                             case "submitted" | "open":
-                                self.stream.dispatch(self.NEW_ORDER, order=stored_order)
+                                self._safe_stream_dispatch(self.NEW_ORDER, order=stored_order)
                             case "partial_filled":
                                 # Not handled for polling, only dispatch completely filled orders
                                 pass
@@ -905,16 +1198,18 @@ class Tradier(Broker):
                                 # values will be filled in by Tradier, so do not trigger a 'filled' event until
                                 # all the needed data has been populated.
                                 if fill_price is not None and fill_qty is not None:
-                                    self.stream.dispatch(
-                                        self.FILLED_ORDER, order=stored_order, price=fill_price,
-                                        filled_quantity=fill_qty
+                                    self._safe_stream_dispatch(
+                                        self.FILLED_ORDER,
+                                        order=stored_order,
+                                        price=fill_price,
+                                        filled_quantity=fill_qty,
                                     )
                             case "canceled":
-                                self.stream.dispatch(self.CANCELED_ORDER, order=stored_order)
+                                self._safe_stream_dispatch(self.CANCELED_ORDER, order=stored_order)
                             case "error":
                                 default_msg = f"{self.name} encountered an error with order {order.identifier} | {order}"
                                 msg = order_row["reason_description"] if "reason_description" in order_row else default_msg
-                                self.stream.dispatch(self.ERROR_ORDER, order=stored_order, error_msg=msg)
+                                self._safe_stream_dispatch(self.ERROR_ORDER, order=stored_order, error_msg=msg)
                             case "cash_settled":
                                 # Don't know how to detect this case in Tradier.
                                 # Reference: https://documentation.tradier.com/brokerage-api/reference/response/orders
@@ -941,7 +1236,10 @@ class Tradier(Broker):
                 # stopped tracking them. This is particularly true with Paper Trading where orders are not tracked
                 # overnight.
                 if order.is_active():
-                    self.stream.dispatch(self.CANCELED_ORDER, order=order)
+                    self._safe_stream_dispatch(self.CANCELED_ORDER, order=order)
+
+        if self._first_iteration:
+            self._first_iteration = False
 
     def _get_broker_id_from_raw_orders(self, raw_orders):
         ids = []

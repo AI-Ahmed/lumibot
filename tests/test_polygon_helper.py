@@ -1,4 +1,5 @@
 import datetime
+import os
 from pathlib import Path
 
 import numpy as np
@@ -7,6 +8,8 @@ import pytest
 import pytz
 
 from lumibot.entities import Asset
+from lumibot.backtesting import PolygonDataBacktesting
+from lumibot.entities.chains import normalize_option_chains
 from lumibot.tools import polygon_helper as ph
 
 
@@ -20,12 +23,12 @@ class TestPolygonHelpers:
         asset = Asset("SPY")
         timespan = "1D"
         mocker.patch.object(ph, "LUMIBOT_CACHE_FOLDER", tmpdir)
-        expected = tmpdir / "polygon" / "stock_SPY_1D.feather"
+        expected = tmpdir / "polygon" / "stock_SPY_1D.parquet"
         assert ph.build_cache_filename(asset, timespan) == expected
 
         expire_date = datetime.date(2023, 8, 1)
         option_asset = Asset("SPY", asset_type="option", expiration=expire_date, strike=100, right="CALL")
-        expected = tmpdir / "polygon" / "option_SPY_230801_100_CALL_1D.feather"
+        expected = tmpdir / "polygon" / "option_SPY_230801_100_CALL_1D.parquet"
         assert ph.build_cache_filename(option_asset, timespan) == expected
 
         # Bad option asset with no expiration
@@ -130,6 +133,8 @@ class TestPolygonHelpers:
         assert datetime.date(2023, 7, 10) in trading_dates
 
     def test_get_polygon_symbol(self, mocker):
+
+
         polygon_client = mocker.MagicMock()
 
         # ------- Unsupported Asset Type
@@ -171,7 +176,7 @@ class TestPolygonHelpers:
 
     def test_load_data_from_cache(self, tmpdir):
         # Setup some basics
-        cache_file = tmpdir / "stock_SPY_1D.feather"
+        cache_file = tmpdir / "stock_SPY_1D.parquet"
 
         # No cache file
         with pytest.raises(FileNotFoundError):
@@ -191,7 +196,7 @@ class TestPolygonHelpers:
                 ],
             }
         )
-        df.to_feather(cache_file)
+        df.to_parquet(cache_file, engine='pyarrow', compression='snappy')
         df_loaded = ph.load_cache(cache_file)
         assert len(df_loaded)
         assert df_loaded["close"].iloc[0] == 2
@@ -211,14 +216,84 @@ class TestPolygonHelpers:
                 ],
             }
         )
-        df.to_feather(cache_file)
+        df.to_parquet(cache_file, engine='pyarrow', compression='snappy')
         df_loaded = ph.load_cache(cache_file)
         assert len(df_loaded)
         assert df_loaded["close"].iloc[0] == 2
         assert df_loaded.index[0] == pd.DatetimeIndex(["2023-07-01 09:30:00-00:00"])[0]
 
+    def test_validate_cache_skips_splits_when_no_cache_file(self, mocker, tmpdir):
+        asset = Asset("AAPL")
+        cache_file = Path(tmpdir) / "polygon" / "stock_AAPL_1D.parquet"
+        create = mocker.patch.object(ph.PolygonClient, "create")
+
+        force_cache_update = ph.validate_cache(
+            force_cache_update=False,
+            asset=asset,
+            cache_file=cache_file,
+            api_key="test",
+        )
+
+        assert force_cache_update is False
+        create.assert_not_called()
+
+    def test_validate_cache_writes_splits_without_invalidating_on_first_snapshot(self, mocker, tmpdir):
+        asset = Asset("AAPL")
+        cache_file = Path(tmpdir) / "polygon" / "stock_AAPL_1D.parquet"
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"open": [1.0], "close": [1.0]}, index=[pd.Timestamp("2024-01-02")]).to_parquet(
+            cache_file, engine="pyarrow", compression="snappy"
+        )
+
+        fake_client = mocker.MagicMock()
+        fake_client.list_splits.return_value = iter([{"execution_date": "2020-01-01", "split_from": 1, "split_to": 1}])
+        mocker.patch.object(ph.PolygonClient, "create", return_value=fake_client)
+
+        force_cache_update = ph.validate_cache(
+            force_cache_update=False,
+            asset=asset,
+            cache_file=cache_file,
+            api_key="test",
+        )
+
+        assert force_cache_update is False
+        assert cache_file.exists()
+
+        splits_file_path = Path(str(cache_file).rpartition(".parquet")[0] + "_splits.parquet")
+        assert splits_file_path.exists()
+
+    def test_validate_cache_invalidates_when_splits_change(self, mocker, tmpdir):
+        asset = Asset("AAPL")
+        cache_file = Path(tmpdir) / "polygon" / "stock_AAPL_1D.parquet"
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"open": [1.0], "close": [1.0]}, index=[pd.Timestamp("2024-01-02")]).to_parquet(
+            cache_file, engine="pyarrow", compression="snappy"
+        )
+
+        splits_file_path = Path(str(cache_file).rpartition(".parquet")[0] + "_splits.parquet")
+        pd.DataFrame([{"execution_date": "2020-01-01", "split_from": 1, "split_to": 1}]).to_parquet(
+            splits_file_path, engine="pyarrow", compression="snappy"
+        )
+        # Make it "stale" so validate_cache checks Polygon.
+        yesterday = datetime.datetime.now() - datetime.timedelta(days=1)
+        os.utime(splits_file_path, (yesterday.timestamp(), yesterday.timestamp()))
+
+        fake_client = mocker.MagicMock()
+        fake_client.list_splits.return_value = iter([{"execution_date": "2020-01-01", "split_from": 2, "split_to": 1}])
+        mocker.patch.object(ph.PolygonClient, "create", return_value=fake_client)
+
+        force_cache_update = ph.validate_cache(
+            force_cache_update=False,
+            asset=asset,
+            cache_file=cache_file,
+            api_key="test",
+        )
+
+        assert force_cache_update is True
+        assert not cache_file.exists()
+
     def test_update_cache(self, tmpdir):
-        cache_file = Path(tmpdir / "polygon" / "stock_SPY_1D.feather")
+        cache_file = Path(tmpdir / "polygon" / "stock_SPY_1D.parquet")
         df = pd.DataFrame(
             {
                 "close": [2, 3, 4, 5, 6],
@@ -298,6 +373,9 @@ class TestPolygonPriceData:
         mocker.patch.object(ph, "PolygonClient", mock_polyclient)
         mocker.patch.object(ph, "LUMIBOT_CACHE_FOLDER", tmpdir)
 
+        # Mock validate_cache to avoid splits checking complexity - just test caching behavior
+        mocker.patch.object(ph, "validate_cache", return_value=False)
+
         # Options Contracts to return
         option_ticker = "O:SPY230801C00100000"
         mock_polyclient().list_options_contracts.return_value = [FakeContract(option_ticker)]
@@ -306,8 +384,9 @@ class TestPolygonPriceData:
         api_key = "abc123"
         asset = Asset("SPY")
         tz_e = pytz.timezone("US/Eastern")
-        start_date = tz_e.localize(datetime.datetime(2023, 8, 2, 6, 30))  # Include PreMarket
-        end_date = tz_e.localize(datetime.datetime(2023, 8, 2, 13, 0))
+        # Use wide date range to include all mocked data (Aug 1-3)
+        start_date = tz_e.localize(datetime.datetime(2023, 8, 1, 0, 0))
+        end_date = tz_e.localize(datetime.datetime(2023, 8, 4, 0, 0))
         timespan = "minute"
         expected_cachefile = ph.build_cache_filename(asset, timespan)
 
@@ -334,27 +413,28 @@ class TestPolygonPriceData:
         mock_polyclient.create().get_aggs.reset_mock()
         df = ph.get_price_data_from_polygon(api_key, asset, start_date, end_date, timespan)
         assert len(df) == 6
-        assert len(df.dropna()) == 6
+        # Note: After Feb 2025 rewrite, dummy rows for missing dates may be present,
+        # so we don't assert dropna() count
         assert df["close"].iloc[0] == 2
         assert mock_polyclient.create().get_aggs.call_count == 0
 
-        # End time is moved out by a few hours, but it doesn't matter because we have all the data we need
+        # End time is moved to Aug 2 - should filter out Aug 3 data (1 row removed)
         mock_polyclient.create().get_aggs.reset_mock()
         end_date = tz_e.localize(datetime.datetime(2023, 8, 2, 16, 0))
         df = ph.get_price_data_from_polygon(api_key, asset, start_date, end_date, timespan)
-        assert len(df) == 6
+        assert len(df) == 5  # 6 rows minus 1 row from Aug 3 that's now filtered out
         assert mock_polyclient.create().get_aggs.call_count == 0
 
-        # New day, new data
+        # New day, new data - query ONLY Aug 7 (Monday, not in cache)
         mock_polyclient.create().get_aggs.reset_mock()
-        start_date = tz_e.localize(datetime.datetime(2023, 8, 4, 6, 30))
-        end_date = tz_e.localize(datetime.datetime(2023, 8, 4, 13, 0))
+        start_date = tz_e.localize(datetime.datetime(2023, 8, 7, 6, 30))
+        end_date = tz_e.localize(datetime.datetime(2023, 8, 7, 13, 0))
         mock_polyclient.create().get_aggs.return_value = [
-            {"o": 5, "h": 8, "l": 3, "c": 7, "v": 100, "t": 1691136000000},  # 8/2/2023 8am UTC (start - 1day)
-            {"o": 9, "h": 12, "l": 7, "c": 10, "v": 100, "t": 1691191800000},
+            {"o": 5, "h": 8, "l": 3, "c": 7, "v": 100, "t": 1691414400000},  # 8/7/2023 10:00 ET
+            {"o": 9, "h": 12, "l": 7, "c": 10, "v": 100, "t": 1691414460000},  # 8/7/2023 10:01 ET
         ]
         df = ph.get_price_data_from_polygon(api_key, asset, start_date, end_date, timespan)
-        assert len(df) == 6 + 2
+        assert len(df) == 2  # Only Aug 7 data returned due to date filtering
         assert mock_polyclient.create().get_aggs.call_count == 1
 
         # Error case: Polygon returns nothing - like for a future date it doesn't know about
@@ -387,7 +467,7 @@ class TestPolygonPriceData:
         end_date = tz_e.localize(datetime.datetime(2023, 10, 31, 13, 0))  # ~90 days
         df = ph.get_price_data_from_polygon(api_key, asset, start_date, end_date, timespan)
         assert mock_polyclient.create().get_aggs.call_count == 3
-        assert len(df) == 2 + 2 + 2
+        assert len(df) == 5  # 6 rows total, but Aug 1 08:00 is filtered out (before 10:30 query start)
 
     @pytest.mark.parametrize("timespan", ["day", "minute"])
     @pytest.mark.parametrize("force_cache_update", [True, False])
@@ -478,7 +558,10 @@ class TestPolygonPriceData:
         df = ph.get_price_data_from_polygon(api_key, asset, start_date, end_date, timespan, force_cache_update=force_cache_update)
         assert mock_polyclient.create().get_aggs.call_count == 3
         assert expected_cachefile.exists()
-        assert len(df) == 7
+        # For daily data: 7 rows (Aug 1 date matches query start date)
+        # For minute data: 6 rows (Aug 1 08:00 is before query start 10:30)
+        expected_len = 7 if timespan == "day" else 6
+        assert len(df) == expected_len
 
         expected_cachefile.unlink()
 
@@ -533,13 +616,15 @@ class TestPolygonPriceData:
             polygon_client=mock_polyclient,
         )
 
+        normalized_first = normalize_option_chains(result_first)
+
         # Basic checks
-        assert result_first["Multiplier"] == 100
-        assert result_first["Exchange"] == "NYSE"
+        assert normalized_first["Multiplier"] == 100
+        assert normalized_first["Exchange"] == "NYSE"
         # The "CALL" side has the 8/15 contract => strike 400
-        assert result_first["Chains"]["CALL"]["2023-08-15"] == [400]
+        assert normalized_first["Chains"]["CALL"]["2023-08-15"] == [400.0]
         # The "PUT" side => strike 395
-        assert result_first["Chains"]["PUT"]["2023-08-15"] == [395]
+        assert normalized_first["Chains"]["PUT"]["2023-08-15"] == [395.0]
 
         # We called list_options_contracts() exactly twice
         assert mock_polyclient.list_options_contracts.call_count == 2
@@ -554,6 +639,47 @@ class TestPolygonPriceData:
             polygon_client=mock_polyclient,
         )
 
-        # Should return identical data
-        assert result_second == result_first
+        # Should return identical data once normalized
+        assert normalize_option_chains(result_second) == normalized_first
         assert mock_polyclient.list_options_contracts.call_count == 0
+
+    def test_polygon_no_future_bars_before_open(self, monkeypatch):
+        tz = pytz.timezone('America/New_York')
+        now = tz.localize(datetime.datetime(2023, 11, 1, 9, 30))
+        frame = pd.DataFrame(
+            {
+                'open': [377.0, 378.5],
+                'high': [377.5, 379.0],
+                'low': [376.8, 378.2],
+                'close': [377.2, 378.9],
+                'volume': [10_000, 10_500],
+            },
+            index=pd.DatetimeIndex([
+                tz.localize(datetime.datetime(2023, 11, 1, 9, 29)),
+                tz.localize(datetime.datetime(2023, 11, 1, 9, 31)),
+            ]),
+        )
+
+        monkeypatch.setattr(
+            'lumibot.backtesting.polygon_backtesting.polygon_helper.get_price_data_from_polygon',
+            lambda *args, **kwargs: frame,
+        )
+
+        data_source = PolygonDataBacktesting(
+            datetime_start=now - datetime.timedelta(days=1),
+            datetime_end=now + datetime.timedelta(days=1),
+            api_key='dummy',
+        )
+        data_source._datetime = now
+        asset = Asset('SPY')
+        quote = Asset('USD', 'forex')
+
+        bars = data_source.get_historical_prices(
+            asset,
+            length=1,
+            timestep='minute',
+            quote=quote,
+            timeshift=datetime.timedelta(minutes=-1),
+        )
+
+        assert bars.df.index[-1] <= now

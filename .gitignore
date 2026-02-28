@@ -8,6 +8,15 @@
 # Cache files
 lumibot/cache
 *cache*
+!lumibot/tools/backtest_cache.py
+!lumibot/tools/parquet_series_cache.py
+!tests/test_backtest_cache_manager.py
+!tests/backtest/test_ibkr_helper_stale_end_negative_cache.py
+!tests/backtest/test_ibkr_conids_seed_from_v1_for_new_cache_version.py
+!docs/remote_cache.md
+!scripts/bench_ibkr_speed_burner_warm_cache.py
+generated-docs/
+docsrc/_build/
 **/*.pkl
 .pytest*
 
@@ -22,9 +31,12 @@ test_bot.py
 .vscode
 .coverage*
 .env
+.env.local
+.env.*.local
 lumi_tradier
 lumiwealth_tradier
-ThetaTerminal.jar
+/ThetaTerminal.jar
+!lumibot/resources/ThetaTerminal.jar
 pytest.ini
 .secrets/.env
 .secrets/config.py
@@ -50,4 +62,35 @@ data/SRNE_Minute.csv
 .env
 token.json
 schwab_token.json
+
+# AI assistant instruction files (contain local paths)
+CLAUDE.md
+AGENTS.md
+
+# Allow scoped agent instructions for the test suite.
+!tests/AGENTS.md
+
+# Acceptance backtest run artifacts (local + CI)
+tests/backtest/_acceptance_runs/
+tests/backtest/_acceptance_warm_runs/
+
+# Parity + manual run artifacts (local)
+tests/backtest/_parity_runs/
+tests/backtest/_manual_visual_runs/
+
+# Local benchmarks (cache + profiler outputs)
+tests/backtest/_ibkr_speed_burner_cache/
+tests/backtest/_speed_burner_profiles/
+
+# Prod-like local runner output
+backtest_runs/
+
+# Local tool configs (untracked, user-specific)
+context*.json
+!context7.json
+/tests/backtest/_manual_runs
+
+# Local scratch / diagnostics (never commit)
+tmp/
+
 .cursor/

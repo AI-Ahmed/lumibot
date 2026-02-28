@@ -1,6 +1,7 @@
-from decimal import Decimal, getcontext
+from decimal import Decimal
 
 import lumibot.entities as entities
+from lumibot.entities.asset import StrEnum #todo: this should be centralized, and not repeated in Asset and Position
 
 
 class Position:
@@ -26,18 +27,51 @@ class Position:
         The assets that are free in the portfolio. (Crypto: only)
     avg_fill_price : float
         The average fill price of the position.
+    current_price : float
+        The current price of the asset.
+    market_value : float
+        The market value of the position.
+    pnl : float
+        The profit and loss of the position.
+    pnl_percent : float
+        The profit and loss of the position as a percentage of the average fill price.
+    asset_type : str
+        The type of the asset.
+    exchange : str
+        The exchange that the position is on.
+    currency : str
+        The currency that the position is denominated in.
+    multiplier : float
+        The multiplier of the asset.
+    expiration : datetime.date
+        The expiration of the asset. (Options and futures: only). Probably better to use on position.asset
+    strike : float
+        The strike price of the asset. (Options: only). Probably better to use on position.asset
+    option_type : str
+        The type of the option. (Options: only). Probably better to use on position.asset
+    side : PositionSide
+        The side of the position (LONG or SHORT)
     """
 
+    class PositionSide(StrEnum):
+        LONG = "LONG"
+        SHORT = "SHORT"
+
     def __init__(
-            self, 
-            strategy, 
-            asset, 
-            quantity, 
-            orders=None, 
-            hold=0, 
-            available=0, 
+            self,
+            strategy,
+            asset,
+            quantity,
+            orders=None,
+            hold=0,
+            available=0,
             avg_fill_price=None
         ):
+        """Creates a position.
+
+        NOTE: There are some properties that can be assigned to a position entity outside of the constructor (pnl, current_price, etc)
+
+        """
         self.strategy = strategy
         self.asset = asset
         self.symbol = self.asset.symbol
@@ -175,46 +209,148 @@ class Position:
     def add_order(self, order: entities.Order, quantity: Decimal = None):
         """
         Add an order to this position and update the position quantity.
-        
+
         Parameters
         ----------
         order : Order
             The order to add to this position
         quantity : Decimal, optional
             The quantity to add/subtract from position. If None, uses order.quantity.
-            
+
         Notes
         -----
         This method is critical for position tracking. It:
         1. Updates position quantity based on order side (buy/sell)
         2. Adds the order to position history if not already there
         """
-        # If quantity is not provided, use the order's quantity
-        if quantity is None:
-            quantity = Decimal(order.quantity)
-            
-        # For buy orders, add the quantity; for sell orders, subtract it
-        increment = quantity if order.side == "buy" else -quantity
-        
-        # Update position quantity
-        self._quantity += Decimal(increment)
-        
-        # Add order to position history if not already there
+        qty = Decimal(quantity) if quantity is not None else Decimal(order.quantity)
+
+        if order.is_buy_order():
+            increment = qty
+        elif order.is_sell_order():
+            increment = -qty
+        else:
+            increment = qty
+
+        self._quantity += increment
+
         if order not in self.orders:
             self.orders.append(order)
 
     # ========= Serialization methods ===========
+    def to_minimal_dict(self) -> dict:
+        """
+        Return a minimal dictionary representation of the position for progress logging.
+
+        This creates a lightweight representation suitable for real-time progress updates,
+        containing only the essential fields needed to display the position.
+
+        Returns
+        -------
+        dict
+            A minimal dictionary with keys:
+            - asset: Minimal asset dict (from asset.to_minimal_dict())
+            - qty: Position quantity
+            - val: Market value (rounded to 2 decimal places)
+            - pnl: Unrealized P&L (rounded to 2 decimal places)
+
+        Example
+        -------
+        >>> position = Position(strategy="MyStrategy", asset=Asset("AAPL"), quantity=100)
+        >>> position.to_minimal_dict()
+        {'asset': {'symbol': 'AAPL', 'type': 'stock'}, 'qty': 100, 'val': 15000.00, 'pnl': 500.00}
+        """
+        # Get market value
+        market_value = 0.0
+        if hasattr(self, 'market_value') and self.market_value is not None:
+            try:
+                market_value = float(self.market_value)
+            except (TypeError, ValueError):
+                pass
+
+        # Get unrealized P&L
+        pnl = 0.0
+        if hasattr(self, 'pnl') and self.pnl is not None:
+            try:
+                pnl = float(self.pnl)
+            except (TypeError, ValueError):
+                pass
+
+        # Build minimal dict
+        result = {
+            "asset": self.asset.to_minimal_dict() if self.asset and hasattr(self.asset, 'to_minimal_dict') else {"symbol": str(self.symbol)},
+            "qty": float(self.quantity) if self.quantity else 0,
+            "val": round(market_value, 2),
+            "pnl": round(pnl, 2),
+        }
+
+        return result
+
     def to_dict(self):
-        return {
+        """
+        Convert position to dictionary for serialization.
+
+        NOTE: We explicitly exclude internal Python fields and large data fields
+        that can cause DynamoDB 400KB limit errors:
+        - _bars: Historical bar data (can be 1.8MB+)
+        - _raw: Raw broker response data (can be 22KB+)
+        - _asset: Duplicate asset data (5KB+)
+        - Any field starting with underscore (Python internals)
+
+        We ONLY return the essential fields needed for portfolio tracking.
+        """
+
+        # Only return the essential fields - no dynamic attributes
+        # This is a WHITELIST approach - only include what we explicitly want
+        result = {
             "strategy": self.strategy,
-            "asset": self.asset.to_dict(),
+            "asset": self.asset.to_dict() if self.asset else None,
+            "symbol": self.symbol,  # Added symbol field
             "quantity": float(self.quantity),
-            "orders": [order.to_dict() for order in self.orders],
+            "orders": [],  # We'll handle orders specially below
             "hold": self.hold,
             "available": float(self.available) if self.available else None,
             "avg_fill_price": float(self.avg_fill_price) if self.avg_fill_price else None,
         }
-    
+
+        # Add dynamically set fields if they exist (from broker)
+        if hasattr(self, 'current_price'):
+            result['current_price'] = float(self.current_price) if self.current_price else None
+        if hasattr(self, 'market_value'):
+            result['market_value'] = float(self.market_value) if self.market_value else None
+        if hasattr(self, 'pnl'):
+            result['pnl'] = float(self.pnl) if self.pnl else None
+        if hasattr(self, 'pnl_percent'):
+            result['pnl_percent'] = float(self.pnl_percent) if self.pnl_percent else None
+        if hasattr(self, 'asset_type'):
+            result['asset_type'] = self.asset_type
+        if hasattr(self, 'exchange'):
+            result['exchange'] = self.exchange
+        if hasattr(self, 'currency'):
+            result['currency'] = self.currency
+        if hasattr(self, 'multiplier'):
+            result['multiplier'] = self.multiplier
+        if hasattr(self, 'expiration'):  #should probably use position.asset instead
+            result['expiration'] = str(self.expiration) if self.expiration else None
+        if hasattr(self, 'strike'): #should probably use position.asset instead
+            result['strike'] = float(self.strike) if self.strike else None
+        if hasattr(self, 'option_type'): #should probably use position.asset instead
+            result['option_type'] = self.option_type
+        if hasattr(self, 'underlying_symbol'): #should probably use position.asset instead
+            result['underlying_symbol'] = self.underlying_symbol
+
+        # Handle orders carefully - ensure to_dict() is called properly
+        if self.orders:
+            result["orders"] = [order.to_dict() for order in self.orders]
+
+        # DEFENSIVE: Double-check we're not including any underscore fields
+        # This shouldn't be necessary with the whitelist approach, but being safe
+        keys_to_remove = [k for k in result.keys() if k.startswith('_')]
+        for key in keys_to_remove:
+            del result[key]
+
+        return result
+
     @classmethod
     def from_dict(cls, data):
         asset = entities.Asset.from_dict(data["asset"])

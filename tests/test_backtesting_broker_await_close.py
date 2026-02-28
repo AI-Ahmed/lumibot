@@ -117,9 +117,10 @@ class TestBacktestingBrokerAwaitClose(unittest.TestCase):
         # Assertions
         self.broker.process_pending_orders.assert_called_once_with(strategy=self.mock_strategy)
         self.broker.get_time_to_close.assert_called_once()
-        # _update_datetime should be called with 1 because calculated time_to_close is <= 0
-        # but the initial time_to_close was positive.
-        self.broker._update_datetime.assert_called_once_with(1)
+        # When the buffer pushes time_to_close to <= 0, we should not advance the clock off-bar
+        # boundaries (e.g., by nudging +1 second). The broker should simply return after
+        # processing pending orders.
+        self.broker._update_datetime.assert_not_called()
 
     def test_await_close_when_already_past_close_no_buffer(self):
         """Test _await_market_to_close when current time is past market close (no buffer)."""

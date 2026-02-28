@@ -1,0 +1,55 @@
+{
+  "url": "https://context7.com/lumiwealth/lumibot",
+  "public_key": "pk_bX3tXLMxgtW78GRI9cEDE",
+  "projectTitle": "Lumibot",
+  "description": "Python trading and backtesting framework for stocks, options, crypto, and futures. Supports Alpaca, Interactive Brokers, Tradier, Schwab, ThetaData, Yahoo Finance, and Polygon.",
+  "folders": [
+    "."
+  ],
+  "excludeFolders": [
+    "docsrc",
+    "lumibot",
+    "tests",
+    "generated-docs",
+    ".github",
+    "__pycache__",
+    ".pytest_cache",
+    ".git",
+    "docs"
+  ],
+  "excludeFiles": [
+    "*.jar",
+    "*.pyc",
+    "*.pyo",
+    "*.png",
+    "*.webp",
+    "*.jpg",
+    "*.jpeg",
+    "*.gif",
+    "*.py",
+    "*.rst",
+    "*.csv",
+    "*.json",
+    "*.toml",
+    "*.cfg",
+    "*.ini",
+    "*.yml",
+    "*.yaml",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "llms.txt",
+    "requirements*.txt"
+  ],
+  "rules": [
+    "CRITICAL: Never use datetime.now() or datetime.today() in strategies - always use self.get_datetime() for backtesting compatibility",
+    "CRITICAL: Never use 'from __future__ import annotations' - it breaks Lumibot's type checking",
+    "Always use self.vars for persistent variables across lifecycle methods (e.g., self.vars.my_variable = value)",
+    "Use self.log_message() instead of print() for proper logging",
+    "Options trading: Use self.create_asset(symbol, asset_type=Asset.AssetType.OPTION, expiration=date, strike=price, right='call'|'put')",
+    "Backtesting data sources: yahoo, thetadata, polygon - set via BACKTESTING_DATA_SOURCE env var",
+    "Get current prices with self.get_last_price(asset) - returns None if unavailable",
+    "Submit orders with self.submit_order(order) where order = self.create_order(asset, quantity, side)",
+    "Access portfolio with self.portfolio_value, self.cash, self.positions",
+    "Implement on_trading_iteration() for main strategy logic - runs once per bar/iteration"
+  ]
+}

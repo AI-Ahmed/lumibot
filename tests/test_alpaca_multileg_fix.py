@@ -7,10 +7,21 @@ due to incorrect order_class value and missing required fields.
 import pytest
 from unittest.mock import Mock, patch
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 from lumibot.entities.order import Order
 from lumibot.entities.asset import Asset
+from lumibot.entities.smart_limit import SmartLimitConfig, SmartLimitPreset
 from lumibot.brokers.alpaca import Alpaca
+from lumibot.strategies.strategy import Strategy
+
+
+class _StubStrategy(Strategy):
+    def initialize(self, parameters=None):
+        self.sleeptime = "1M"
+
+    def on_trading_iteration(self):
+        return
 
 
 class TestAlpacaMultiLegOrders:
@@ -88,9 +99,9 @@ class TestAlpacaMultiLegOrders:
                 call_args = mock_api.submit_order.call_args
                 order_data = call_args[1]['order_data'] if 'order_data' in call_args[1] else call_args[0][0]
                 
-                # The key fix: order_class should be "multileg", not "mleg"
+                # Alpaca expects the short code "mleg" for multi-leg orders
                 assert hasattr(order_data, 'order_class'), "OrderData should have order_class attribute"
-                assert order_data.order_class == "multileg", f"Expected order_class 'multileg', got '{order_data.order_class}'"
+                assert order_data.order_class == "mleg", f"Expected order_class 'mleg', got '{order_data.order_class}'"
     
     @patch('lumibot.brokers.alpaca.TradingClient')
     def test_multileg_order_has_required_fields(self, mock_trading_client):
@@ -131,7 +142,7 @@ class TestAlpacaMultiLegOrders:
             "qty": "1",
             "side": side,
             "type": "limit",
-            "order_class": "multileg",
+            "order_class": "mleg",
             "time_in_force": "day",
             "legs": [],  # Would be populated in real scenario
             "limit_price": "1.00"
@@ -143,7 +154,7 @@ class TestAlpacaMultiLegOrders:
             assert field in kwargs, f"Missing required field: {field}"
         
         # Test that order_class is the correct value
-        assert kwargs["order_class"] == "multileg", "order_class must be 'multileg' for multi-leg orders"
+        assert kwargs["order_class"] == "mleg", "order_class must be 'mleg' for multi-leg orders"
         
         # Test that symbol is present (fixes missing asset info)
         assert kwargs["symbol"] == "SPY", "symbol field is required for multi-leg orders"
@@ -211,6 +222,70 @@ class TestAlpacaMultiLegOrders:
         with pytest.raises(ValueError, match="limit price is required"):
             # This should raise an error because price is None for a limit order
             broker._submit_multileg_order(orders, order_type="limit", price=None)
+
+    @patch('lumibot.brokers.alpaca.TradingClient')
+    def test_smart_limit_submits_as_limit(self, mock_trading_client):
+        """Smart limit should downgrade to limit before broker submission."""
+        mock_trading_client.return_value = Mock()
+        broker = Alpaca(self.test_config, connect_stream=False)
+        broker._set_initial_positions = Mock()
+        captured = {}
+
+        def _capture_submit(order):
+            captured["order_type"] = order.order_type
+            return order
+
+        broker.submit_order = Mock(side_effect=_capture_submit)
+
+        with patch.object(Strategy, "update_broker_balances", return_value=None):
+            strategy = _StubStrategy(broker=broker, budget=100_000.0, analyze_backtest=False, parameters={})
+            strategy._first_iteration = False
+            strategy.get_quote = Mock(return_value=SimpleNamespace(bid=99.0, ask=101.0))
+
+            asset = Asset("SPY", asset_type=Asset.AssetType.STOCK)
+            config = SmartLimitConfig(preset=SmartLimitPreset.NORMAL)
+            order = strategy.create_order(
+                asset,
+                1,
+                Order.OrderSide.BUY,
+                order_type=Order.OrderType.SMART_LIMIT,
+                smart_limit=config,
+            )
+            strategy.submit_order(order)
+
+        assert captured["order_type"] == Order.OrderType.LIMIT
+
+    @patch('lumibot.brokers.alpaca.TradingClient')
+    def test_smart_limit_downgrades_to_market_without_quotes(self, mock_trading_client):
+        """Smart limit should downgrade to market when bid/ask are missing."""
+        mock_trading_client.return_value = Mock()
+        broker = Alpaca(self.test_config, connect_stream=False)
+        broker._set_initial_positions = Mock()
+        captured = {}
+
+        def _capture_submit(order):
+            captured["order_type"] = order.order_type
+            return order
+
+        broker.submit_order = Mock(side_effect=_capture_submit)
+
+        with patch.object(Strategy, "update_broker_balances", return_value=None):
+            strategy = _StubStrategy(broker=broker, budget=100_000.0, analyze_backtest=False, parameters={})
+            strategy._first_iteration = False
+            strategy.get_quote = Mock(return_value=SimpleNamespace(bid=None, ask=None))
+
+            asset = Asset("SPY", asset_type=Asset.AssetType.STOCK)
+            config = SmartLimitConfig(preset=SmartLimitPreset.NORMAL)
+            order = strategy.create_order(
+                asset,
+                1,
+                Order.OrderSide.BUY,
+                order_type=Order.OrderType.SMART_LIMIT,
+                smart_limit=config,
+            )
+            strategy.submit_order(order)
+
+        assert captured["order_type"] == Order.OrderType.MARKET
 
 
 if __name__ == "__main__":

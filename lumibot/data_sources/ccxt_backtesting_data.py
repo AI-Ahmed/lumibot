@@ -1,17 +1,18 @@
+import logging
+from datetime import datetime, timedelta
 from decimal import Decimal
+from typing import Any, Dict, Union
 
 import numpy as np
 import pytz
-from datetime import timedelta,datetime
-
-from lumibot import LUMIBOT_DEFAULT_PYTZ
-from lumibot.data_sources import DataSourceBacktesting
-from lumibot.entities import Asset, Bars
-
-from lumibot.tools import CcxtCacheDB
 from pandas import DataFrame
 
-from typing import Union, Any, Dict
+logger = logging.getLogger(__name__)
+
+from lumibot.constants import LUMIBOT_DEFAULT_PYTZ
+from lumibot.data_sources import DataSourceBacktesting
+from lumibot.entities import Asset, Bars
+from lumibot.tools import CcxtCacheDB
 
 
 class CcxtBacktestingData(DataSourceBacktesting):
@@ -46,7 +47,7 @@ class CcxtBacktestingData(DataSourceBacktesting):
 
 
     def _to_utc_timezone(self, dt:datetime)->datetime:
-        if not dt.tzinfo is None:
+        if dt.tzinfo is not None:
             dt = dt.astimezone(pytz.utc)
         else:
             dt = pytz.utc.localize(dt)
@@ -249,7 +250,11 @@ class CcxtBacktestingData(DataSourceBacktesting):
         elif bars is None or bars.df.empty:
             return None
 
-        close_ = bars.df.iloc[0].close
+        df_local = bars.df
+        if hasattr(df_local, "iloc"):
+            close_ = df_local["close"].iat[0]
+        else:
+            close_ = df_local["close"][0]
         if isinstance(close_, np.int64):
             close_ = Decimal(close_.item())
         return close_

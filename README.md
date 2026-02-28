@@ -10,6 +10,28 @@
 
 Lumibot is a comprehensive, production-ready algorithmic trading framework designed for quantitative researchers, portfolio managers, and algorithmic traders. Built with modern Python practices, it seamlessly bridges the gap between backtesting and live trading with the same codebase.
 
+**IMPORTANT: This library requires data for backtesting. Our recommended data source is [ThetaData](https://www.thetadata.net/) because they provide the deepest historical coverage we’ve found and directly support BotSpot. Use the promo code `BotSpot10` at checkout for 10% off the first order (the code also tells ThetaData you were referred by us).**
+
+> **Contributor note:** Read `AGENTS.md` before running anything Theta-related. That file spells out the hard rules—never launch ThetaTerminal or the shared downloader locally, always point LumiBot at the AWS-hosted downloader, and wrap all long
+> commands with `/Users/robertgrzesik/bin/safe-timeout`. Breaking these rules kills the only licensed Theta session.
+
+## Architecture Documentation
+
+- `docs/BACKTESTING_ARCHITECTURE.md` - Detailed documentation of the backtesting data flow (Yahoo, ThetaData, Polygon data sources, caching, and data flow diagrams)
+- `docs/ACCEPTANCE_BACKTESTS.md` - Manual end-to-end acceptance backtest suite + performance gate (ThetaData)
+- `docsrc/environment_variables.rst` - Public documentation page for environment variables (update when env vars change)
+- `CHANGELOG.md` - Deployment/release notes (keep this updated)
+- `CLAUDE.md` - AI assistant instructions for working with the codebase
+- `AGENTS.md` - Critical rules for ThetaData and production safety
+
+## Releases / Deployments (internal)
+
+For production deployments (BotSpot / BotManager), keep releases traceable:
+
+- Update `CHANGELOG.md` for every deploy (include the deploy commit hash)
+- Tag the deploy commit as `vX.Y.Z` and push the tag
+- Create a GitHub Release from that tag using the `CHANGELOG.md` entry
+
 ## 🌟 Key Features
 
 - **🔄 Unified Codebase**: Same code for backtesting and live trading
@@ -139,6 +161,7 @@ uv pip install -e ".[all,private]"
 **⚠️ Important: pandas-ta & FPAP Dependency Conflict**
 
 Due to conflicting numpy version requirements, the dependency resolver cannot install both packages simultaneously:
+
 - **FPAP**: Declares `numpy==1.26.4` (pinned version)
 - **pandas-ta**: Requires `numpy>=2.2.6` (newer version)
 
@@ -147,16 +170,19 @@ Due to conflicting numpy version requirements, the dependency resolver cannot in
 **Installation Options:**
 
 1. **FPAP Only** (Recommended for contributors):
+
    ```bash
    uv pip install -e ".[private]"  # Installs FPAP without pandas-ta
    ```
 
 2. **pandas-ta Only** (Public users):
+
    ```bash
    uv pip install -e ".[ta]"       # Installs pandas-ta without FPAP
    ```
 
 3. **Separate Environments** (Advanced users):
+
    ```bash
    # Environment 1: FPAP
    uv venv fpap-env --python 3.12
@@ -294,11 +320,12 @@ Want to build trading bots without code? Check out our new platform [BotSpot](ht
 
 **Visit [BotSpot.trade](https://botspot.trade/sales?utm_source=lumibot+docs&utm_medium=documentation&utm_campaign=GitHub+Readme) to get started building AI-powered trading bots today!**
 
-## Blog
+## Learn More
 
-Our blog has lots of example strategies and shows you how to run a bot using LumiBot. Check the blog out here:
+Check out example strategies and tutorials on our blog, or use our AI agent to build strategies for you:
 
-**https://lumiwealth.com/blog/**
+**Blog:** <https://lumiwealth.com/blog/>
+**AI Strategy Builder:** <https://www.botspot.trade/?utm_source=github&utm_medium=referral&utm_campaign=lumibot_readme>
 
 ## 🚀 Example Strategies & Backtesting
 
@@ -310,6 +337,26 @@ python -m lumibot.example_strategies.stock_buy_and_hold
 ```
 
 ### Example Strategy Repository
+
+You can select a backtesting data source via the `BACKTESTING_DATA_SOURCE` environment variable (this overrides any explicit `datasource_class` in code):
+
+```bash
+# Single-provider backtesting (examples)
+export BACKTESTING_DATA_SOURCE=thetadata
+export BACKTESTING_DATA_SOURCE=ibkr
+```
+
+Multi-provider routing (by asset type) is supported by setting a JSON mapping:
+
+```bash
+# Example: ThetaData for stocks/options/indexes, IBKR for futures/crypto
+export BACKTESTING_DATA_SOURCE='{"default":"thetadata","stock":"thetadata","option":"thetadata","index":"thetadata","future":"ibkr","crypto":"ibkr"}'
+
+# Example: route crypto to CCXT via a specific exchange id (if desired)
+export BACKTESTING_DATA_SOURCE='{"default":"thetadata","crypto":"coinbase"}'
+```
+
+## Run an Example Strategy
 
 Explore our comprehensive example strategy: **[Stock Example Algorithm](https://github.com/Lumiwealth-Strategies/stock_example_algo)**
 
@@ -414,6 +461,7 @@ pip install -e ".[private]"
 ### 🏗️ Build System
 
 Our build system supports:
+
 - **Dynamic dependency resolution** based on Python version
 - **Private package integration** for authorized contributors
 - **Modern Python packaging** with `pyproject.toml` and `setuptools`
@@ -458,6 +506,13 @@ POLYGON_API_KEY=your_polygon_key
 - **Integration Tests**: Broker and data source integration
 - **Backtest Tests**: Strategy backtesting validation
 - **Performance Tests**: Speed and memory benchmarks
+
+## Remote Cache Configuration
+
+Lumibot can mirror its local parquet caches to AWS S3 when you enable the new
+backtest cache manager. The feature is optional and defaults to local storage.
+To configure the environment variables, understand the key naming convention,
+and follow the manual validation checklist, review `docs/remote_cache.md`.
 
 ### Showing Code Coverage
 

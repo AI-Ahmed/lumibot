@@ -1,28 +1,43 @@
+import datetime
+import inspect
+import logging
+import math
 import os
+import re
 import time
 import datetime
-from decimal import Decimal
 import uuid
 from typing import Union, List, Type, Callable, Literal
 
 import logging
 import jsonpickle
 import matplotlib
+from matplotlib.colors import is_color_like
 import numpy as np
 import pandas as pd
 import pandas_market_calendars as mcal
-from termcolor import colored
 from apscheduler.triggers.cron import CronTrigger
 
 from loguru import logger
 from lumibot import log
+from termcolor import colored, COLORS
 
-from ..entities import Asset, Order, Position, Data, TradingFee, Quote
-from ..tools import get_risk_free_rate
-from ..traders import Trader
 from ..data_sources import DataSource
-
+from ..entities import Asset, Data, Order, Position, Quote, TradingFee, TradingSlippage, SmartLimitConfig
+from ..tools import get_risk_free_rate
+from ..tools.smart_limit_utils import (
+    build_price_ladder,
+    compute_final_price,
+    compute_final_price_from_mid,
+    compute_mid,
+    infer_tick_size,
+    round_to_tick,
+)
+from ..tools.polars_utils import PolarsResampleError, resample_polars_ohlc
+from ..traders import Trader
+from ..credentials import IS_BACKTESTING
 from ._strategy import _Strategy
+from ..constants import LUMIBOT_DEFAULT_TIMEZONE, LUMIBOT_DEFAULT_PYTZ
 
 matplotlib.use("Agg")
 
@@ -239,7 +254,10 @@ class Strategy(_Strategy):
 
     @property
     def portfolio_value(self):
-        """Returns the current portfolio value (cash + positions value).
+        """
+        Returns the last portfolio value (cash + positions value) reported by the broker. Does
+        not query the broker for an updated value. To get the current broker value, use
+        `self.get_portfolio_value()`.
 
         Returns the portfolio value of positions plus cash in US dollars.
 
@@ -253,7 +271,7 @@ class Strategy(_Strategy):
 
         Example
         -------
-        >>> # Get the current portfolio value
+        >>> # Get the last seen portfolio value
         >>> self.log_message(self.portfolio_value)
 
         """
@@ -266,6 +284,10 @@ class Strategy(_Strategy):
             self.update_broker_balances(force_update=False)
 
         return self._portfolio_value
+
+    @portfolio_value.setter
+    def portfolio_value(self, value):
+        self._portfolio_value = value
 
     @property
     def cash(self):
@@ -387,17 +409,18 @@ class Strategy(_Strategy):
             # Send the message to Discord
             self.send_discord_message(message)
 
-        # If we are backtesting and we don't want to save the logfile, don't log (they're not displayed in the console anyway)
-        if not self.save_logfile and self.is_backtesting:
-            return
-
-        # Check if INFO level is enabled before logging
+        # Performance optimization: skip work if INFO is not enabled.
+        # This respects BACKTESTING_QUIET_LOGS via StrategyLoggerAdapter.isEnabledFor().
         if not self.logger.isEnabledFor(logging.INFO):
-            return
+            return message
 
         if color:
-            colored_message = colored(message, color)
-            self.logger.info(colored_message)
+            if color in COLORS:
+                colored_message = colored(message, color)
+                self.logger.info(colored_message)
+            else:
+                self.logger.warning(f"Unsupported log color '{color}' for message: {message}")
+                self.logger.info(message)
         else:
             self.logger.info(message)
         
@@ -447,6 +470,7 @@ class Strategy(_Strategy):
         order_type: Union[Order.OrderType, None] = None,
         order_class: Union[Order.OrderClass, None] = None,
         type: Union[Order.OrderType, None] = None,  # Deprecated, use 'order_type' instead
+        smart_limit: SmartLimitConfig = None,
         custom_params: dict = None,
     ):
         # noinspection PyShadowingNames,PyUnresolvedReferences
@@ -484,8 +508,10 @@ class Strategy(_Strategy):
             Whether the order is ``buy`` or ``sell``.
         order_type : Order.OrderType
             The type of order. Order types include: ``'market'``, ``'limit'``, ``'stop'``, ``'stop_limit'``,
-            ``trailing_stop``
+            ``trailing_stop``, ``smart_limit``
             We will try to determine the order type if you do not specify it.
+        smart_limit : SmartLimitConfig
+            Configuration for SMART_LIMIT orders. If provided, the order type defaults to ``smart_limit``.
         order_class: Order.OrderClass
             The class of the order. Order classes include: ``'simple'``, ``'bracket'``, ``'oco'``, ``'oto'``,
             ``'multileg'``
@@ -752,6 +778,17 @@ class Strategy(_Strategy):
             quote = self.quote_asset
 
         asset = self._sanitize_user_asset(asset)
+        if smart_limit is not None and order_type is None and type is None:
+            order_type = Order.OrderType.SMART_LIMIT
+
+        # PERF: uuid4() generation is a measurable hot path in high-churn backtests (1 order per bar per asset).
+        # Backtests only need identifiers to be unique within the run, so use a cheap monotonic counter.
+        identifier = None
+        if getattr(self.broker, "IS_BACKTESTING_BROKER", False):
+            seq = getattr(self.broker, "_backtest_order_seq", 0) + 1
+            setattr(self.broker, "_backtest_order_seq", seq)
+            identifier = f"bt_{seq}"
+
         order = Order(
             self.name,
             asset,
@@ -780,7 +817,9 @@ class Strategy(_Strategy):
             type=type,
             order_type=order_type,
             order_class=order_class,
+            smart_limit=smart_limit,
             custom_params=custom_params,
+            identifier=identifier,
         )
 
         # Add debug logging for custom_params
@@ -1018,7 +1057,7 @@ class Strategy(_Strategy):
             from termcolor import colored
             error_msg = colored(
                 "No broker is set. Cannot set market. Please set a broker using environment variables, "
-                "secrets or by passing it as an argument to the strategy constructor.", 
+                "secrets or by passing it as an argument to the strategy constructor.",
                 "red"
             )
             self.logger.error(error_msg)
@@ -1105,7 +1144,8 @@ class Strategy(_Strategy):
         strategy.
 
         Seeks out and returns the position object for the given asset
-        in the current strategy.
+        in the current strategy. For continuous futures (CONT_FUTURE),
+        automatically matches against active contract positions.
 
         Parameters
         ----------
@@ -1117,6 +1157,8 @@ class Strategy(_Strategy):
         Position or None
             A position object for the assset if there is a tracked
             position or returns None to indicate no tracked position.
+            For continuous futures, returns the position for the most
+            appropriate active contract (front-month priority).
 
         Example
         -------
@@ -1125,15 +1167,119 @@ class Strategy(_Strategy):
         >>> # Show the quantity of the TLT position
         >>> self.log_message(position.quantity)
 
+        >>> # Get position for continuous futures (matches active contract)
+        >>> future_asset = Asset("MNQ", asset_type=Asset.AssetType.CONT_FUTURE)
+        >>> position = self.get_position(future_asset)  # Returns MNQU5 position if held
+
         """
 
         # Check if asset is an Asset object or a string
         if not (isinstance(asset, Asset) or isinstance(asset, str)):
-            logger.error(f"Asset in get_position() must be an Asset object or a string. You entered {asset}.")
+            self.logger.error(f"Asset in get_position() must be an Asset object or a string. You entered {asset}.")
             return None
 
         asset = self._sanitize_user_asset(asset)
-        return self.broker.get_tracked_position(self.name, asset)
+        
+        # For non-continuous futures, use existing exact matching
+        if asset.asset_type != Asset.AssetType.CONT_FUTURE:
+            return self.broker.get_tracked_position(self.name, asset)
+        
+        # For continuous futures, implement smart matching
+        return self._get_continuous_future_position(asset)
+
+    def _get_continuous_future_position(self, asset):
+        """
+        Find position for continuous futures by matching against active contracts.
+        
+        Parameters
+        ----------
+        asset : Asset
+            Continuous futures asset to find position for
+            
+        Returns
+        -------
+        Position or None
+            Position for the best matching active contract, or None if no matches
+        """
+        from lumibot.tools.futures_symbols import (
+            symbol_matches_root, 
+            get_contract_priority_key,
+            build_ib_contract_variants
+        )
+        
+        # First try exact match (ProjectX may store as CONT_FUTURE)
+        exact_position = self.broker.get_tracked_position(self.name, asset)
+        if exact_position is not None:
+            return exact_position
+        
+        # Get all positions for this strategy
+        all_positions = self.broker.get_tracked_positions(self.name)
+        if not all_positions:
+            return None
+        
+        # Find positions that match this root symbol
+        matching_positions = []
+        root_symbol = asset.symbol
+        
+        for position in all_positions:
+            pos_asset = position.asset
+            
+            # Skip non-futures positions
+            if pos_asset.asset_type not in {Asset.AssetType.FUTURE, Asset.AssetType.CRYPTO_FUTURE, Asset.AssetType.CONT_FUTURE}:
+                continue
+            
+            # Check for root symbol match
+            if symbol_matches_root(pos_asset.symbol, root_symbol):
+                matching_positions.append(position)
+            elif (pos_asset.symbol == root_symbol and 
+                  pos_asset.expiration is not None and 
+                  pos_asset.asset_type == Asset.AssetType.FUTURE):
+                # IB-style: same root symbol with expiration
+                matching_positions.append(position)
+        
+        if not matching_positions:
+            return None
+        
+        if len(matching_positions) == 1:
+            return matching_positions[0]
+        
+        # Multiple matches - rank by priority and log
+        priority_list = asset.get_potential_futures_contracts()
+        
+        # Score each position by priority
+        scored_positions = []
+        for position in matching_positions:
+            pos_asset = position.asset
+            
+            # For IB-style positions, generate contract variants
+            if (pos_asset.symbol == root_symbol and 
+                pos_asset.expiration is not None and
+                pos_asset.asset_type == Asset.AssetType.FUTURE):
+                variants = build_ib_contract_variants(root_symbol, pos_asset.expiration)
+                # Find best priority among variants
+                best_priority = min(
+                    (get_contract_priority_key(variant, priority_list) for variant in variants),
+                    default=999999
+                )
+            else:
+                # Direct symbol priority lookup
+                best_priority = get_contract_priority_key(pos_asset.symbol, priority_list)
+            
+            scored_positions.append((best_priority, position))
+        
+        # Sort by priority (lower number = higher priority)
+        scored_positions.sort(key=lambda x: x[0])
+        best_position = scored_positions[0][1]
+        
+        # Log ambiguity warning
+        contract_symbols = [pos.asset.symbol for pos in matching_positions]
+        self.log_message(
+            f"Multiple futures contracts found for {root_symbol}: {contract_symbols}. "
+            f"Selected {best_position.asset.symbol} (front-month priority).",
+            color="yellow"
+        )
+        
+        return best_position
 
     def get_tracked_positions(self):
         """Deprecated, will be removed in the future. Please use `get_positions()` instead."""
@@ -1142,7 +1288,9 @@ class Strategy(_Strategy):
         return self.get_positions()
 
     def get_portfolio_value(self):
-        """Get the current portfolio value (cash + net equity).
+        """
+        Query the broker to get the current portfolio value (cash + net equity). This is a slow,
+        expensive call, if you want the fast "last seen" value, use the `self.portfolio_value` property instead.
 
         Parameters
         ----------
@@ -1151,8 +1299,12 @@ class Strategy(_Strategy):
         Returns
         -------
         float
-            The current portfolio value, which is the sum of the cash and net equity. This is the total value of your account, which is the amount of money you would have if you sold all your assets and closed all your positions. For crypto assets, this is the total value of your account in the quote asset (eg. USDT if that is your quote asset).
+            The current portfolio value, which is the sum of the cash and net equity. This is the total value of your
+             account, which is the amount of money you would have if you sold all your assets and closed all your
+             positions. For crypto assets, this is the total value of your account in the quote asset (eg. USDT if
+            that is your quote asset).
         """
+        self.update_broker_balances(force_update=False)
         return self._portfolio_value
 
     def get_cash(self):
@@ -1364,14 +1516,14 @@ class Strategy(_Strategy):
         asset = self._sanitize_user_asset(asset)
         return self.broker.get_asset_potential_total(self.name, asset)
 
-    def submit_order(self, order: Order, **kwargs):
+    def submit_order(self, order: Order|list[Order], **kwargs):
         """Submit an order or a list of orders for assets
 
         Submits an order or a list of orders for processing by the active broker.
 
         Parameters
         ---------
-        order : Order object or list of Order objects
+        order : Order or list[Order]
             Order object or a list of order objects containing the asset and instructions for executing the order.
         is_multileg : bool
             Tradier only.
@@ -1415,6 +1567,12 @@ class Strategy(_Strategy):
 
         >>> # For a stop limit order
         >>> order = self.create_order("SPY", 100, "buy", limit_price=100.00, stop_price=100.00)
+        >>> self.submit_order(order)
+
+        >>> # For a SMART_LIMIT order
+        >>> from lumibot.entities import SmartLimitConfig, SmartLimitPreset
+        >>> config = SmartLimitConfig(preset=SmartLimitPreset.NORMAL, slippage=0.05)
+        >>> order = self.create_order("SPY", 100, "buy", smart_limit=config)
         >>> self.submit_order(order)
 
         >>> # For a market sell order
@@ -1489,6 +1647,88 @@ class Strategy(_Strategy):
             if 'is_multileg' not in kwargs:
                 kwargs['is_multileg'] = default_multileg
 
+            is_multileg = bool(kwargs.get("is_multileg"))
+            wants_smart_limit = any(
+                o.order_type == Order.OrderType.SMART_LIMIT or getattr(o, "smart_limit", None) is not None for o in order
+            )
+            if wants_smart_limit:
+                cfg = next((getattr(o, "smart_limit", None) for o in order if getattr(o, "smart_limit", None) is not None), None)
+                if cfg is None:
+                    cfg = SmartLimitConfig()
+
+                if any(getattr(o, "smart_limit", None) not in (None, cfg) for o in order):
+                    self.log_message(
+                        "[SMART_LIMIT] Multi-leg SMART_LIMIT requires a single SmartLimitConfig; using the first config for all legs.",
+                        color="yellow",
+                    )
+
+                for o in order:
+                    o.order_type = Order.OrderType.SMART_LIMIT
+                    o.smart_limit = cfg
+
+                if is_multileg:
+                    if self.broker.IS_BACKTESTING_BROKER:
+                        return self.broker.submit_orders(order, **kwargs)
+                    return self._submit_multileg_smart_limit_orders(order, cfg, **kwargs)
+
+                # Multiple independent SMART_LIMIT orders.
+                submitted_orders = []
+                for o in order:
+                    submitted_orders.append(self.submit_order(o))
+                return submitted_orders
+
+            # Broker-agnostic multi-leg LIMIT UX:
+            # If the caller requests a package LIMIT (`order_type='limit'`) on a broker that uses
+            # debit/credit/even semantics (Tradier) or needs net-side hints (Alpaca mleg),
+            # infer the net sign from quotes and map internally so strategies remain portable.
+            if (
+                is_multileg
+                and not self.broker.IS_BACKTESTING_BROKER
+                and str(kwargs.get("order_type", "")).lower() == str(Order.OrderType.LIMIT)
+                and str(getattr(self.broker, "name", "")).lower() in {"tradier", "alpaca"}
+            ):
+                inferred = self._infer_multileg_type_and_mid(order)
+                if inferred is not None:
+                    inferred_type, inferred_mid_abs = inferred
+                else:
+                    inferred_type, inferred_mid_abs = None, None
+
+                raw_price = kwargs.get("price")
+                price_abs = None
+                if raw_price is not None:
+                    try:
+                        price_abs = abs(float(raw_price))
+                    except Exception:
+                        price_abs = None
+
+                if inferred_type is None:
+                    # Fall back to interpreting a signed price (negative=credit) if quotes are missing.
+                    if raw_price is not None:
+                        try:
+                            signed = float(raw_price)
+                            inferred_type = "even" if abs(signed) < 1e-9 else ("debit" if signed > 0 else "credit")
+                            if price_abs is None:
+                                price_abs = abs(signed)
+                            self.log_message(
+                                "[MULTILEG][LIMIT] Missing quotes; inferring debit/credit from price sign. "
+                                "For net credits, pass a negative price or explicit order_type='credit'.",
+                                color="yellow",
+                            )
+                        except Exception:
+                            inferred_type = None
+
+                if inferred_type is not None:
+                    kwargs["order_type"] = inferred_type
+                    if price_abs is None and inferred_mid_abs is not None:
+                        price_abs = float(inferred_mid_abs)
+
+                    broker_name = str(getattr(self.broker, "name", "")).lower()
+                    if inferred_type == "even" and broker_name == "tradier":
+                        kwargs["price"] = None
+                    else:
+                        # Alpaca requires a limit_price for mleg orders; treat even as 0.0 and let the broker decide.
+                        kwargs["price"] = 0.0 if price_abs is None else float(price_abs)
+
             return self.broker.submit_orders(order, **kwargs)
 
         else:
@@ -1496,7 +1736,190 @@ class Strategy(_Strategy):
             if not self._validate_order(order):
                 return
 
+            if order.order_type == Order.OrderType.SMART_LIMIT:
+                if self.broker.IS_BACKTESTING_BROKER:
+                    return self.broker.submit_order(order)
+
+                if order.smart_limit is None:
+                    order.smart_limit = SmartLimitConfig()
+
+                if order.order_class == Order.OrderClass.MULTILEG and order.child_orders:
+                    return self._submit_multileg_smart_limit(order)
+
+                try:
+                    quote = self.get_quote(order.asset, quote=order.quote, exchange=order.exchange)
+                except Exception as exc:
+                    self.log_message(
+                        f"[SMART_LIMIT] Quote fetch failed for {order.asset} ({exc}); downgrading to market.",
+                        color="yellow",
+                    )
+                    order.smart_limit = None
+                    order.order_type = Order.OrderType.MARKET
+                    return self.broker.submit_order(order)
+                bid = getattr(quote, "bid", None)
+                ask = getattr(quote, "ask", None)
+                if bid is None or ask is None or bid < 0 or ask <= 0:
+                    self.log_message(
+                        f"[SMART_LIMIT] Missing bid/ask for {order.asset}; downgrading to market.",
+                        color="yellow",
+                    )
+                    order.smart_limit = None
+                    order.order_type = Order.OrderType.MARKET
+                    return self.broker.submit_order(order)
+
+                side = "buy" if order.is_buy_order() else "sell"
+                tick = infer_tick_size(bid, ask)
+                mid = compute_mid(bid, ask)
+                final_price = compute_final_price(bid, ask, side, order.smart_limit.final_price_pct)
+                ladder = build_price_ladder(mid, final_price, order.smart_limit.get_step_count())
+                initial_price = round_to_tick(ladder[0], tick, side=side)
+
+                order.limit_price = initial_price
+                order._smart_limit_state = {
+                    "created_at": time.monotonic(),
+                    "step_index": 0,
+                    "steps": max(1, order.smart_limit.get_step_count()),
+                    "step_seconds": max(1, order.smart_limit.get_step_seconds()),
+                    "final_hold_seconds": order.smart_limit.get_final_hold_seconds(),
+                }
+
+                original_type = order.order_type
+                order.order_type = Order.OrderType.LIMIT
+                try:
+                    submitted = self.broker.submit_order(order)
+                finally:
+                    order.order_type = original_type
+                return submitted
+
             return self.broker.submit_order(order)
+
+    def _submit_multileg_smart_limit(self, order: Order):
+        return self._submit_multileg_smart_limit_orders(order.child_orders, order.smart_limit)
+
+    def _compute_multileg_net_best_fastest(self, child_orders: List[Order]) -> tuple[float, float] | None:
+        """Compute signed net best/fastest prices for a multi-leg options package.
+
+        Convention (matches OptionsHelper and SMART_LIMIT logic):
+        - For buy legs: best=bid, fastest=ask (positive contribution)
+        - For sell legs: best=-ask, fastest=-bid (negative contribution)
+        """
+
+        quote_data: list[tuple[Order, float | None, float | None]] = []
+        for leg in child_orders:
+            try:
+                quote = self.get_quote(leg.asset, quote=leg.quote, exchange=leg.exchange)
+                bid = getattr(quote, "bid", None)
+                ask = getattr(quote, "ask", None)
+            except Exception:
+                bid = None
+                ask = None
+            quote_data.append((leg, bid, ask))
+
+        if any(bid is None or ask is None or bid < 0 or ask <= 0 for _, bid, ask in quote_data):
+            return None
+
+        net_best = 0.0
+        net_fastest = 0.0
+        for leg, bid, ask in quote_data:
+            if leg.is_buy_order():
+                net_best += float(bid)
+                net_fastest += float(ask)
+            else:
+                net_best -= float(ask)
+                net_fastest -= float(bid)
+
+        return net_best, net_fastest
+
+    def _infer_multileg_type_and_mid(self, child_orders: List[Order]) -> tuple[str, float] | None:
+        """Infer package type (debit/credit/even) and return abs(net_mid)."""
+
+        computed = self._compute_multileg_net_best_fastest(child_orders)
+        if computed is None:
+            return None
+
+        net_best, net_fastest = computed
+        mid_signed = compute_mid(net_best, net_fastest)
+        if abs(mid_signed) < 1e-9:
+            return "even", 0.0
+        if mid_signed > 0:
+            return "debit", float(abs(mid_signed))
+        return "credit", float(abs(mid_signed))
+
+    def _submit_multileg_smart_limit_orders(self, child_orders: List[Order], smart_limit: SmartLimitConfig, **kwargs):
+        if self.broker.IS_BACKTESTING_BROKER:
+            kwargs.setdefault("is_multileg", True)
+            return self.broker.submit_orders(child_orders, **kwargs)
+
+        if smart_limit is None:
+            smart_limit = SmartLimitConfig()
+
+        computed = self._compute_multileg_net_best_fastest(child_orders)
+        if computed is None:
+            self.log_message(
+                "[SMART_LIMIT] Missing bid/ask for multileg order; downgrading to market.",
+                color="yellow",
+            )
+            return self.broker.submit_orders(child_orders, is_multileg=True, order_type=Order.OrderType.MARKET)
+        net_best, net_fastest = computed
+
+        tick = infer_tick_size(net_best, net_fastest)
+        mid = compute_mid(net_best, net_fastest)
+        final_signed = compute_final_price_from_mid(mid, net_fastest, smart_limit.final_price_pct)
+        ladder = build_price_ladder(mid, final_signed, smart_limit.get_step_count())
+        initial_signed = round_to_tick(ladder[0], tick, side="buy")
+
+        initial_type = "even" if abs(initial_signed) < 1e-9 else ("debit" if initial_signed > 0 else "credit")
+        initial_price: float | None = abs(initial_signed) if initial_type != "even" else 0.0
+        broker_name = str(getattr(self.broker, "name", "")).lower()
+        if initial_type == "even" and broker_name == "tradier":
+            initial_price = None
+
+        duration = kwargs.get("duration") or kwargs.get("time_in_force")
+        if not duration:
+            duration = "day" if all(o.asset.asset_type == "option" for o in child_orders) else (
+                getattr(child_orders[0], "time_in_force", None) or "day"
+            )
+
+        state = {
+            "created_at": time.monotonic(),
+            "step_index": 0,
+            "steps": max(1, smart_limit.get_step_count()),
+            "step_seconds": max(1, smart_limit.get_step_seconds()),
+            "final_hold_seconds": smart_limit.get_final_hold_seconds(),
+            "multileg_order_type": initial_type,
+        }
+
+        submit_price = 0.0 if initial_price is None else float(initial_price)
+        submit_price_or_none = None if (initial_type == "even" and broker_name == "tradier") else submit_price
+
+        try:
+            submitted = self.broker.submit_orders(
+                child_orders,
+                is_multileg=True,
+                order_type=initial_type,
+                duration=duration,
+                price=submit_price_or_none,
+            )
+        except Exception as exc:
+            self.log_message(
+                f"[SMART_LIMIT] Multi-leg submit failed for type={initial_type} ({exc}); retrying as limit.",
+                color="yellow",
+            )
+            submitted = self.broker.submit_orders(
+                child_orders,
+                is_multileg=True,
+                order_type=Order.OrderType.LIMIT,
+                duration=duration,
+                price=submit_price,
+            )
+
+        parent_order = submitted[0] if isinstance(submitted, list) and submitted else submitted
+        if parent_order is not None:
+            parent_order.smart_limit = smart_limit
+            parent_order.order_type = Order.OrderType.SMART_LIMIT
+            parent_order._smart_limit_state = state
+            parent_order.limit_price = 0.0 if initial_price is None else float(initial_price)
+        return submitted
 
     def submit_orders(self, orders: List[Order], **kwargs):
         """[Deprecated] Submit a list of orders
@@ -1794,7 +2217,7 @@ class Strategy(_Strategy):
         """
         return self.broker.cancel_orders(orders)
 
-    def cancel_open_orders(self):
+    def cancel_open_orders(self, orders: list[Order] | None = None):
         """Cancel all the strategy open orders.
 
         Cancels all orders that are open and awaiting execution within
@@ -1803,7 +2226,11 @@ class Strategy(_Strategy):
 
         Parameters
         ----------
-        None
+        orders : list[Order] | None
+            Optional list of already enumerated orders. Pass in the list
+            when you have just fetched/filtered the active orders to avoid
+            re-querying the broker; leave as None to let the broker gather
+            them itself.
 
         Returns
         -------
@@ -1815,7 +2242,29 @@ class Strategy(_Strategy):
         >>> self.cancel_open_orders()
 
         """
-        return self.broker.cancel_open_orders(self.name)
+        active_orders: list[Order] = []
+        try:
+            tracked_orders = orders if orders is not None else self.broker.get_tracked_orders(self.name)
+            active_orders = [order for order in tracked_orders if order.is_active()]
+            if active_orders:
+                order_ids = [
+                    getattr(order, "identifier", None)
+                    or getattr(order, "id", None)
+                    or getattr(order, "order_id", None)
+                    for order in active_orders
+                ]
+                self.log_message(
+                    f"cancel_open_orders -> active={len(active_orders)} ids={order_ids}",
+                    color="yellow",
+                )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.exception("Failed to enumerate open orders before cancellation: %s", exc)
+            active_orders = []
+
+        if not active_orders:
+            return []
+
+        return self.broker.cancel_open_orders(self.name, active_orders)
 
     def modify_order(self, order: Order, limit_price: Union[float, None] = None, stop_price: Union[float, None] = None):
         """Modify an order.
@@ -1902,7 +2351,37 @@ class Strategy(_Strategy):
             - If no open position exists, this method does nothing.
         """
         asset_obj = self._sanitize_user_asset(asset)
-        result = self.broker.close_position(self.name, asset_obj, fraction)
+
+        try:
+            position = self.get_position(asset_obj)
+            qty = getattr(position, "quantity", 0) if position else 0
+            self.log_message(
+                f"close_position -> asset={asset_obj.symbol if hasattr(asset_obj, 'symbol') else asset_obj}, "
+                f"fraction={fraction}, current_qty={qty}",
+                color="yellow",
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.exception("Unable to inspect position prior to close_position: %s", exc)
+
+        target_asset = getattr(position, "asset", asset_obj) if position is not None else asset_obj
+        if target_asset is not asset_obj:
+            try:
+                self.log_message(
+                    f"close_position -> resolved continuous asset {asset_obj.symbol if hasattr(asset_obj, 'symbol') else asset_obj} "
+                    f"to contract {target_asset.symbol if hasattr(target_asset, 'symbol') else target_asset}",
+                    color="yellow",
+                )
+            except Exception:  # pragma: no cover - best effort logging
+                pass
+        result = self.broker.close_position(self.name, target_asset, fraction)
+        if result is None:
+            self.log_message("close_position -> broker returned None (no order submitted)", color="yellow")
+        else:
+            order_id = getattr(result, "identifier", None) or getattr(result, "id", None) or getattr(result, "order_id", None)
+            self.log_message(
+                f"close_position -> broker submitted order {order_id} (type={type(result).__name__})",
+                color="yellow",
+            )
         if result is not None:
             return result
 
@@ -1991,7 +2470,7 @@ class Strategy(_Strategy):
 
         # Check if the Asset object is a string or Asset object
         if not (isinstance(asset, Asset) or isinstance(asset, str) or isinstance(asset, tuple)):
-            logger.error(
+            self.logger.error(
                 f"Asset in get_last_price() must be a string or Asset or tuple object. Got {asset} of type {type(asset)}"
             )
             return None
@@ -2004,6 +2483,20 @@ class Strategy(_Strategy):
             quote_asset = quote
 
         try:
+            # For daily-cadence backtests with ThetaData, prefer day bars to avoid exploding minute fetches.
+            # Only apply this optimization for ThetaData - other sources (Yahoo, Polygon) have their own
+            # efficient implementations and may return different price types (open vs close).
+            if (IS_BACKTESTING or getattr(self.broker, "IS_BACKTESTING_BROKER", False)) and self._should_use_daily_last_price(asset):
+                data_source = getattr(self.broker, "data_source", None)
+                is_thetadata = data_source is not None and "ThetaData" in type(data_source).__name__
+                if is_thetadata:
+                    try:
+                        bars = self.get_historical_prices(asset, length=2, timestep="day", timeshift=-1, quote=quote_asset, exchange=exchange)
+                        if bars is not None and getattr(bars, "df", None) is not None and not bars.df.empty:
+                            return float(bars.df["close"].iloc[-1])
+                    except Exception:
+                        # Fall through to the default path on any failure.
+                        pass
             return self.broker.get_last_price(
                 asset,
                 quote=quote_asset,
@@ -2014,6 +2507,45 @@ class Strategy(_Strategy):
             self.log_message(f"Could not get last price for {asset}", color="red")
             self.log_message(f"{e}")
             return None
+
+    def _should_use_daily_last_price(self, asset: Asset) -> bool:
+        if asset is None:
+            return False
+        asset_type = str(getattr(asset, "asset_type", "")).lower()
+        if asset_type not in {"stock", "equity", "index"}:
+            return False
+        if not (IS_BACKTESTING or getattr(self.broker, "IS_BACKTESTING_BROKER", False)):
+            return False
+        cadence_seconds = self._get_sleeptime_seconds()
+        if cadence_seconds is None:
+            return False
+        return cadence_seconds >= 20 * 3600
+
+    def _get_sleeptime_seconds(self) -> Optional[float]:
+        value = getattr(self, "_sleeptime", None)
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value) * 60.0
+        if isinstance(value, str):
+            normalized = value.strip().upper().replace(" ", "")
+            if not normalized:
+                return None
+            match = re.match(r"^(\d+(?:\.\d+)?)([A-Z]*)$", normalized)
+            if not match:
+                return None
+            qty = float(match.group(1))
+            suffix = match.group(2) or "M"
+            if suffix.startswith("S"):
+                multiplier = 1.0
+            elif suffix.startswith("H"):
+                multiplier = 3600.0
+            elif suffix.startswith("D"):
+                multiplier = 86400.0
+            else:
+                multiplier = 60.0
+            return qty * multiplier
+        return None
 
     def get_quote(self, asset: Asset, quote: Asset = None, exchange: str = None) -> Quote:
         """Get a quote for the asset.
@@ -2088,26 +2620,51 @@ class Strategy(_Strategy):
             return asset_prices
 
     # ======= Broker Methods  ============
-    def options_expiry_to_datetime_date(self, date: datetime.date):
-        """Converts an IB Options expiry to datetime.date.
+    def options_expiry_to_datetime_date(self, expiry) -> datetime.date:
+        """Convert an options expiry to datetime.date.
 
         Parameters
         ----------
-            date : str
-                String in the format of 'YYYYMMDD'
+        expiry : str | datetime.date | datetime.datetime
+            The expiry to convert. Can be:
+            - String in 'YYYYMMDD' format (legacy IB format)
+            - String in 'YYYY-MM-DD' format (Polygon format)
+            - datetime.date object
+            - datetime.datetime object
 
         Returns
         -------
-            datetime.date
-
-        Example
-        -------
-        >>> # Will return the date for the expiry
-        >>> date = "20200101"
-        >>> expiry_date = self.options_expiry_to_datetime_date(date)
-        >>> self.log_message(f"Expiry date for {date} is {expiry_date}")
+        datetime.date
+            The normalised expiry date.
         """
-        return datetime.datetime.strptime(date, "%Y%m%d").date()
+        if isinstance(expiry, datetime.datetime):
+            return expiry.date()
+        if isinstance(expiry, datetime.date):
+            return expiry
+        if isinstance(expiry, str):
+            # Try different string formats
+            expiry_clean = expiry.strip()
+
+            # Try YYYY-MM-DD format (Polygon)
+            if len(expiry_clean) == 10 and expiry_clean[4] == '-' and expiry_clean[7] == '-':
+                try:
+                    return datetime.datetime.strptime(expiry_clean, "%Y-%m-%d").date()
+                except ValueError:
+                    pass
+
+            # Try YYYYMMDD format (IB legacy)
+            expiry_digits = expiry_clean.replace("-", "")
+            if len(expiry_digits) == 8 and expiry_digits.isdigit():
+                try:
+                    return datetime.datetime.strptime(expiry_digits, "%Y%m%d").date()
+                except ValueError:
+                    pass
+
+            raise ValueError(f"Unable to parse expiry string: {expiry}")
+
+        raise TypeError(
+            f"expiry must be a string, datetime.date, or datetime.datetime instance, got {type(expiry)}"
+        )
 
     def get_chains(self, asset: Asset):
         """Returns option chains.
@@ -2496,8 +3053,11 @@ class Strategy(_Strategy):
 
         Returns
         -------
-        Returns a dictionary with greeks as keys and greek values as
-        values.
+        dict or None
+            Returns a dictionary with greeks as keys and greek values as values.
+            **Returns None if the option price or underlying price is unavailable**
+            (e.g., no data from ThetaData for that strike/expiry).
+            Always check for None before accessing greek values.
 
         implied_volatility : float
             The implied volatility.
@@ -2522,11 +3082,14 @@ class Strategy(_Strategy):
         >>> # Will return the greeks for SPY
         >>> opt_asset = Asset("SPY", expiration=date(2021, 1, 1), strike=100, option_type="call"
         >>> greeks = self.get_greeks(opt_asset)
-        >>> implied_volatility = greeks["implied_volatility"]
-        >>> delta = greeks["delta"]
-        >>> gamma = greeks["gamma"]
-        >>> vega = greeks["vega"]
-        >>> theta = greeks["theta"]
+        >>> if greeks is None:
+        >>>     print("Greeks unavailable - option price or underlying price missing")
+        >>> else:
+        >>>     implied_volatility = greeks["implied_volatility"]
+        >>>     delta = greeks["delta"]
+        >>>     gamma = greeks["gamma"]
+        >>>     vega = greeks["vega"]
+        >>>     theta = greeks["theta"]
         """
         if asset.asset_type != "option":
             self.log_message(
@@ -2573,7 +3136,30 @@ class Strategy(_Strategy):
         >>> timezone = self.timezone
         >>> self.log_message(f"Timezone: {timezone}")
         """
-        return self.broker.data_source.DEFAULT_TIMEZONE
+        # Be defensive: pytz timezones have `.zone`, zoneinfo has `.key`, and
+        # datetime.timezone may only provide `tzname(None)`
+        tz = getattr(self.broker.data_source, "tzinfo", None)
+
+        # Hard default when tzinfo is missing
+        if tz is None:
+            return LUMIBOT_DEFAULT_TIMEZONE
+
+        # Prefer canonical zone identifiers when available
+        if hasattr(tz, "zone") and getattr(tz, "zone", None):
+            return tz.zone
+        if hasattr(tz, "key") and getattr(tz, "key", None):
+            return tz.key
+
+        # Fallbacks: tzname or default
+        try:
+            name = tz.tzname(None)
+            if name:
+                return name
+        except Exception:
+            pass
+
+        # Final fallback to configured default to ensure a str is returned
+        return LUMIBOT_DEFAULT_TIMEZONE
 
     @property
     def pytz(self):
@@ -2590,7 +3176,8 @@ class Strategy(_Strategy):
         >>> pytz = self.pytz
         >>> self.log_message(f"pytz: {pytz}")
         """
-        return self.broker.data_source.tzinfo
+        tz = getattr(self.broker.data_source, "tzinfo", None)
+        return tz or LUMIBOT_DEFAULT_PYTZ
 
     def get_datetime(self, adjust_for_delay: bool = False):
         """Returns the current datetime according to the data source. In a backtest this will be the current bar's datetime. In live trading this will be the current datetime on the exchange.
@@ -2886,6 +3473,31 @@ class Strategy(_Strategy):
             multiplier=multiplier,
         )
 
+    def _normalize_plot_color(self, color: Optional[str], *, default: Optional[str], context: str):
+        """Normalize user-supplied chart colors while falling back gracefully."""
+        if color is None:
+            return default
+
+        normalized = color.strip()
+        if not normalized:
+            fallback = default if default is not None else "auto-color selection"
+            self.logger.warning(f"Unsupported {context} color '{color}', defaulting to {fallback}.")
+            return default
+
+        try:
+            valid = is_color_like(normalized)
+        except Exception:
+            valid = False
+
+        if valid:
+            if normalized.startswith('#'):
+                return normalized.lower()
+            return normalized.lower()
+
+        fallback = default if default is not None else "auto-color selection"
+        self.logger.warning(f"Unsupported {context} color '{color}', defaulting to {fallback}.")
+        return default
+
     def add_marker(
             self,
             name: str,
@@ -2895,7 +3507,8 @@ class Strategy(_Strategy):
             size: int = None,
             detail_text: str = None,
             dt: Union[datetime.datetime, pd.Timestamp] = None,
-            plot_name: str = "default_plot"
+            plot_name: str = "default_plot",
+            asset: Asset = None
             ):
         """Adds a marker to the indicators plot that loads after a backtest. This can be used to mark important events on the graph, such as price crossing a certain value, marking a support level, marking a resistance level, etc.
 
@@ -2908,7 +3521,7 @@ class Strategy(_Strategy):
         value : float or int
             The value of the marker. Default is the current portfolio value.
         color : str
-            The color of the marker. Possible values are "red", "green", "blue", "yellow", "orange", "purple", "pink", "brown", "black", and "white".
+            The color of the marker. Use any Matplotlib/Plotly compatible color name (e.g. "red", "magenta", "lightblue") or a hex string like "#ff0000".
         size : int
             The size of the marker.
         detail_text : str
@@ -2917,11 +3530,22 @@ class Strategy(_Strategy):
             The datetime of the marker. Default is the current datetime.
         plot_name : str
             The name of the subplot to add the marker to. If "default_plot" (the default value) or None, the marker will be added to the main plot.
+        asset : Asset, optional
+            The Asset object to associate with this marker. Indicators are almost always tied to specific assets,
+            so if you have an asset object, you should pass it here. This enables proper multi-symbol charting
+            where indicators can be displayed as overlays on their corresponding asset's price chart rather than
+            as separate subplots. Must be an Asset object, not a string.
+
+        Note
+        ----
+        Colors are validated before plotting; use Matplotlib/Plotly color names or hex codes.
 
         Example
         -------
         >>> # Will add a marker to the chart
         >>> self.add_chart_marker("Overbought", symbol="circle", color="red", size=10)
+        >>> # Will add a marker associated with a specific asset
+        >>> self.add_marker("buy_signal", value=150.0, color="green", symbol="arrow-up", asset=my_asset)
         """
 
         # Check that the parameters are valid
@@ -2967,13 +3591,42 @@ class Strategy(_Strategy):
                 f"which is a type {type(dt)}."
             )
 
-        # If no datetime is specified, use the current datetime
+        if asset is not None and not isinstance(asset, Asset):
+            raise TypeError(
+                f"Invalid asset parameter in add_marker() method. Asset must be an Asset object, not a string or other type. "
+                f"Got {asset}, which is a type {type(asset)}. Use Asset(symbol='SPY', asset_type='stock') to create an Asset."
+            )
+
+        color = self._normalize_plot_color(color, default="blue", context="marker")
+
+        def _coerce_finite(label: str, number):
+            if number is None:
+                return None
+            try:
+                num = float(number)
+            except (TypeError, ValueError):
+                self.logger.warning(f"Skipping {label} marker: value '{number}' is not numeric.")
+                return None
+            if math.isnan(num) or math.isinf(num):
+                self.logger.warning(f"Skipping {label} marker: value '{number}' is not finite.")
+                return None
+            return num
+
         if dt is None:
             dt = self.get_datetime()
 
-        # If no value is specified, use the current portfolio value
         if value is None:
-            value = self.get_portfolio_value()
+            value = self.portfolio_value
+
+        numeric_value = _coerce_finite(name, value)
+        if numeric_value is None:
+            return None
+
+        if size is not None and size <= 0:
+            self.logger.warning("Marker size must be positive; ignoring the size override.")
+            size = None
+
+        value = numeric_value
 
         # Check for duplicate markers
         if len(self._chart_markers_list) > 0:
@@ -2997,6 +3650,15 @@ class Strategy(_Strategy):
             "value": value,
             "detail_text": detail_text,
             "plot_name": plot_name,
+            # Asset fields for multi-symbol charting support
+            "asset_symbol": asset.symbol if asset else None,
+            "asset_type": asset.asset_type if asset else None,
+            "asset_expiration": str(asset.expiration) if asset and asset.expiration else None,
+            "asset_strike": asset.strike if asset else None,
+            "asset_right": asset.right if asset else None,
+            "asset_multiplier": asset.multiplier if asset else None,
+            "quote_symbol": asset._quote_asset.symbol if asset and hasattr(asset, '_quote_asset') and asset._quote_asset else None,
+            "asset_display_name": str(asset) if asset else None,
         }
 
         self._chart_markers_list.append(new_marker)
@@ -3025,7 +3687,8 @@ class Strategy(_Strategy):
             width: int = None,
             detail_text: str = None,
             dt: Union[datetime.datetime, pd.Timestamp] = None,
-            plot_name: str = "default_plot"
+            plot_name: str = "default_plot",
+            asset: Asset = None
             ):
         """Adds a line data point to the indicator chart. This can be used to add lines such as bollinger bands, prices for specific assets, or any other line you want to add to the chart.
 
@@ -3036,7 +3699,7 @@ class Strategy(_Strategy):
         value : float or int
             The value of the line.
         color : str
-            The color of the line. Possible values are "red", "green", "blue", "yellow", "orange", "purple", "pink", "brown", "black", "white", "gray", "lightgray", "darkgray", "lightblue", "darkblue", "lightgreen", "darkgreen", "lightred", "darkred" and any hex color code.
+            The color of the line. Use any Matplotlib/Plotly compatible color name (e.g. "red", "magenta", "lightblue") or a hex string like "#ff0000".
         style : str
             The style of the line. Possible values are "solid", "dotted", and "dashed".
         width : int
@@ -3047,11 +3710,22 @@ class Strategy(_Strategy):
             The datetime of the line. Default is the current datetime.
         plot_name : str
             The name of the subplot to add the line to. If "default_plot" (the default value) or None, the line will be added to the main plot.
+        asset : Asset, optional
+            The Asset object to associate with this line. Indicators are almost always tied to specific assets,
+            so if you have an asset object, you should pass it here. This enables proper multi-symbol charting
+            where indicators can be displayed as overlays on their corresponding asset's price chart rather than
+            as separate subplots. Must be an Asset object, not a string.
+
+        Note
+        ----
+        Colors are validated before plotting; use Matplotlib/Plotly color names or hex codes.
 
         Example
         -------
         >>> # Will add a line to the chart
         >>> self.add_chart_line("Overbought", value=80, color="red", style="dotted", width=2)
+        >>> # Will add a line associated with a specific asset
+        >>> self.add_line("SMA_20", sma_value, color="blue", dt=dt, asset=my_asset)
         """
 
         # Check that the parameters are valid
@@ -3097,23 +3771,183 @@ class Strategy(_Strategy):
                 f"which is a type {type(dt)}."
             )
 
+        if asset is not None and not isinstance(asset, Asset):
+            raise TypeError(
+                f"Invalid asset parameter in add_line() method. Asset must be an Asset object, not a string or other type. "
+                f"Got {asset}, which is a type {type(asset)}. Use Asset(symbol='SPY', asset_type='stock') to create an Asset."
+            )
+
+        if color is not None:
+            color = self._normalize_plot_color(color, default="blue", context="line")
+
+        if style not in {"solid", "dotted", "dashed"}:
+            self.logger.warning(f"Unsupported line style '{style}', defaulting to solid.")
+            style = "solid"
+
+        value = float(value)
+        if math.isnan(value) or math.isinf(value):
+            self.logger.warning("Skipping line because value is not finite.")
+            return None
+
+        if width is not None and width <= 0:
+            self.logger.warning("Line width must be positive; ignoring the width override.")
+            width = None
+
         # If no datetime is specified, use the current datetime
         if dt is None:
             dt = self.get_datetime()
 
         # Whenever you want to add a new line, use the following code
-        self._chart_lines_list.append(
-            {
-                "datetime": dt,
-                "name": name,
-                "value": value,
-                "color": color,
-                "style": style,
-                "width": width,
-                "detail_text": detail_text,
-                "plot_name": plot_name,
-            }
-        )
+        new_line = {
+            "datetime": dt,
+            "name": name,
+            "value": value,
+            "color": color,
+            "style": style,
+            "width": width,
+            "detail_text": detail_text,
+            "plot_name": plot_name,
+            # Asset fields for multi-symbol charting support
+            "asset_symbol": asset.symbol if asset else None,
+            "asset_type": asset.asset_type if asset else None,
+            "asset_expiration": str(asset.expiration) if asset and asset.expiration else None,
+            "asset_strike": asset.strike if asset else None,
+            "asset_right": asset.right if asset else None,
+            "asset_multiplier": asset.multiplier if asset else None,
+            "quote_symbol": asset._quote_asset.symbol if asset and hasattr(asset, '_quote_asset') and asset._quote_asset else None,
+            "asset_display_name": str(asset) if asset else None,
+        }
+
+        self._chart_lines_list.append(new_line)
+        return new_line
+
+    def add_ohlc(
+            self,
+            name: str,
+            open: float,
+            high: float,
+            low: float,
+            close: float,
+            color: str = None,
+            detail_text: str = None,
+            dt: Union[datetime.datetime, pd.Timestamp] = None,
+            plot_name: str = "default_plot",
+            asset: Asset = None
+    ):
+        """Adds an OHLC (candlestick) data point to the indicator chart.
+
+        This can be used to plot price bars, Heikin Ashi candles, or any other
+        OHLC series on the indicator chart. OHLC data is exported to indicators.csv
+        with type="ohlc" and (when supported by the viewer) can be rendered as
+        candlesticks.
+
+        Parameters
+        ----------
+        name : str
+            The name of the OHLC series.
+        open : float
+            The opening value for the bar.
+        high : float
+            The high value for the bar.
+        low : float
+            The low value for the bar.
+        close : float
+            The closing value for the bar.
+        color : str, optional
+            The color for this bar. If omitted, defaults to "green" for bullish
+            (close >= open) and "red" for bearish (close < open).
+        detail_text : str, optional
+            Additional hover text.
+        dt : datetime.datetime or pandas.Timestamp, optional
+            The datetime for this bar. Defaults to current strategy datetime.
+        plot_name : str, optional
+            Subplot name. Default "default_plot".
+        asset : Asset, optional
+            Asset metadata for multi-symbol charting.
+        """
+
+        if not isinstance(name, str):
+            raise ValueError(
+                f"Invalid name parameter in add_ohlc() method. Name must be a string but instead got {name}, "
+                f"which is a type {type(name)}."
+            )
+
+        for label, number in (("open", open), ("high", high), ("low", low), ("close", close)):
+            if not isinstance(number, (float, int, np.float64)):
+                raise ValueError(
+                    f"Invalid {label} parameter in add_ohlc() method. {label} must be a float or int but instead got {number}, "
+                    f"which is a type {type(number)}."
+                )
+
+        if color is not None and not isinstance(color, str):
+            raise ValueError(
+                f"Invalid color parameter in add_ohlc() method. Color must be a string but instead got {color}, "
+                f"which is a type {type(color)}."
+            )
+
+        if detail_text is not None and not isinstance(detail_text, str):
+            raise ValueError(
+                f"Invalid detail_text parameter in add_ohlc() method. Detail_text must be a string but instead got "
+                f"{detail_text}, which is a type {type(detail_text)}."
+            )
+
+        if dt is not None and not isinstance(dt, (datetime.datetime, pd.Timestamp)):
+            raise ValueError(
+                f"Invalid dt parameter in add_ohlc() method. Dt must be a datetime.datetime but instead got {dt}, "
+                f"which is a type {type(dt)}."
+            )
+
+        if asset is not None and not isinstance(asset, Asset):
+            raise TypeError(
+                f"Invalid asset parameter in add_ohlc() method. Asset must be an Asset object, not a string or other type. "
+                f"Got {asset}, which is a type {type(asset)}. Use Asset(symbol='SPY', asset_type='stock') to create an Asset."
+            )
+
+        open = float(open)
+        high = float(high)
+        low = float(low)
+        close = float(close)
+
+        if any(math.isnan(x) or math.isinf(x) for x in (open, high, low, close)):
+            self.logger.error("Skipping OHLC bar because one or more values are not finite.")
+            return None
+
+        if high < low or high < max(open, close) or low > min(open, close):
+            self.logger.error(
+                "Skipping OHLC bar because values are invalid: "
+                f"open={open}, high={high}, low={low}, close={close}."
+            )
+            return None
+
+        if dt is None:
+            dt = self.get_datetime()
+
+        default_color = "green" if close >= open else "red"
+        color = self._normalize_plot_color(color, default=default_color, context="ohlc")
+
+        new_ohlc = {
+            "datetime": dt,
+            "name": name,
+            "open": open,
+            "high": high,
+            "low": low,
+            "close": close,
+            "color": color,
+            "detail_text": detail_text,
+            "plot_name": plot_name,
+            # Asset fields for multi-symbol charting support
+            "asset_symbol": asset.symbol if asset else None,
+            "asset_type": asset.asset_type if asset else None,
+            "asset_expiration": str(asset.expiration) if asset and asset.expiration else None,
+            "asset_strike": asset.strike if asset else None,
+            "asset_right": asset.right if asset else None,
+            "asset_multiplier": asset.multiplier if asset else None,
+            "quote_symbol": asset._quote_asset.symbol if asset and hasattr(asset, '_quote_asset') and asset._quote_asset else None,
+            "asset_display_name": str(asset) if asset else None,
+        }
+
+        self._chart_ohlc_list.append(new_ohlc)
+        return new_ohlc
 
     def get_lines_df(self):
         """Returns a dataframe of the lines on the indicator chart.
@@ -3126,6 +3960,11 @@ class Strategy(_Strategy):
 
         df = pd.DataFrame(self._chart_lines_list)
 
+        return df
+
+    def get_ohlc_df(self):
+        """Returns the OHLC data on the indicator chart as a pandas DataFrame."""
+        df = pd.DataFrame(self._chart_ohlc_list)
         return df
 
     def write_backtest_settings(self, settings_file: str):
@@ -3148,6 +3987,32 @@ class Strategy(_Strategy):
         """
         datasource = self.broker.data_source
         auto_adjust = datasource.auto_adjust if hasattr(datasource, "auto_adjust") else False
+
+        lumibot_version = None
+        backtesting_data_sources = None
+        backtest_time_seconds = None
+        try:
+            import lumibot as _lumibot
+
+            lumibot_version = getattr(_lumibot, "__version__", None)
+        except Exception:
+            pass
+        try:
+            backtesting_data_sources = (
+                os.environ.get("BACKTESTING_DATA_SOURCES")
+                or os.environ.get("BACKTESTING_DATA_SOURCE")
+                or type(datasource).__name__
+            )
+        except Exception:
+            backtesting_data_sources = os.environ.get("BACKTESTING_DATA_SOURCE")
+        try:
+            backtest_time_seconds = getattr(self, "_backtest_time_seconds", None)
+            if backtest_time_seconds is None:
+                start_ts = getattr(self, "_backtest_time_start_monotonic", None)
+                if start_ts is not None:
+                    backtest_time_seconds = time.monotonic() - float(start_ts)
+        except Exception:
+            pass
         settings = {
             "name": self.name,
             "backtesting_start": str(self.backtesting_start),
@@ -3161,22 +4026,136 @@ class Strategy(_Strategy):
             "quote_asset": self.quote_asset,
             "benchmark_asset": self._benchmark_asset,
             "starting_positions": self.starting_positions,
-            "parameters": {k: v for k, v in self.parameters.items() if k != 'pandas_data'}
+            "parameters": {k: v for k, v in self.parameters.items() if k != 'pandas_data'},
+            "lumibot_version": lumibot_version,
+            "backtesting_data_sources": backtesting_data_sources,
+            "backtest_time_seconds": backtest_time_seconds,
         }
+        profiling_enabled = bool(getattr(self, "_backtest_profiling_enabled", False))
+        if profiling_enabled:
+            settings["profiling_enabled"] = True
+            settings["profiling_tool"] = getattr(self, "_backtest_profiling_tool", None)
+            settings["profiling_format"] = getattr(self, "_backtest_profiling_format", None)
+            settings["profiling_clock"] = getattr(self, "_backtest_profiling_clock", None)
+            settings["profiling_artifact"] = getattr(self, "_backtest_profiling_artifact", None)
+
+        # Non-secret telemetry (best-effort; must never crash a backtest).
+        #
+        # These fields are intentionally safe to share in artifacts:
+        # - do NOT include API keys or AWS secret keys
+        # - include only config identifiers + counters
+        try:
+            settings["datadownloader_base_url"] = os.environ.get("DATADOWNLOADER_BASE_URL")
+            settings["datadownloader_skip_local_start"] = os.environ.get("DATADOWNLOADER_SKIP_LOCAL_START")
+        except Exception:
+            pass
+
+        try:
+            from lumibot.tools.backtest_cache import get_backtest_cache
+
+            cache = get_backtest_cache()
+            settings["remote_cache"] = {
+                "backend": os.environ.get("LUMIBOT_CACHE_BACKEND"),
+                "mode": os.environ.get("LUMIBOT_CACHE_MODE"),
+                "s3_bucket": os.environ.get("LUMIBOT_CACHE_S3_BUCKET"),
+                "s3_prefix": os.environ.get("LUMIBOT_CACHE_S3_PREFIX"),
+                "s3_region": os.environ.get("LUMIBOT_CACHE_S3_REGION"),
+                "s3_version": os.environ.get("LUMIBOT_CACHE_S3_VERSION"),
+            }
+            settings["remote_cache_stats"] = cache.stats_snapshot()
+        except Exception:
+            pass
+
+        try:
+            from lumibot.tools.data_downloader_queue_client import queue_telemetry_snapshot
+
+            settings["thetadata_queue_telemetry"] = queue_telemetry_snapshot()
+        except Exception:
+            pass
         os.makedirs(os.path.dirname(settings_file), exist_ok=True)
         with open(settings_file, "w") as outfile:
             json = jsonpickle.encode(settings)
             outfile.write(json)
+
+    def _parse_timestep(self, timestep: str) -> tuple:
+        """Parse various timestep formats into (multiplier, base_unit).
+
+        Examples:
+            "5min", "5m", "5 minutes" -> (5, "minute")
+            "1h", "1hour" -> (60, "minute")
+            "2d", "2 days" -> (2, "day")
+            "minute" -> (1, "minute")
+            "day" -> (1, "day")
+
+        Returns None if unparseable.
+        """
+        if not timestep:
+            return None
+
+        # Normalize: lowercase, strip whitespace
+        timestep = str(timestep).lower().strip()
+
+        # Handle standard formats first
+        if timestep in ["minute", "minutes", "min", "m"]:
+            return (1, "minute")
+        if timestep in ["day", "days", "d"]:
+            return (1, "day")
+
+        # Try to extract number and unit
+        import re
+
+        # Match patterns like "5min", "5 min", "5 minutes", "5m"
+        pattern = r'^(\d+)\s*([a-z]+)$'
+        match = re.match(pattern, timestep)
+
+        if not match:
+            # Try without number (e.g., "hour" -> 1 hour)
+            pattern = r'^([a-z]+)$'
+            match = re.match(pattern, timestep)
+            if match:
+                unit = match.group(1)
+                multiplier = 1
+            else:
+                return None
+        else:
+            multiplier = int(match.group(1))
+            unit = match.group(2)
+
+        # Map unit aliases to base units
+        minute_aliases = ["m", "min", "mins", "minute", "minutes"]
+        hour_aliases = ["h", "hr", "hrs", "hour", "hours"]
+        day_aliases = ["d", "day", "days"]
+        week_aliases = ["w", "wk", "week", "weeks"]
+        month_aliases = ["mo", "month", "months"]
+
+        if unit in minute_aliases:
+            return (multiplier, "minute")
+        elif unit in hour_aliases:
+            # Convert hours to minutes
+            return (multiplier * 60, "minute")
+        elif unit in day_aliases:
+            return (multiplier, "day")
+        elif unit in week_aliases:
+            # Convert weeks to days
+            return (multiplier * 7, "day")
+        elif unit in month_aliases:
+            # Approximate months as 30 days
+            return (multiplier * 30, "day")
+
+        # If we can't parse it, return None
+        return None
 
     def get_historical_prices(
         self,
         asset: Union[Asset, str],
         length: int,
         timestep: str = "",
-        timeshift: datetime.timedelta = None,
+        timeshift: Union[int, datetime.timedelta, None] = None,
         quote: Asset = None,
         exchange: str = None,
         include_after_hours: bool = True,
+        *args,
+        **kwargs
     ):
         """Get historical pricing data for a given symbol or asset.
 
@@ -3193,14 +4172,26 @@ class Strategy(_Strategy):
         length : int
             The number of rows (number of timesteps)
         timestep : str
-            Either ``"minute"`` for minutes data or ``"day"``
-            for days data default value depends on the data_source (minute
-            for alpaca, day for yahoo, ...).  If you need, you can specify the width of the bars by adding a number
-            before the timestep (e.g. "5 minutes", "15 minutes", "1 day", "2 weeks", "1month", ...)
-        timeshift : timedelta
-            ``None`` by default. If specified indicates the time shift from
-            the present. If  backtesting in Pandas, use integer representing
-            number of bars.
+            Time interval for each bar. Supports multiple formats:
+
+            **Basic formats:**
+                - ``"minute"`` or ``"day"`` - Single minute or day bars
+
+            **Multi-timeframe formats (automatically aggregated):**
+                - Minutes: ``"5min"``, ``"5m"``, ``"5 minutes"``, ``"15min"``, ``"30m"``, etc.
+                - Hours: ``"1h"``, ``"1hour"``, ``"2h"``, ``"4 hours"``, etc. (converted to minutes)
+                - Days: ``"2d"``, ``"2 days"``, ``"1 week"``, ``"1w"``, etc.
+                - Flexible formatting: Case-insensitive, with/without spaces
+
+            When using multi-timeframe formats, the method automatically fetches the
+            underlying minute or day data and resamples it to your desired timeframe.
+            Default value depends on the data_source (minute for alpaca, day for yahoo, ...)
+        timeshift : int, timedelta, or None
+            ``None`` by default. When provided it shifts the data window relative to
+            the current backtest time.
+
+            - Passing an ``int`` shifts by bars (positive = past, negative = future).
+            - Passing a ``timedelta`` shifts by wall-clock time (e.g. ``timedelta(hours=-1)``).
         quote : Asset
             The quote currency for crypto currencies (e.g. USD, USDT, EUR, ...).
             Default is the quote asset for the strategy.
@@ -3208,13 +4199,17 @@ class Strategy(_Strategy):
             The exchange to pull the historical data from. Default is None (decided based on the broker)
         include_after_hours : bool
             Whether to include after hours data. Default is True. Currently only works with Interactive Brokers.
+        return_polars : bool (deprecated)
+            Deprecated. Do not use in strategy code. This keyword will be removed in a future release.
+            Strategy logic should use pandas operations on ``bars.pandas_df`` and should not depend on
+            the underlying DataFrame backend.
 
         Returns
         -------
         Bars
             The bars object with all the historical pricing data. Please check the ``Entities.Bars``
             object documentation for more details on how to use Bars objects. To get a ``DataFrame``
-            from the Bars object, use ``bars.df``.
+            from the Bars object, use ``bars.pandas_df``.
 
         Example
         -------
@@ -3224,10 +4219,10 @@ class Strategy(_Strategy):
         >>> # Get the data for SPY for the last 2 days
         >>> bars =  self.get_historical_prices("SPY", 2, "day")
         >>> # To get the DataFrame of SPY data
-        >>> df = bars.df
+        >>> df = bars.pandas_df
         >>>
         >>> # Then, to get the DataFrame of SPY data
-        >>> df = bars.df
+        >>> df = bars.pandas_df
         >>> last_ohlc = df.iloc[-1] # Get the last row of the DataFrame (the most recent pricing data we have)
         >>> self.log_message(f"Last price of BTC in USD: {last_ohlc['close']}, and the open price was {last_ohlc['open']}")
 
@@ -3235,16 +4230,28 @@ class Strategy(_Strategy):
         >>> bars =  self.get_historical_prices("AAPL", 30, "minute")
         >>>
         >>> # Then, to get the DataFrame of SPY data
-        >>> df = bars.df
+        >>> df = bars.pandas_df
         >>> last_ohlc = df.iloc[-1] # Get the last row of the DataFrame (the most recent pricing data we have)
-        >>> self.log_message(f"Last price of BTC in USD: {last_ohlc['close']}, and the open price was {last_ohlc['open']}")
+        >>> self.log_message(f"Last price of AAPL: {last_ohlc['close']}, and the open price was {last_ohlc['open']}")
+
+        >>> # Get 5-minute bars for the last 10 5-minute periods (using new multi-timeframe support)
+        >>> bars = self.get_historical_prices("SPY", 10, "5min")
+        >>> df = bars.pandas_df  # DataFrame with 10 rows of 5-minute OHLCV data
+        >>>
+        >>> # Get hourly bars for the last 24 hours
+        >>> bars = self.get_historical_prices("AAPL", 24, "1h")
+        >>>
+        >>> # Get 15-minute bars (multiple format options work)
+        >>> bars = self.get_historical_prices("TSLA", 20, "15m")       # Short format
+        >>> bars = self.get_historical_prices("TSLA", 20, "15min")     # Alternative
+        >>> bars = self.get_historical_prices("TSLA", 20, "15 minutes") # With space
 
         >>> # Get the historical data for an AAPL option for the last 30 minutes
         >>> asset = self.create_asset("AAPL", asset_type="option", expiration=datetime.datetime(2020, 1, 1), strike=100, right="call")
         >>> bars =  self.get_historical_prices(asset, 30, "minute")
         >>>
         >>> # Then, to get the DataFrame of SPY data
-        >>> df = bars.df
+        >>> df = bars.pandas_df
         >>> last_ohlc = df.iloc[-1] # Get the last row of the DataFrame (the most recent pricing data we have)
         >>> self.log_message(f"Last price of BTC in USD: {last_ohlc['close']}, and the open price was {last_ohlc['open']}")
 
@@ -3256,16 +4263,35 @@ class Strategy(_Strategy):
         >>> bars =  self.get_historical_prices(asset_base, 2, "day", quote=asset_quote)
         >>>
         >>> # Then, to get the DataFrame of SPY data
-        >>> df = bars.df
+        >>> df = bars.pandas_df
         >>> last_ohlc = df.iloc[-1] # Get the last row of the DataFrame (the most recent pricing data we have)
         >>> self.log_message(f"Last price of BTC in USD: {last_ohlc['close']}, and the open price was {last_ohlc['open']}")
         """
+        if args:
+            if len(args) != 1:
+                raise TypeError("get_historical_prices() accepts at most 1 extra positional argument (deprecated `return_polars`)")
+            if "return_polars" in kwargs:
+                raise TypeError("get_historical_prices() got multiple values for keyword argument 'return_polars'")
+            kwargs["return_polars"] = args[0]
+
+        return_polars_provided = "return_polars" in kwargs
+        return_polars = kwargs.pop("return_polars", False)
+        if return_polars_provided:
+            warnings.warn(
+                "`return_polars` is deprecated and will be removed. "
+                "Do not depend on the DataFrame backend; use `bars.pandas_df` for pandas.",
+                category=DeprecationWarning,
+                stacklevel=2,
+            )
+        if kwargs:
+            unexpected = ", ".join(sorted(kwargs))
+            raise TypeError(f"get_historical_prices() got unexpected keyword argument(s): {unexpected}")
 
         # Get that length is type int and if not try to cast it
         if not isinstance(length, int):
             try:
                 length = int(length)
-            except Exception as e:
+            except Exception:
                 raise ValueError(
                     f"Invalid length parameter in get_historical_prices() method. Length must be an int but instead got {length}, "
                     f"which is a type {type(length)}."
@@ -3274,37 +4300,167 @@ class Strategy(_Strategy):
         if quote is None:
             quote = self.quote_asset
 
-        # Only log once per asset to reduce noise
-        asset_key = f"{asset}_{length}_{timestep}"
-        if asset_key not in self._logged_get_historical_prices_assets:
-            self.logger.info(f"Getting historical prices for {asset}, {length} bars, {timestep}")
-            self._logged_get_historical_prices_assets.add(asset_key)
+        # Parse timestep to check if we need to aggregate
+        original_timestep = timestep
+        parsed = self._parse_timestep(timestep) if timestep else None
+
+        # Determine the actual timestep to use for data fetching
+        if parsed and parsed[0] > 1:
+            # Multi-timeframe request detected.
+            #
+            # Backtesting data sources already implement aggregation via Data.get_bars()
+            # (see `lumibot/entities/data.py`). In backtests, avoid doing an extra layer of
+            # resampling here; instead pass the original timestep (e.g., "15min") through to
+            # the backtesting data source so it can slice/aggregate efficiently and cache
+            # results internally.
+            multiplier, base_unit = parsed
+            if getattr(self, "is_backtesting", False) or getattr(getattr(self, "broker", None), "IS_BACKTESTING_BROKER", False):
+                actual_timestep = original_timestep
+                actual_length = length
+                needs_resampling = False
+            else:
+                actual_timestep = base_unit
+                actual_length = length * multiplier
+                needs_resampling = True
+        elif parsed:
+            # Standard format (1 minute or 1 day)
+            multiplier, base_unit = parsed
+            actual_timestep = base_unit
+            actual_length = length
+            needs_resampling = False
+        else:
+            # Use original timestep if parsing failed or empty
+            actual_timestep = timestep if timestep else None
+            actual_length = length
+            needs_resampling = False
 
         asset = self._sanitize_user_asset(asset)
 
         asset = self.crypto_assets_to_tuple(asset, quote)
-        if not timestep:
-            timestep = self.broker.data_source.get_timestep()
-        if self.broker.option_source and asset.asset_type == "option":
-            return self.broker.option_source.get_historical_prices(
+        if not actual_timestep:
+            actual_timestep = self.broker.data_source.get_timestep()
+
+        # Only log once per asset to reduce noise.
+        # PERF: avoid per-call f-string construction in hot loops; use a tuple key.
+        asset_key = (asset, int(length), original_timestep)
+        if asset_key not in self._logged_get_historical_prices_assets:
+            if needs_resampling:
+                self.logger.info(
+                    f"Getting historical prices for {asset}, {length} bars of {original_timestep} "
+                    f"(fetching {actual_length} {actual_timestep} bars)"
+                )
+            else:
+                self.logger.info(f"Getting historical prices for {asset}, {length} bars, {original_timestep}")
+            self._logged_get_historical_prices_assets.add(asset_key)
+
+        effective_return_polars = return_polars
+
+        # Call through to the appropriate data source. Only pass `return_polars` if supported
+        # to maintain compatibility with live data sources that don't yet accept it.
+        #
+        # PERF: avoid per-call nested function creation/dict allocations; keep this inline and cache
+        # `return_polars` support per data source type.
+        supports_cache = getattr(self, "_get_hist_supports_return_polars_by_ds_type", None)
+        if supports_cache is None:
+            supports_cache = {}
+            setattr(self, "_get_hist_supports_return_polars_by_ds_type", supports_cache)
+
+        ds = self.broker.data_source
+        if self.broker.option_source and getattr(asset, "asset_type", None) == "option":
+            ds = self.broker.option_source
+
+        ds_type = type(ds)
+        supports_return_polars = supports_cache.get(ds_type)
+        if supports_return_polars is None:
+            try:
+                params = inspect.signature(ds_type.get_historical_prices).parameters
+                supports_return_polars = (
+                    "return_polars" in params
+                    or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+                )
+            except Exception:
+                # Conservative default: if we can't inspect, assume it does NOT support return_polars
+                # so we don't raise TypeError by passing an unknown kwarg.
+                supports_return_polars = False
+            supports_cache[ds_type] = bool(supports_return_polars)
+
+        fn = ds.get_historical_prices
+        if supports_return_polars:
+            bars = fn(
                 asset,
-                length,
-                timestep=timestep,
+                actual_length,  # Use the actual length for fetching
+                timestep=actual_timestep,
                 timeshift=timeshift,
                 exchange=exchange,
                 include_after_hours=include_after_hours,
                 quote=quote,
+                return_polars=effective_return_polars,
             )
         else:
-            return self.broker.data_source.get_historical_prices(
+            bars = fn(
                 asset,
-                length,
-                timestep=timestep,
+                actual_length,  # Use the actual length for fetching
+                timestep=actual_timestep,
                 timeshift=timeshift,
                 exchange=exchange,
                 include_after_hours=include_after_hours,
                 quote=quote,
             )
+
+        # If we need to resample the data
+        if needs_resampling and bars and len(bars) > 0:
+            resampled_with_polars = False
+            if return_polars:
+                try:
+                    polars_frame = bars.polars_df
+                    resampled_frame = resample_polars_ohlc(polars_frame, multiplier, base_unit, length)
+                    if resampled_frame is not None and not resampled_frame.is_empty():
+                        bars.df = resampled_frame
+                        resampled_with_polars = True
+                except PolarsResampleError as exc:
+                    self.logger.debug(
+                        "Unsupported polars resample for %s (%s); falling back to pandas.",
+                        asset,
+                        exc,
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        "Polars resample failed for %s; falling back to pandas. Error: %s",
+                        asset,
+                        exc,
+                    )
+            if not resampled_with_polars:
+                try:
+                    import pandas as pd
+
+                    df = bars.pandas_df.copy()
+                    if not isinstance(df.index, pd.DatetimeIndex):
+                        df.index = pd.to_datetime(df.index)
+
+                    if base_unit == "minute":
+                        resample_rule = f"{multiplier}min"
+                    elif base_unit == "day":
+                        resample_rule = f"{multiplier}D"
+                    else:
+                        return bars
+
+                    resampled_df = df.resample(resample_rule, label='left', closed='left').agg({
+                        'open': 'first',
+                        'high': 'max',
+                        'low': 'min',
+                        'close': 'last',
+                        'volume': 'sum'
+                    }).dropna()
+
+                    if len(resampled_df) > length:
+                        resampled_df = resampled_df.iloc[-length:]
+
+                    bars.df = resampled_df
+                except Exception as e:
+                    # If resampling fails, log warning and return original data
+                    self.logger.warning(f"Failed to resample data from {actual_timestep} to {original_timestep}: {e}")
+
+        return bars
 
     def get_symbol_bars(
         self,
@@ -3343,6 +4499,7 @@ class Strategy(_Strategy):
         max_workers: int = 200,
         exchange: str = None,
         include_after_hours: bool = True,
+        sleep_time: float | None = None,
     ):
         """Get historical pricing data for the list of assets.
 
@@ -3374,6 +4531,11 @@ class Strategy(_Strategy):
         include_after_hours : bool
             ``True`` by default. If ``False``, only return bars that are during
             regular trading hours. If ``True``, return all bars. Currently only works for Interactive Brokers.
+        sleep_time : float, optional
+            Sleep between per-asset fetches to reduce the likelihood of upstream rate limiting.
+            When omitted (``None``), LumiBot defaults to:
+            - ``0`` for backtesting data sources
+            - ``0.1`` seconds for live data sources
 
         Returns
         -------
@@ -3409,6 +4571,11 @@ class Strategy(_Strategy):
             self._logged_get_historical_prices_assets.add(assets_key)
 
         assets = [self._sanitize_user_asset(asset) for asset in assets]
+
+        effective_sleep_time = sleep_time
+        if effective_sleep_time is None:
+            data_source = getattr(getattr(self, "broker", None), "data_source", None)
+            effective_sleep_time = 0.0 if getattr(data_source, "IS_BACKTESTING_DATA_SOURCE", False) else 0.1
         return self.broker.data_source.get_bars(
             assets,
             length,
@@ -3417,6 +4584,7 @@ class Strategy(_Strategy):
             chunk_size=chunk_size,
             max_workers=max_workers,
             exchange=exchange,
+            sleep_time=effective_sleep_time
         )
 
     def get_bars(
@@ -3428,6 +4596,7 @@ class Strategy(_Strategy):
         chunk_size: int = 100,
         max_workers: int = 200,
         exchange: str = None,
+        sleep_time: float | None = None,
     ):
         """
         This method is deprecated and will be removed in a future version.
@@ -3445,6 +4614,7 @@ class Strategy(_Strategy):
             chunk_size=chunk_size,
             max_workers=max_workers,
             exchange=exchange,
+            sleep_time=sleep_time
         )
 
     def start_realtime_bars(self, asset: Asset, keep_bars: int = 30):
@@ -4096,20 +5266,22 @@ class Strategy(_Strategy):
         pandas_data: List[Data] = None,
         quote_asset: Asset = Asset(symbol="USD", asset_type="forex"),
         starting_positions: dict = None,
-        show_plot: bool = True,
+        show_plot: bool | None = None,
         tearsheet_file: str = None,
         save_tearsheet: bool = True,
-        show_tearsheet: bool = True,
+        show_tearsheet: bool | None = None,
         parameters: dict = {},
         buy_trading_fees: List[TradingFee] = [],
         sell_trading_fees: List[TradingFee] = [],
+        buy_trading_slippages: List[TradingSlippage] = [],
+        sell_trading_slippages: List[TradingSlippage] = [],
         polygon_api_key: str = None,
         indicators_file: str = None,
-        show_indicators: bool = True,
+        show_indicators: bool | None = None,
         save_logfile: bool = False,
         thetadata_username: str = None,
         thetadata_password: str = None,
-        use_quote_data: bool = False,
+        use_quote_data: bool = True,  # Changed to True for ThetaData options support
         show_progress_bar: bool = True,
         quiet_logs: bool = True,
         trader_class: Type[Trader] = Trader,
@@ -4180,6 +5352,10 @@ class Strategy(_Strategy):
             A list of TradingFee objects to apply to the buy orders during backtests.
         sell_trading_fees : list of TradingFee objects
             A list of TradingFee objects to apply to the sell orders during backtests.
+        buy_trading_slippages : list of TradingSlippage objects
+            Slippage amounts to apply to buy SMART_LIMIT fills when no per-order slippage is provided.
+        sell_trading_slippages : list of TradingSlippage objects
+            Slippage amounts to apply to sell SMART_LIMIT fills when no per-order slippage is provided.
         polygon_api_key : str
             The polygon api key to use for polygon data. Only required if you are using PolygonDataBacktesting as
             the datasource_class.
@@ -4265,6 +5441,8 @@ class Strategy(_Strategy):
             parameters=parameters,
             buy_trading_fees=buy_trading_fees,
             sell_trading_fees=sell_trading_fees,
+            buy_trading_slippages=buy_trading_slippages,
+            sell_trading_slippages=sell_trading_slippages,
             polygon_api_key=polygon_api_key,
             indicators_file=indicators_file,
             show_indicators=show_indicators,

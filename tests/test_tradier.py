@@ -1,6 +1,10 @@
 import datetime as dt
 import os
+import base64
+import json
+import time
 from time import sleep
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -8,8 +12,17 @@ import pytest
 
 from lumibot.brokers.tradier import Tradier
 from lumibot.data_sources.tradier_data import TradierData
-from lumibot.entities import Asset, Order, Position
+from lumibot.entities import Asset, Order, Position, SmartLimitConfig, SmartLimitPreset
 from lumibot.credentials import TRADIER_TEST_CONFIG
+from lumibot.strategies.strategy import Strategy
+
+
+class _StubStrategy(Strategy):
+    def initialize(self, parameters=None):
+        self.sleeptime = "1M"
+
+    def on_trading_iteration(self):
+        return
 
 
 def pytest_collection_modifyitems(config, items):
@@ -60,10 +73,71 @@ class TestTradierBroker:
     Unit tests for the Tradier broker. These tests do not require any API calls.
     """
 
+    def _b64url(self, obj: dict) -> str:
+        raw = json.dumps(obj).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
     def test_basics(self):
         broker = Tradier(account_number="1234", access_token="a1b2c3", paper=True, connect_stream=False)
         assert broker.name == "Tradier"
         assert broker._tradier_account_number == "1234"
+
+    def test_oauth_payload_sets_access_token(self, monkeypatch):
+        token_json = {
+            "access_token": "oauth-access",
+            "refresh_token": "oauth-refresh",
+            "expires_in": 86400,
+            "issued_at": int(time.time() * 1000),
+        }
+        monkeypatch.setenv("TRADIER_TOKEN", self._b64url(token_json))
+
+        broker = Tradier(
+            config={"ACCESS_TOKEN": None, "ACCOUNT_NUMBER": "1234", "PAPER": True},
+            connect_stream=False,
+        )
+
+        assert broker._oauth_enabled()
+        assert broker._tradier_access_token == "oauth-access"
+
+    def test_oauth_refresh_when_expired(self, monkeypatch):
+        # Expired token payload
+        token_json = {
+            "access_token": "old-access",
+            "refresh_token": "oauth-refresh",
+            "expires_in": 1,
+            "issued_at": int((time.time() - 3600) * 1000),
+        }
+        monkeypatch.setenv("TRADIER_TOKEN", self._b64url(token_json))
+        monkeypatch.setenv("TRADIER_REFRESH_TOKEN", "oauth-refresh")
+        monkeypatch.setenv("TRADIER_OAUTH_CLIENT_ID", "cid")
+        monkeypatch.setenv("TRADIER_OAUTH_CLIENT_SECRET", "secret")
+
+        class _Resp:
+            ok = True
+            status_code = 200
+            text = ""
+
+            def json(self):
+                return {
+                    "access_token": "new-access",
+                    "expires_in": 86400,
+                    "issued_at": int(time.time() * 1000),
+                }
+
+        # Patch requests.post in the Tradier broker module to avoid network.
+        from lumibot.brokers import tradier as tradier_module
+
+        def _fake_post(*args, **kwargs):
+            return _Resp()
+
+        monkeypatch.setattr(tradier_module.requests, "post", _fake_post)
+
+        broker = Tradier(
+            config={"ACCESS_TOKEN": None, "ACCOUNT_NUMBER": "1234", "PAPER": True},
+            connect_stream=False,
+        )
+
+        assert broker._tradier_access_token == "new-access"
 
     def test_modify_order(self, mocker):
         broker = Tradier(account_number="1234", access_token="a1b2c3", paper=True, connect_stream=False)
@@ -154,6 +228,64 @@ class TestTradierBroker:
         mock_pull_positions.return_value = Position(strategy=strategy, asset=option_asset, quantity=0)
         option_order.side = "buy"
         assert broker._lumi_side2tradier(option_order) == "buy_to_open"
+
+    def test_smart_limit_submits_as_limit(self, mocker):
+        broker = Tradier(account_number="1234", access_token="a1b2c3", paper=True, connect_stream=False)
+        broker._set_initial_positions = mocker.MagicMock()
+        mocker.patch.object(Strategy, "update_broker_balances", return_value=None)
+        captured = {}
+
+        def _capture_submit(order):
+            captured["order_type"] = order.order_type
+            return order
+
+        broker.submit_order = mocker.MagicMock(side_effect=_capture_submit)
+
+        strategy = _StubStrategy(broker=broker, budget=100_000.0, analyze_backtest=False, parameters={})
+        strategy._first_iteration = False
+        strategy.get_quote = mocker.MagicMock(return_value=SimpleNamespace(bid=99.0, ask=101.0))
+
+        asset = Asset("SPY")
+        config = SmartLimitConfig(preset=SmartLimitPreset.NORMAL)
+        order = strategy.create_order(
+            asset,
+            1,
+            Order.OrderSide.BUY,
+            order_type=Order.OrderType.SMART_LIMIT,
+            smart_limit=config,
+        )
+        strategy.submit_order(order)
+
+        assert captured["order_type"] == Order.OrderType.LIMIT
+
+    def test_smart_limit_downgrades_to_market_without_quotes(self, mocker):
+        broker = Tradier(account_number="1234", access_token="a1b2c3", paper=True, connect_stream=False)
+        broker._set_initial_positions = mocker.MagicMock()
+        mocker.patch.object(Strategy, "update_broker_balances", return_value=None)
+        captured = {}
+
+        def _capture_submit(order):
+            captured["order_type"] = order.order_type
+            return order
+
+        broker.submit_order = mocker.MagicMock(side_effect=_capture_submit)
+
+        strategy = _StubStrategy(broker=broker, budget=100_000.0, analyze_backtest=False, parameters={})
+        strategy._first_iteration = False
+        strategy.get_quote = mocker.MagicMock(return_value=SimpleNamespace(bid=None, ask=None))
+
+        asset = Asset("SPY")
+        config = SmartLimitConfig(preset=SmartLimitPreset.NORMAL)
+        order = strategy.create_order(
+            asset,
+            1,
+            Order.OrderSide.BUY,
+            order_type=Order.OrderType.SMART_LIMIT,
+            smart_limit=config,
+        )
+        strategy.submit_order(order)
+
+        assert captured["order_type"] == Order.OrderType.MARKET
 
     def test_pull_broker_all_orders(self, mocker):
         """

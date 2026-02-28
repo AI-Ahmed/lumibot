@@ -1,14 +1,40 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+import logging
 import uuid
 from unittest.mock import patch, MagicMock
+import pytest
 
 from lumibot.backtesting import BacktestingBroker, YahooDataBacktesting
 from lumibot.example_strategies.stock_buy_and_hold import BuyAndHold
-from lumibot.entities import Asset, Order
+from lumibot.entities import Asset, Order, Position
+from lumibot.strategies.strategy import Strategy
 from apscheduler.triggers.cron import CronTrigger
+from lumibot.constants import LUMIBOT_DEFAULT_PYTZ, LUMIBOT_DEFAULT_TIMEZONE
 
 
+class FakeSnapshotSource:
+    def __init__(self):
+        self.snapshot = None
+        self.last_price_calls = 0
+
+    def get_price_snapshot(self, asset, *args, **kwargs):
+        return self.snapshot
+
+    def get_last_price(self, asset, *args, **kwargs):
+        self.last_price_calls += 1
+        return None
+
+
+# LEGACY TEST CLASS (created Aug 2023)
+# These tests explicitly test YahooDataBacktesting and must not be overridden
+# by the BACKTESTING_DATA_SOURCE environment variable.
+@pytest.mark.usefixtures("disable_datasource_override")
 class TestStrategyMethods:
+    def _make_strategy_stub(self):
+        strat = Strategy.__new__(Strategy)
+        strat.logger = logging.getLogger(__name__)
+        return strat
+
     def test_get_option_expiration_after_date(self):
         """
         Test the get_option_expiration_after_date method by checking that the correct expiration date is returned
@@ -143,6 +169,22 @@ class TestStrategyMethods:
         is_valid = strategy._validate_order(None)
         assert is_valid == False
 
+    def test_get_price_from_source_snapshot_fallback(self):
+        strat = self._make_strategy_stub()
+        strat._should_use_daily_last_price = MagicMock(return_value=False)
+        strat.get_last_price = MagicMock(return_value=321)
+        strat._pick_snapshot_price = MagicMock(return_value=42.0)
+
+        dummy_source = MagicMock()
+        dummy_source.get_price_snapshot.return_value = {"fake": "snapshot"}
+
+        asset = Asset("QQQ", Asset.AssetType.STOCK)
+        result = Strategy._get_price_from_source(strat, dummy_source, asset)
+
+        assert result == 42.0
+        strat._pick_snapshot_price.assert_called_once()
+        strat.get_last_price.assert_not_called()
+
     def test_validate_order_with_invalid_order_type(self):
         """
         Test that _validate_order rejects non-Order objects
@@ -196,6 +238,130 @@ class TestStrategyMethods:
 
         # Check that the job ID is correct
         assert job_id == "cron_callback_test-uuid"
+
+    def test_update_portfolio_value_with_missing_price(self):
+        """_update_portfolio_value should skip assets whose prices are missing instead of raising."""
+
+        date_start = datetime(2021, 7, 10)
+        date_end = datetime(2021, 7, 13)
+        data_source = YahooDataBacktesting(date_start, date_end)
+        backtesting_broker = BacktestingBroker(data_source)
+        strategy = BuyAndHold(
+            backtesting_broker,
+            backtesting_start=date_start,
+            backtesting_end=date_end,
+        )
+
+        asset = Asset("SPY")
+        position = Position(strategy._name, asset, quantity=1, avg_fill_price=430.0)
+        strategy.broker._filled_positions.append(position)
+
+        with patch.object(strategy.broker.data_source, "get_last_price", return_value=None):
+            original_value = strategy.get_portfolio_value()
+            updated_value = strategy._update_portfolio_value()
+
+        assert updated_value == original_value
+
+    def _setup_strategy_with_option_position(self):
+        date_start = datetime(2024, 1, 1)
+        date_end = datetime(2024, 1, 10)
+        data_source = YahooDataBacktesting(date_start, date_end)
+        backtesting_broker = BacktestingBroker(data_source)
+        strategy = BuyAndHold(
+            backtesting_broker,
+            backtesting_start=date_start,
+            backtesting_end=date_end,
+        )
+        option_asset = Asset(
+            "CVNA",
+            asset_type="option",
+            expiration=date(2026, 1, 16),
+            strike=180.0,
+            right="CALL",
+        )
+        option_asset.multiplier = 100
+        position = Position(strategy._name, option_asset, quantity=2, avg_fill_price=60.0)
+        strategy.broker.get_tracked_positions = MagicMock(return_value=[position])
+        strategy._quote_asset = Asset("USD", asset_type="forex")
+        source = FakeSnapshotSource()
+        strategy.broker.option_source = source
+        strategy.broker.data_source = MagicMock()
+        strategy.broker.data_source.get_last_price = MagicMock(return_value=None)
+        return strategy, position, option_asset, source
+
+    def test_update_portfolio_value_prefers_fresh_trade_snapshot(self):
+        strategy, position, option_asset, source = self._setup_strategy_with_option_position()
+        now = LUMIBOT_DEFAULT_PYTZ.localize(datetime(2025, 4, 7, 10, 30))
+        strategy.broker.data_source.get_datetime = MagicMock(return_value=now)
+        source.snapshot = {
+            "open": 60.0,
+            "high": 66.0,
+            "low": 58.0,
+            "close": 65.0,
+            "bid": 64.5,
+            "ask": 65.5,
+            "last_trade_time": now - timedelta(seconds=30),
+            "last_bid_time": now - timedelta(seconds=20),
+            "last_ask_time": now - timedelta(seconds=10),
+        }
+        starting_cash = strategy.cash
+
+        value = strategy._update_portfolio_value()
+        expected_price = 65.0
+        assert value == pytest.approx(starting_cash + position.quantity * option_asset.multiplier * expected_price)
+        assert source.last_price_calls == 0
+
+    def test_update_portfolio_value_uses_mid_when_trade_stale(self):
+        strategy, position, option_asset, source = self._setup_strategy_with_option_position()
+        now = LUMIBOT_DEFAULT_PYTZ.localize(datetime(2025, 4, 7, 10, 30))
+        strategy.broker.data_source.get_datetime = MagicMock(return_value=now)
+        source.snapshot = {
+            "open": 60.0,
+            "high": 66.0,
+            "low": 58.0,
+            "close": 65.0,
+            "bid": 70.0,
+            "ask": 74.0,
+            "last_trade_time": now - timedelta(minutes=10),
+            "last_bid_time": now - timedelta(seconds=20),
+            "last_ask_time": now - timedelta(seconds=10),
+        }
+        starting_cash = strategy.cash
+
+        with patch.object(strategy.logger, "warning") as warning_mock:
+            value = strategy._update_portfolio_value()
+
+        expected_price = (70.0 + 74.0) / 2.0
+        assert value == pytest.approx(starting_cash + position.quantity * option_asset.multiplier * expected_price)
+        warning_mock.assert_not_called()
+        assert source.last_price_calls == 0
+
+    def test_update_portfolio_value_logs_debug_when_all_snapshot_data_stale(self):
+        """Test that stale snapshot data triggers debug log and uses close price."""
+        strategy, position, option_asset, source = self._setup_strategy_with_option_position()
+        now = LUMIBOT_DEFAULT_PYTZ.localize(datetime(2025, 4, 7, 10, 30))
+        strategy.broker.data_source.get_datetime = MagicMock(return_value=now)
+        stale_dt = now - timedelta(minutes=10)
+        source.snapshot = {
+            "open": 60.0,
+            "high": 66.0,
+            "low": 58.0,
+            "close": 65.0,
+            "bid": 70.0,
+            "ask": 74.0,
+            "last_trade_time": stale_dt,
+            "last_bid_time": stale_dt,
+            "last_ask_time": stale_dt,
+        }
+        starting_cash = strategy.cash
+
+        with patch.object(strategy.logger, "debug") as debug_mock:
+            value = strategy._update_portfolio_value()
+
+        assert value == pytest.approx(starting_cash + position.quantity * option_asset.multiplier * 65.0)
+        # Debug is called for stale data - expected behavior in backtesting
+        debug_mock.assert_called_once()
+        assert source.last_price_calls == 0
 
     @patch('uuid.uuid4')
     def test_register_cron_callback_adds_job_to_scheduler(self, mock_uuid4):
@@ -327,3 +493,28 @@ class TestStrategyMethods:
         strategy.log_message.assert_called_once_with(
             f"Skipping registration of cron callback test_callback in backtesting mode"
         )
+
+
+def test_timezone_defaults_when_tzinfo_missing():
+    """Ensure Strategy.timezone and Strategy.pytz default when data source tzinfo is missing."""
+    date_start = datetime(2021, 7, 10)
+    date_end = datetime(2021, 7, 13)
+
+    # Create a data source and explicitly remove tzinfo
+    data_source = YahooDataBacktesting(date_start, date_end)
+    # Simulate a broker/data source that does not provide tzinfo
+    data_source.tzinfo = None
+
+    backtesting_broker = BacktestingBroker(data_source)
+    strategy = BuyAndHold(
+        backtesting_broker,
+        backtesting_start=date_start,
+        backtesting_end=date_end,
+    )
+
+    # timezone should fall back to the documented default string
+    assert strategy.timezone == LUMIBOT_DEFAULT_TIMEZONE
+
+    # pytz should fall back to the default tzinfo (pytz timezone)
+    # Compare by canonical name to avoid object identity assumptions
+    assert getattr(strategy.pytz, "zone", None) == LUMIBOT_DEFAULT_TIMEZONE

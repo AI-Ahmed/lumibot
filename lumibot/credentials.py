@@ -29,6 +29,15 @@ def find_and_load_dotenv(base_dir) -> bool:
             # Create a colored message for the log using termcolor
             colored_message = termcolor.colored(f".env file loaded from: {dotenv_path}", "green")
             logger.info(colored_message)
+
+            # Optional local override file. This is intentionally loaded *after* `.env` so it can
+            # override settings without requiring edits to the primary file (which may contain
+            # shared or sensitive values).
+            dotenv_local_path = os.path.join(root, ".env.local")
+            if os.path.exists(dotenv_local_path):
+                load_dotenv(dotenv_local_path, override=True)
+                colored_message = termcolor.colored(f".env.local file loaded from: {dotenv_local_path}", "green")
+                logger.info(colored_message)
             return True
 
     return False
@@ -37,9 +46,18 @@ def find_and_load_dotenv(base_dir) -> bool:
 # Get the directory of the original script being run
 script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
 logger.debug(f"script_dir: {script_dir}")
-found_dotenv = find_and_load_dotenv(script_dir)
+_disable_dotenv = os.environ.get("LUMIBOT_DISABLE_DOTENV", "").lower() in ("1", "true", "yes")
 
-if not found_dotenv:
+if _disable_dotenv:
+    # In production backtests we should rely on injected environment variables rather than scanning
+    # large directory trees for `.env` files. Recursive scanning can add seconds of startup latency and,
+    # worse, can accidentally load an unrelated `.env` if the working directory contains nested repos.
+    logger.debug("Skipping .env discovery because LUMIBOT_DISABLE_DOTENV is set.")
+    found_dotenv = False
+else:
+    found_dotenv = find_and_load_dotenv(script_dir)
+
+if not found_dotenv and not _disable_dotenv:
     # Get the root directory of the project
     cwd_dir = os.getcwd()
     logger.debug(f"cwd_dir: {cwd_dir}")
@@ -48,8 +66,11 @@ if not found_dotenv:
 # If no .env file was found, print a warning message
 if not found_dotenv:
     # Create a colored message for the log using termcolor
-    colored_message = termcolor.colored("No .env file found. This is ok if you are using environment variables or secrets (like on Replit, AWS, etc), but if you are not, please create a .env file in the root directory of the project.", "yellow")
-    logger.warning(colored_message)
+    colored_message = termcolor.colored(
+        "No .env file found. This is expected when relying on environment variables or external secrets.",
+        "blue",
+    )
+    logger.debug(colored_message)
 
 # dotenv.load_dotenv()
 broker=None
@@ -77,6 +98,9 @@ if backtesting_start:
 BACKTESTING_END = None
 if backtesting_end:
     BACKTESTING_END = parser.parse(backtesting_end)
+
+# Get the backtesting data source
+BACKTESTING_DATA_SOURCE = os.environ.get("BACKTESTING_DATA_SOURCE", "ThetaData")
 
 # Check if we should hide trades
 hide_trades = os.environ.get("HIDE_TRADES")
@@ -158,12 +182,8 @@ POLYGON_MAX_MEMORY_BYTES = os.environ.get("POLYGON_MAX_MEMORY_BYTES")
 ALPACA_MAX_MEMORY_BYTES = os.environ.get("ALPACA_MAX_MEMORY_BYTES")
 
 POLYGON_CONFIG = {
-    # Add POLYGON_API_KEY and POLYGON_IS_PAID_SUBSCRIPTION to your .env file or set them as secrets
+    # Add POLYGON_API_KEY to your .env file or set it as secrets
     "API_KEY": os.environ.get("POLYGON_API_KEY"),
-    "IS_PAID_SUBSCRIPTION": os.environ.get("POLYGON_IS_PAID_SUBSCRIPTION").lower()
-    == "true"
-    if os.environ.get("POLYGON_IS_PAID_SUBSCRIPTION")
-    else False,
 }
 
 # Polygon API Key
@@ -182,6 +202,19 @@ DATABENTO_CONFIG = {
     "API_KEY": os.environ.get("DATABENTO_API_KEY"),
     "TIMEOUT": int(os.environ.get("DATABENTO_TIMEOUT", "30")),
     "MAX_RETRIES": int(os.environ.get("DATABENTO_MAX_RETRIES", "3")),
+}
+
+# Remote cache configuration (disabled by default)
+CACHE_REMOTE_CONFIG = {
+    "backend": os.environ.get("LUMIBOT_CACHE_BACKEND", "local"),
+    "mode": os.environ.get("LUMIBOT_CACHE_MODE", "disabled"),
+    "s3_bucket": os.environ.get("LUMIBOT_CACHE_S3_BUCKET"),
+    "s3_prefix": os.environ.get("LUMIBOT_CACHE_S3_PREFIX", ""),
+    "s3_region": os.environ.get("LUMIBOT_CACHE_S3_REGION"),
+    "s3_access_key_id": os.environ.get("LUMIBOT_CACHE_S3_ACCESS_KEY_ID"),
+    "s3_secret_access_key": os.environ.get("LUMIBOT_CACHE_S3_SECRET_ACCESS_KEY"),
+    "s3_session_token": os.environ.get("LUMIBOT_CACHE_S3_SESSION_TOKEN"),
+    "s3_version": os.environ.get("LUMIBOT_CACHE_S3_VERSION", "v1"),
 }
 
 # Alpaca Configuration
@@ -319,25 +352,25 @@ PROJECTX_BASE_URLS = {
 
 # ProjectX SignalR streaming URL mappings
 PROJECTX_STREAMING_URLS = {
-    "topstepx": "https://gateway-rtc-topstepx.s2f.projectx.com/",
-    "topone": "https://gateway-rtc-demo.s2f.projectx.com/",  # Top One Futures
-    "tickticktrader": "https://gateway-rtc-tickticktrader.s2f.projectx.com/",
-    "alphaticks": "https://gateway-rtc-alphaticks.s2f.projectx.com/",
-    "aquafutures": "https://gateway-rtc-aquafutures.s2f.projectx.com/",
-    "blueguardianfutures": "https://gateway-rtc-blueguardianfutures.s2f.projectx.com/",
-    "blusky": "https://gateway-rtc-blusky.s2f.projectx.com/",
-    "bulenox": "https://gateway-rtc-bulenox.s2f.projectx.com/",
-    "e8x": "https://gateway-rtc-e8x.s2f.projectx.com/",
-    "fundingfutures": "https://gateway-rtc-fundingfutures.s2f.projectx.com/",
-    "thefuturesdesk": "https://gateway-rtc-thefuturesdesk.s2f.projectx.com/",
-    "futureselite": "https://gateway-rtc-futureselite.s2f.projectx.com/",
-    "fxifyfutures": "https://gateway-rtc-fxifyfutures.s2f.projectx.com/",
-    "goatfundedfutures": "https://gateway-rtc-goatfundedfutures.s2f.projectx.com/",
-    "holaprime": "https://gateway-rtc-holaprime.s2f.projectx.com/",
-    "nexgen": "https://gateway-rtc-nexgen.s2f.projectx.com/",
-    "tx3funding": "https://gateway-rtc-tx3funding.s2f.projectx.com/",
+    "topstepx": "https://rtc.topstepx.com/",
+    "topone": "https://rtc.toponefutures.projectx.com/",  # Top One Futures
+    "tickticktrader": "https://rtc.tickticktrader.projectx.com/",
+    "alphaticks": "https://rtc.alphaticks.projectx.com/",
+    "aquafutures": "https://rtc.aquafutures.projectx.com/",
+    "blueguardianfutures": "https://rtc.blueguardianfutures.projectx.com/",
+    "blusky": "https://rtc.blusky.projectx.com/",
+    "bulenox": "https://rtc.bulenox.projectx.com/",
+    "e8x": "https://rtc.e8.projectx.com/",
+    "fundingfutures": "https://rtc.fundingfutures.projectx.com/",
+    "thefuturesdesk": "https://rtc.thefuturesdesk.projectx.com/",
+    "futureselite": "https://rtc.futureselite.projectx.com/",
+    "fxifyfutures": "https://rtc.fxifyfutures.projectx.com/",
+    "goatfundedfutures": "https://rtc.goatfundedfutures.projectx.com/",
+    "holaprime": "https://rtc.holaprime.projectx.com/",
+    "nexgen": "https://rtc.nexgen.projectx.com/",
+    "tx3funding": "https://rtc.tx3funding.projectx.com/",
     "demo": "https://gateway-rtc-demo.s2f.projectx.com/",
-    "daytraders": "https://gateway-rtc-daytraders.s2f.projectx.com/",
+    "daytraders": "https://rtc.daytraders.projectx.com/",
 }
 
 # ProjectX Configuration - Multi-firm support
@@ -508,7 +541,21 @@ if not is_backtesting or is_backtesting.lower() == "false":
         elif INTERACTIVE_BROKERS_REST_CONFIG["IB_USERNAME"]:
             broker = InteractiveBrokersREST(INTERACTIVE_BROKERS_REST_CONFIG)
         elif TRADOVATE_CONFIG["USERNAME"]:
-            broker = Tradovate(TRADOVATE_CONFIG)
+            try:
+                broker = Tradovate(TRADOVATE_CONFIG)
+            except Exception as e:
+                # Handle rate limiting and other connection errors gracefully
+                error_str = str(e)
+                if "rate limited" in error_str.lower() or "429" in error_str:
+                    message = (
+                        "Tradovate connection blocked due to rate limiting. "
+                        "Too many requests were made. Wait 5-10 minutes and try again."
+                    )
+                    logger.error(termcolor.colored(message, "red"))
+                    raise RuntimeError(message) from e
+                else:
+                    logger.error(termcolor.colored(f"Could not initialize Tradovate broker: {e}", "red"))
+                    raise
         # Only check for SCHWAB_ACCOUNT_NUMBER to select Schwab
         elif SCHWAB_CONFIG.get("SCHWAB_ACCOUNT_NUMBER"):
             broker = Schwab(SCHWAB_CONFIG)

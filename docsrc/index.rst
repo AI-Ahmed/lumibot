@@ -166,23 +166,25 @@ Table of Contents
 *****************
 
 .. toctree::
-   :maxdepth: 3
-   
+   :maxdepth: 2
+
    Home <self>
    Build Bots with AI <https://botspot.trade/sales?utm_source=lumibot+docs&utm_medium=documentation&utm_campaign=Menu+Build+Bots+with+AI>
    GitHub <https://github.com/Lumiwealth/lumibot>
    Discord Community <https://discord.gg/v6asVjTCvh>
-   Get Pre-Built Profitable Strategies <https://lumiwealth.com/?utm_source=documentation&utm_medium=referral&utm_campaign=lumibot_sidebar>
-   deployment
    getting_started
    lifecycle_methods
-   vars
    strategy_methods
    strategy_properties
    entities
-   futures
    backtesting
    brokers
+   reference
+   examples
+   deployment
+   common_mistakes
+   faq
+   Get Pre-Built Strategies <https://www.botspot.trade/?utm_source=documentation&utm_medium=referral&utm_campaign=lumibot_sidebar>
 
 Indices and tables
 ==================

@@ -1,7 +1,7 @@
 How To Backtest
 ===================================
 
-Backtesting is a vital step in validating your trading strategies using historical data. With LumiBot, you can backtest strategies across various data sources such as **Yahoo Finance**, **Polygon.io**, **ThetaData**, or even your own custom **CSV** files. This guide will walk you through each step of backtesting, explain the data sources, and introduce the files that LumiBot generates during backtesting.
+Backtesting is a vital step in validating your trading strategies using historical data. With LumiBot, you can backtest strategies across various data sources such as **ThetaData** (our recommended vendor), **Polygon.io**, **Yahoo Finance**, or even your own custom **CSV** files. This guide will walk you through each step of backtesting, explain the data sources, and introduce the files that LumiBot generates during backtesting.
 
 .. note::
 
@@ -41,38 +41,33 @@ Choosing a Data Source
 
 LumiBot supports several data sources for backtesting, each suited for different asset types and backtesting needs. Here's an overview of the available sources:
 
-**1. Yahoo Finance**
+**1. ThetaData (Recommended)**
+
+- Deep historical coverage for U.S. equities and options with SIP-quality filtering.
+- Offers free tiers plus paid plans with higher rate limits and multi-year history.
+
+.. important::
+
+   **Get Your ThetaData Account**
+
+   Sign up at `ThetaData <https://www.thetadata.net/>`_. Use the promo code ``BotSpot10`` for 10% off the first order—ThetaData uses this code to credit BotSpot for the referral.
+
+For more details, see the :ref:`ThetaData Backtesting <backtesting.thetadata>` section.
+
+**2. Yahoo Finance**
 
 - Free stock and ETF data for daily trading backtests.
 - Suitable for longer-term strategies but not ideal for intraday backtesting.
 
 For more details, see the :ref:`Yahoo Backtesting <backtesting.yahoo>` section.
 
-**2. Polygon.io**
+**3. Polygon.io**
 
 - Offers intraday and end-of-day data for stocks, options, forex, and cryptocurrency.
 - Provides up to two years of free data; paid plans offer more advanced features and faster data retrieval.
-
-.. important::
-
-   **Get Your API Key from Polygon.io**
-   
-   You can get an API key at `Polygon.io <https://polygon.io/?utm_source=affiliate&utm_campaign=lumi10>`_. **Please use the coupon code 'LUMI10' for 10% off!**
+- Best suited for existing workflows; new LumiBot users should consider ThetaData first for the BotSpot10 promo and deeper coverage.
 
 For more details, see the :ref:`Polygon.io Backtesting <backtesting.polygon>` section.
-
-**3. ThetaData**
-
-- Designed for users looking to backtest stock and options trading strategies.
-- Provides options pricing and other securities.
-
-.. important::
-
-   **Get Your ThetaData Account**
-   
-   You can get a username and password at `thetadata.net <https://www.thetadata.net/>`_. **Please use the coupon code 'LUMI' for 10% off!**
-
-For more details, see the :ref:`ThetaData Backtesting <backtesting.thetadata>` section.
 
 **4. Pandas (CSV or Other Custom Data)**
 
@@ -132,14 +127,15 @@ Here's an example of a backtest using **Polygon.io**:
             polygon_api_key=polygon_api_key  # Pass the Polygon.io API key here
         )
 
-Optional: Using Environment Variables for Backtest Dates
------------------------------------
+Optional: Using Environment Variables for Backtest Configuration
+-----------------------------------------------------------------
 
-Instead of specifying `backtesting_start` and `backtesting_end` in your code, you can set these environment variables:
+Instead of specifying `backtesting_start`, `backtesting_end`, and data sources in your code, you can set these environment variables:
 
 - ``IS_BACKTESTING``
 - ``BACKTESTING_START``
 - ``BACKTESTING_END``
+- ``BACKTESTING_DATA_SOURCE``
 
 If they are set, LumiBot will automatically pick them up. For example:
 
@@ -159,12 +155,14 @@ If they are set, LumiBot will automatically pick them up. For example:
    * - BACKTESTING_END
      - End date in the format "YYYY-MM-DD".
      - 2025-05-01
+   * - BACKTESTING_DATA_SOURCE
+     - Backtesting data source. This value is case-insensitive and takes precedence even when your code passes a ``datasource_class`` argument. Set it to ``none`` (or leave it unset) if you prefer to control the data source from code. Valid options: **Polygon**, **ThetaData**, **Yahoo**, **Alpaca**, **CCXT**, **DataBento** (defaults to ThetaData).
+     - Polygon
 
-Below is a short example showing how you might rely *entirely* on environment variables and **omit** any explicit date definitions in code. The same `polygon_api_key` parameter is still required if you are using Polygon.io:
+Below is a short example showing how you might rely *entirely* on environment variables and **omit** any explicit date or data source definitions in code. Set ``BACKTESTING_DATA_SOURCE=Polygon`` in your environment to use Polygon.io (API key still required):
 
 .. code-block:: python
 
-    from lumibot.backtesting import PolygonDataBacktesting
     from lumibot.strategies import Strategy
 
     class MyStrategy(Strategy):
@@ -184,15 +182,21 @@ Below is a short example showing how you might rely *entirely* on environment va
                 self.submit_order(order)
 
     if __name__ == "__main__":
-        # If BACKTESTING_START/BACKTESTING_END are set in the environment,
-        # LumiBot will pick them up automatically.
-        polygon_api_key = "YOUR_POLYGON_API_KEY"
+        # Set in environment: BACKTESTING_DATA_SOURCE=Polygon
+        # Set in environment: BACKTESTING_START=2025-01-01
+        # Set in environment: BACKTESTING_END=2025-05-01
+        polygon_api_key = "YOUR_POLYGON_API_KEY"  # Still required for Polygon
         result = MyStrategy.run_backtest(
-            PolygonDataBacktesting,
+            None,  # Auto-selects from BACKTESTING_DATA_SOURCE env var
             polygon_api_key=polygon_api_key
         )
 
 For more information about running backtests, refer to the :ref:`Backtesting Function <backtesting.backtesting_function>` section.
+
+.. tip::
+
+   For a full list of supported configuration environment variables (audit telemetry, remote cache, profiling, etc.),
+   see :ref:`Environment Variables <environment_variables>`.
 
 Files Generated from Backtesting
 ===================================

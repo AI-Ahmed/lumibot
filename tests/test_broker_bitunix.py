@@ -1,9 +1,12 @@
 import unittest
 from unittest.mock import MagicMock, patch
 from decimal import Decimal
+from types import SimpleNamespace
 
 from lumibot.brokers.bitunix import Bitunix
-from lumibot.entities import Asset, Order, Position
+from lumibot.brokers.schwab import Schwab
+from lumibot.entities import Asset, Order, Position, SmartLimitConfig, SmartLimitPreset
+from lumibot.strategies.strategy import Strategy
 from lumibot.tools.bitunix_helpers import BitUnixClient
 from lumibot.brokers.broker import LumibotBrokerAPIError
 
@@ -117,6 +120,7 @@ class TestBitunixBroker(unittest.TestCase):
         self.assertEqual(broker._map_status_from_bitunix("PENDING_CANCEL"), Order.OrderStatus.CANCELED)
         self.assertEqual(broker._map_status_from_bitunix("UNKNOWN_STATUS"), Order.OrderStatus.ERROR) # Test default
 
+
     @patch("lumibot.brokers.bitunix.BitUnixClient")
     @patch("lumibot.brokers.bitunix.BitunixData")
     def test_parse_broker_order(self, MockBitunixData, MockBitUnixClientInstance):
@@ -175,6 +179,88 @@ class TestBitunixBroker(unittest.TestCase):
         self.assertEqual(broker._parse_source_timestep("1d"), "1d")
         # Test fallback/default
         self.assertEqual(broker._parse_source_timestep("unknown"), "1m")
+
+
+class _StubStrategy(Strategy):
+    def initialize(self, parameters=None):
+        self.sleeptime = "1M"
+
+    def on_trading_iteration(self):
+        return
+
+
+class TestSchwabSmartLimit(unittest.TestCase):
+    def test_smart_limit_submits_as_limit(self):
+        broker = Schwab.__new__(Schwab)
+        broker.IS_BACKTESTING_BROKER = False
+        broker.name = "Schwab"
+        broker.quote_assets = set()
+        broker.data_source = MagicMock()
+        broker._add_subscriber = MagicMock()
+        broker._set_initial_positions = MagicMock()
+        broker.get_quote = MagicMock(return_value=SimpleNamespace(bid=99.0, ask=101.0))
+
+        captured = {}
+
+        def _capture_submit(order):
+            captured["order_type"] = order.order_type
+            return order
+
+        broker.submit_order = MagicMock(side_effect=_capture_submit)
+
+        with patch.object(Strategy, "update_broker_balances", return_value=None):
+            strategy = _StubStrategy(broker=broker, budget=100_000.0, analyze_backtest=False, parameters={})
+            strategy._first_iteration = False
+            strategy.get_quote = MagicMock(return_value=SimpleNamespace(bid=99.0, ask=101.0))
+
+            asset = Asset("SPY")
+            config = SmartLimitConfig(preset=SmartLimitPreset.NORMAL)
+            order = strategy.create_order(
+                asset,
+                1,
+                Order.OrderSide.BUY,
+                order_type=Order.OrderType.SMART_LIMIT,
+                smart_limit=config,
+            )
+            strategy.submit_order(order)
+
+        self.assertEqual(captured["order_type"], Order.OrderType.LIMIT)
+
+    def test_smart_limit_downgrades_to_market_without_quotes(self):
+        broker = Schwab.__new__(Schwab)
+        broker.IS_BACKTESTING_BROKER = False
+        broker.name = "Schwab"
+        broker.quote_assets = set()
+        broker.data_source = MagicMock()
+        broker._add_subscriber = MagicMock()
+        broker._set_initial_positions = MagicMock()
+        broker.get_quote = MagicMock(return_value=SimpleNamespace(bid=None, ask=None))
+
+        captured = {}
+
+        def _capture_submit(order):
+            captured["order_type"] = order.order_type
+            return order
+
+        broker.submit_order = MagicMock(side_effect=_capture_submit)
+
+        with patch.object(Strategy, "update_broker_balances", return_value=None):
+            strategy = _StubStrategy(broker=broker, budget=100_000.0, analyze_backtest=False, parameters={})
+            strategy._first_iteration = False
+            strategy.get_quote = MagicMock(return_value=SimpleNamespace(bid=None, ask=None))
+
+            asset = Asset("SPY")
+            config = SmartLimitConfig(preset=SmartLimitPreset.NORMAL)
+            order = strategy.create_order(
+                asset,
+                1,
+                Order.OrderSide.BUY,
+                order_type=Order.OrderType.SMART_LIMIT,
+                smart_limit=config,
+            )
+            strategy.submit_order(order)
+
+        self.assertEqual(captured["order_type"], Order.OrderType.MARKET)
 
 if __name__ == "__main__":
     unittest.main()

@@ -84,6 +84,24 @@ To create trailing_stop orders, add either a trail_price or a trail_percent keyw
    order_2 = self.create_order(symbol, quantity, side, trail_percent=my_trail_percent)
    self.submit_order(order_2)
 
+
+**smart limit order**
+
+SMART_LIMIT orders walk the bid/ask spread using a timed ladder and are designed
+to achieve realistic fills for options and other wide-spread assets.
+
+.. code-block:: python
+
+   from lumibot.entities import SmartLimitConfig, SmartLimitPreset
+
+   config = SmartLimitConfig(preset=SmartLimitPreset.NORMAL, slippage=0.05)
+   order = self.create_order(symbol, quantity, side, smart_limit=config)
+   self.submit_order(order)
+
+In backtests, SMART_LIMIT fills at mid ± slippage. If the config does not specify
+slippage, the strategy-level defaults (``buy_trading_slippages`` /
+``sell_trading_slippages``) are used.
+
 Order With Legs
 """""""""""""""""""""
 
@@ -146,7 +164,8 @@ Interactive Brokers requires the main or parent order to be a limit order. Add l
 Documentation
 """""""""""""""""""
 
-.. automodule:: entities.order
+.. automodule:: lumibot.entities.order
+   :noindex:
    :members:
    :undoc-members:
    :show-inheritance:

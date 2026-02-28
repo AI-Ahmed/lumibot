@@ -1,0 +1,133 @@
+{% extends "furo/base.html" %}
+
+{# Add FAQPage JSON-LD schema for the FAQ page #}
+{% block extrahead %}
+{{ super() }}
+{% if pagename == 'faq' %}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Why can't I use datetime.now() in my Lumibot strategy?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "During backtesting, datetime.now() returns the real current time, not the simulated time. Your strategy will think it's 2024 when it's actually simulating trades from 2020. Always use self.get_datetime() instead."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why do my variables reset between trading iterations in Lumibot?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Local variables are reset each iteration. Use self.vars for persistent state. For example: self.vars.my_variable = value"
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why does 'from __future__ import annotations' break my Lumibot strategy?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "This import breaks Lumibot's type checking system and causes backtests to crash. Never use it - just remove this import."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why does my crypto strategy stop trading at 4pm?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Crypto markets are 24/7, but Lumibot defaults to stock market hours. Add self.set_market('24/7') to your initialize method."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why do my option calculations seem off by 100x?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Options are multiplied by 100. A $1.50 option premium costs $150 per contract. Always multiply the premium by 100 for cost calculations."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why does get_last_price() return None?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Price data may be unavailable for illiquid assets. Always check if the return value is None before using it in calculations."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I close a crypto futures position in Lumibot?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "For CRYPTO_FUTURE assets, use self.close_position(futures_asset) instead of submit_order(). Using submit_order to 'sell' opens a new position instead of closing."
+      }
+    }
+  ]
+}
+</script>
+{% endif %}
+
+{# Add HowTo schema for the examples page #}
+{% if pagename == 'examples' %}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "HowTo",
+  "name": "How to Build Trading Strategies with Lumibot",
+  "description": "Code examples for building algorithmic trading strategies for stocks, options, crypto, and futures using the Lumibot Python framework.",
+  "step": [
+    {
+      "@type": "HowToStep",
+      "name": "Get Historical Prices",
+      "text": "Use self.get_historical_prices(asset, length, unit) to retrieve historical OHLCV data for backtesting and analysis."
+    },
+    {
+      "@type": "HowToStep",
+      "name": "Get Current Price",
+      "text": "Use self.get_last_price(asset) to get the current market price. Always check for None return value."
+    },
+    {
+      "@type": "HowToStep",
+      "name": "Create and Submit Orders",
+      "text": "Use order = self.create_order(asset, quantity, side) and self.submit_order(order) to place trades."
+    },
+    {
+      "@type": "HowToStep",
+      "name": "Manage Positions",
+      "text": "Use self.get_position(asset) to check current positions and self.get_positions() for all positions."
+    },
+    {
+      "@type": "HowToStep",
+      "name": "Use Persistent Variables",
+      "text": "Store state between iterations using self.vars.my_variable = value instead of local variables."
+    }
+  ]
+}
+</script>
+{% endif %}
+
+{# Add SoftwareSourceCode schema for the common_mistakes page #}
+{% if pagename == 'common_mistakes' %}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "Common Mistakes When Writing Lumibot Trading Strategies",
+  "description": "Learn about the most common mistakes made when writing Lumibot trading strategies and how to avoid them. Covers critical errors with datetime, variables, options, crypto, and more.",
+  "about": {
+    "@type": "SoftwareApplication",
+    "name": "Lumibot",
+    "applicationCategory": "Trading Software",
+    "operatingSystem": "Cross-platform"
+  },
+  "author": {
+    "@type": "Organization",
+    "name": "Lumiwealth"
+  }
+}
+</script>
+{% endif %}
+{% endblock %}

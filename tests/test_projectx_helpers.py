@@ -1,10 +1,12 @@
+import datetime as dt
 import pytest
+import pytz
 from unittest.mock import MagicMock, patch, Mock
 import requests
 import json
 import pandas as pd
 
-from lumibot.tools.projectx_helpers import ProjectXAuth, ProjectXClient, ProjectX
+from lumibot.tools.projectx_helpers import ProjectXAuth, ProjectXClient, ProjectX, _to_utc_iso
 from lumibot.entities import Asset
 
 
@@ -277,20 +279,30 @@ class TestProjectXClient:
         assert details["TickSize"] == 0.25
 
     def test_find_contract_by_symbol(self, mock_client):
-        """Test finding contract by symbol"""
-        
-        # Mock contract search response
+        """Test finding contract by symbol.
+
+        To avoid coupling to real-time rollover dates, mock the Asset generator
+        so the first candidate is MESU25 and verify we convert to ProjectX ID.
+        """
+
         mock_contracts = [
             {
-                "ContractId": "CON.F.US.MES.U25",
-                "Symbol": "MES"
+                "contractId": "CON.F.US.MES.Z25",
+                "id": "CON.F.US.MES.Z25",
+                "symbol": "MES",
+                "name": "MESZ25",
             }
         ]
         mock_client.api.contract_search = MagicMock(return_value={"success": True, "contracts": mock_contracts})
-        
-        contract_id = mock_client.find_contract_by_symbol("MES")
-        
-        assert contract_id == "CON.F.US.MES.U25"
+
+        with patch.object(Asset, 'get_potential_futures_contracts', return_value=['MESU25', 'MES.U25', 'MESU2025']):
+            contract_id = mock_client.find_contract_by_symbol("MES")
+            assert contract_id == "CON.F.US.MES.Z25"
+
+            # No API info found, fallback to asset logic
+            mock_client.api.contract_search.return_value = {"success": True, "contracts": []}
+            contract_id = mock_client.find_contract_by_symbol("MES")
+            assert contract_id == "CON.F.US.MES.U25"  # From mocked Asset
 
     def test_contract_id_conversion_no_hardcoded_mappings(self, mock_client):
         """
@@ -581,4 +593,24 @@ class TestProjectXErrorHandling:
                 
                 # Should handle all error codes gracefully
                 assert result["success"] is False
-                assert f"HTTP {status_code}" in result["error"] 
+                assert f"HTTP {status_code}" in result["error"]
+
+
+class TestProjectXDatetime:
+    def test_to_utc_iso_from_z_string(self):
+        res = _to_utc_iso("2025-01-02T09:30:00Z", is_est=True)
+        assert res == "2025-01-02T14:30:00+00:00"
+
+    def test_to_utc_iso_from_naive_dt(self):
+        start_dt = dt.datetime(2025, 1, 2, 9, 30)
+        res = _to_utc_iso(start_dt, is_est=True)
+        assert res == "2025-01-02T14:30:00+00:00"
+
+    def test_to_utc_iso_from_aware_utc_no_est(self):
+        start_dt = pytz.utc.localize(dt.datetime(2025, 1, 2, 14, 30))
+        res = _to_utc_iso(start_dt, is_est=False)
+        assert res == "2025-01-02T14:30:00+00:00"
+
+    def test_to_utc_iso_string_without_z(self):
+        res = _to_utc_iso("2025-01-02T09:30:00", is_est=True)
+        assert res == "2025-01-02T14:30:00+00:00"

@@ -1,6 +1,10 @@
+from __future__ import annotations
 import os
 import re
 import sys
+import time
+import weakref
+from functools import lru_cache
 from decimal import Decimal, ROUND_HALF_EVEN
 
 import pytz
@@ -12,6 +16,62 @@ from pandas_market_calendars.market_calendar import MarketCalendar
 from termcolor import colored
 
 from ..constants import LUMIBOT_DEFAULT_PYTZ, LUMIBOT_DEFAULT_TIMEZONE
+
+# ============================================================================
+# PERFORMANCE CACHES - Critical for backtesting performance
+# ============================================================================
+# Trading calendar cache.
+#
+# NOTE: `pandas_market_calendars` schedule generation is surprisingly expensive because it
+# computes holidays/valid-days even for tiny windows. Options backtests can call
+# `get_trading_days()` thousands of times (ThetaData coverage checks, session-bound clamping,
+# order-fill utilities), and caching by the *exact* (start,end) range is not effective when
+# callers pass slightly different sliding windows.
+#
+# We cache schedules by **year** (market, year, tz) and then slice to the requested window.
+# Key: (market, year, tz_str)
+# Slice cache (best-effort; primarily avoids repeated `.loc[]` slicing for identical windows).
+# Key: (market, start_date_str, end_date_str, tz_str)
+_TRADING_CALENDAR_CACHE = {}
+
+# Progress bar throttling: when BACKTESTING_QUIET_LOGS=false we print progress as newline-separated
+# lines. For fast simulations this can spam thousands of lines in a single second and drown out
+# strategy logs. Throttle to at most ~1 line/second per (output, prefix) when not in quiet mode.
+_PROGRESS_LAST_PRINT: "weakref.WeakKeyDictionary[object, dict[str, tuple[float, str]]]" = weakref.WeakKeyDictionary()
+_PROGRESS_LAST_PRINT_FALLBACK: dict[tuple[int, str], tuple[float, str]] = {}
+
+
+def _format_datetime_to_tz(dtm, tzinfo: pytz.BaseTzInfo):
+    if pd.isna(dtm):
+        return dtm
+    ts = pd.Timestamp(dtm)
+    if ts.tz is None:
+        ts = ts.tz_localize(tzinfo)
+    else:
+        ts = ts.tz_convert(tzinfo)
+    return ts.to_pydatetime()
+
+
+@lru_cache(maxsize=256)
+def _get_trading_schedule_for_year(market: str, year: int, tz_name: str) -> pd.DataFrame:
+    """Return a cached trading schedule for a full calendar year.
+
+    NOTE: This function is intentionally module-scoped and `lru_cache`'d (thread-safe) to
+    avoid repeated expensive schedule builds under backtest concurrency.
+    """
+    tzinfo = pytz.timezone(tz_name)
+    year_start = pd.Timestamp(year=year, month=1, day=1)
+    year_end = pd.Timestamp(year=year, month=12, day=31)
+
+    if market == "24/7":
+        cal = TwentyFourSevenCalendar(tzinfo=tzinfo)
+    else:
+        cal = mcal.get_calendar(market)
+
+    schedule = cal.schedule(start_date=year_start, end_date=year_end, tz=tzinfo)
+    schedule.market_open = schedule.market_open.apply(lambda v: _format_datetime_to_tz(v, tzinfo))
+    schedule.market_close = schedule.market_close.apply(lambda v: _format_datetime_to_tz(v, tzinfo))
+    return schedule
 
 
 def get_chunks(l, chunk_size):
@@ -106,6 +166,10 @@ def get_trading_days(
     for a specified market between given start and end dates, including proper
     timezone handling for datetime objects.
 
+    PERFORMANCE OPTIMIZATION: Caches calendar schedules to avoid expensive
+    holiday calculations. Caches by (market, year, tz) and slices to the
+    requested window.
+
     Args:
         market (str, optional): Market identifier for which the trading days
             are to be retrieved. Defaults to "NYSE".
@@ -127,11 +191,23 @@ def get_trading_days(
 
     # More robust datetime conversion with explicit timezone handling
     def format_datetime(dtm):
+        """
+        Convert dtm to a timezone-aware Python datetime in tzinfo.
+
+        Handles inputs that may be:
+        - tz-naive (localize to tzinfo)
+        - tz-aware (convert to tzinfo)
+        - pandas Timestamp or Python datetime
+        - NaT/None (returned as-is)
+        """
         if pd.isna(dtm):
             return dtm
-        # Convert to Python datetime and ensure proper timezone conversion
-        return pd.Timestamp(dtm).tz_convert(tzinfo).to_pydatetime()
-
+        ts = pd.Timestamp(dtm)
+        if ts.tz is None:
+            ts = ts.tz_localize(tzinfo)
+        else:
+            ts = ts.tz_convert(tzinfo)
+        return ts.to_pydatetime()
     def ensure_tz_aware(dtm, tzinfo):
         dtm = pd.to_datetime(dtm)
         return dtm.tz_convert(tzinfo) if dtm.tz is not None else dtm.tz_localize(tzinfo)
@@ -142,16 +218,67 @@ def get_trading_days(
     else:
         end_date = ensure_tz_aware(get_lumibot_datetime(), tzinfo)
 
-    if market == "24/7":
-        cal = TwentyFourSevenCalendar(tzinfo=tzinfo)
-    else:
-        cal = mcal.get_calendar(market)
+    # Normalize to date-only boundaries, but ensure tz-awareness to match schedule index
+    try:
+        start_day = pd.Timestamp(start_date.date(), tz=tzinfo)
+    except Exception:
+        start_day = pd.Timestamp(pd.to_datetime(start_date).date(), tz=tzinfo)
+    try:
+        end_day_exclusive = pd.Timestamp(end_date.date(), tz=tzinfo)
+    except Exception:
+        end_day_exclusive = pd.Timestamp(pd.to_datetime(end_date).date(), tz=tzinfo)
 
-    # Make end_date exclusive by moving it one day earlier
-    schedule_end = pd.Timestamp(end_date) - pd.Timedelta(days=1)
-    days = cal.schedule(start_date=start_date, end_date=schedule_end, tz=tzinfo)
-    days.market_open = days.market_open.apply(format_datetime)
-    days.market_close = days.market_close.apply(format_datetime)
+    # Make end_date exclusive by moving it one day earlier.
+    schedule_end_day = end_day_exclusive - pd.Timedelta(days=1)
+    if schedule_end_day < start_day:
+        return pd.DataFrame(columns=["market_open", "market_close"])
+
+    # Create cache key from market, dates, and timezone
+    cache_key = (
+        market,
+        str(start_date.date()),
+        str(end_date.date()),
+        str(tzinfo)
+    )
+
+    # Check cache first
+    if cache_key in _TRADING_CALENDAR_CACHE:
+        return _TRADING_CALENDAR_CACHE[cache_key].copy()
+
+    start_year = int(start_day.year)
+    end_year = int(schedule_end_day.year)
+    tz_name = getattr(tzinfo, "zone", None) or str(tzinfo)
+    year_schedules = []
+    for year in range(start_year, end_year + 1):
+        year_schedules.append(_get_trading_schedule_for_year(market, int(year), tz_name))
+
+    full_schedule = year_schedules[0] if len(year_schedules) == 1 else pd.concat(year_schedules, axis=0)
+
+    # Ensure the index is tz-aware and aligned with requested tz BEFORE slicing
+    # Calendars may return:
+    # - DatetimeIndex (tz-naive or tz-aware)
+    # - Index of Python datetimes (tz-naive or tz-aware)
+    idx = full_schedule.index
+    if isinstance(idx, pd.DatetimeIndex):
+        full_schedule.index = idx.tz_localize(tzinfo) if idx.tz is None else idx.tz_convert(tzinfo)
+    else:
+        # Likely an Index of Python datetime/date objects; can be mixed naive/aware
+        # Prefer parsing as naive and localizing (preserves calendar days)
+        # but fall back to utc=True if any tz-aware elements are present.
+        try:
+            tmp = pd.to_datetime(idx, errors="raise")
+            full_schedule.index = pd.DatetimeIndex(tmp).tz_localize(tzinfo)
+        except ValueError:
+            # Pandas requires utc=True when any tz-aware python datetimes are present
+            tmp = pd.to_datetime(idx, utc=True)
+            full_schedule.index = tmp.tz_convert(tzinfo)
+
+    # Slice to the requested window (inclusive of schedule_end_day).
+    days = full_schedule.loc[start_day:schedule_end_day].copy()
+
+    # Cache the result
+    _TRADING_CALENDAR_CACHE[cache_key] = days.copy()
+
     return days
 
 
@@ -212,50 +339,97 @@ def date_n_trading_days_from_date(
     Get the trading date n_days from start_datetime.
     Positive n_days means going backwards in time (earlier dates).
     Negative n_days means going forwards in time (later dates).
+    Works with tz-aware indices and cross-midnight sessions.
+
+    Semantics:
+    - n_days > 0: move backward n trading sessions (earlier dates).
+    - n_days < 0: move forward |n_days| trading sessions (later dates).
+    - The "current" session is determined by the last market_open that is
+      less than or equal to start_datetime in the given market tz.
     """
     if n_days == 0:
         return start_datetime.date()
     if not isinstance(start_datetime, dt.datetime):
         raise ValueError("start_datetime must be datetime")
 
+    # Ensure timezone-aware start
     if start_datetime.tzinfo is None:
         start_datetime = LUMIBOT_DEFAULT_PYTZ.localize(start_datetime)
 
     tzinfo = start_datetime.tzinfo
 
-    # Special handling for 24/7 market
+    # 24/7 special case identical to legacy behavior
     if market == "24/7":
         return (start_datetime - dt.timedelta(days=n_days)).date()
 
-    # Regular market handling
-    buffer_bars = max(10, abs(n_days) + (abs(n_days) // 5) * 3)  # Padding for weekends/holidays
+    # Padding for non-trading days/holidays and to cover lookaround range
+    buffer_days = max(10, abs(n_days) + (abs(n_days) // 5) * 3)
 
-    # Calculate date range based on direction
-    date_range = {
-        'market': market,
-        'tzinfo': tzinfo,
-    }
+    # Build date window around start_datetime depending on direction
     if n_days > 0:
-        date_range.update({
-            'start_date': (start_datetime - dt.timedelta(days=n_days + buffer_bars)).date().isoformat(),
-            'end_date': (start_datetime + dt.timedelta(days=1)).date().isoformat(),  # Add one day to include end date
-        })
+        start_date = (start_datetime - dt.timedelta(days=n_days + buffer_days)).date().isoformat()
+        end_date = (start_datetime + dt.timedelta(days=1)).date().isoformat()
     else:
-        date_range.update({
-            'start_date': start_datetime.date().isoformat(),
-            'end_date': (start_datetime + dt.timedelta(days=abs(n_days) + buffer_bars + 1)).date().isoformat(),
-            # Add one day
-        })
+        start_date = start_datetime.date().isoformat()
+        end_date = (start_datetime + dt.timedelta(days=abs(n_days) + buffer_days + 1)).date().isoformat()
 
-    trading_days = get_trading_days(**date_range)
-    start_datetime_naive = start_datetime.replace(tzinfo=None)
+    sched = get_trading_days(
+        market=market,
+        start_date=start_date,
+        end_date=end_date,
+        tzinfo=tzinfo,
+    )
 
-    # Find index and calculate result
-    start_index = (trading_days.index.get_loc(start_datetime_naive)
-                   if start_datetime_naive in trading_days.index
-                   else trading_days.index.get_indexer([start_datetime_naive], method='bfill')[0])
+    if sched.empty:
+        # Fallback: no sessions found; return start date to avoid crash
+        return start_datetime.date()
 
-    return trading_days.index[start_index - n_days].date()
+    # Determine reference index position based on session DATE (schedule index)
+    session_idx = pd.DatetimeIndex(sched.index)
+    # Build target date matching index tz-awareness
+    if getattr(session_idx, 'tz', None) is None:
+        target_date_val = pd.Timestamp(start_datetime.astimezone(tzinfo).date())
+    else:
+        target_date_val = pd.Timestamp(start_datetime.astimezone(tzinfo).date(), tz=tzinfo)
+
+    # Equivalent to bfill on dates: find first session with date >= target date
+    pos = session_idx.searchsorted(target_date_val, side='left')
+    if pos >= len(session_idx):
+        pos = len(session_idx) - 1
+
+    target_index = pos - n_days  # subtract because positive n_days means go back
+
+    # If target index is outside range, attempt a single retry with larger buffer
+    if target_index < 0 or target_index >= len(session_idx):
+        extra = abs(n_days) + buffer_days + 30
+        if n_days > 0:
+            start_date = (start_datetime - dt.timedelta(days=abs(n_days) + extra)).date().isoformat()
+            end_date = (start_datetime + dt.timedelta(days=1)).date().isoformat()
+        else:
+            start_date = start_datetime.date().isoformat()
+            end_date = (start_datetime + dt.timedelta(days=abs(n_days) + extra + 1)).date().isoformat()
+        sched = get_trading_days(market=market, start_date=start_date, end_date=end_date, tzinfo=tzinfo)
+        if sched.empty:
+            return start_datetime.date()
+        session_idx = pd.DatetimeIndex(sched.index)
+        # Match tz-awareness again on retry
+        if getattr(session_idx, 'tz', None) is None:
+            retry_target = pd.Timestamp(start_datetime.astimezone(tzinfo).date())
+        else:
+            retry_target = pd.Timestamp(start_datetime.astimezone(tzinfo).date(), tz=tzinfo)
+        pos = session_idx.searchsorted(retry_target, side='left')
+        if pos >= len(session_idx):
+            pos = len(session_idx) - 1
+        target_index = pos - n_days
+
+    # Final clamp to valid range (should be valid after retry)
+    target_index = max(0, min(target_index, len(session_idx) - 1))
+
+    # Return the trading date (date component of the session index)
+    session_date = session_idx[target_index].date()
+
+    return session_date
+
 
 
 def is_market_open(
@@ -344,6 +518,7 @@ def print_progress_bar(
     fill=chr(9608),
     cash=None,
     portfolio_value=None,
+    eta_override=None,
 ):
     """
     Prints a dynamically sized progress bar with time estimates and portfolio value.
@@ -361,6 +536,7 @@ def print_progress_bar(
         fill (str): Bar fill character
         cash (float): Current cash (unused)
         portfolio_value (float): Current portfolio value
+        eta_override (timedelta): Optional override for ETA calculation
     """
     global _progress_bar_active, _progress_bar_completed
     
@@ -387,6 +563,37 @@ def print_progress_bar(
         return
 
     # Time calculations
+    # Check if quiet logs mode is enabled.
+    # When quiet_logs=true: no newline, progress bar overwrites itself in place
+    # When quiet_logs=false: add newline so log messages appear on their own lines
+    quiet_logs = os.environ.get("BACKTESTING_QUIET_LOGS", "true").lower() == "true"
+
+    # Progress output can be extremely chatty (especially minute-bar backtests) and, in
+    # non-interactive log sinks (CloudWatch, CI), carriage returns don't overwrite prior output.
+    # Cap progress printing to ~1 line/sec in all modes. Always allow the final 100% line through.
+    now_mono = time.monotonic()
+    prefix_key = str(prefix)
+    try:
+        per_file = _PROGRESS_LAST_PRINT.get(file)
+        if per_file is None:
+            per_file = {}
+            _PROGRESS_LAST_PRINT[file] = per_file
+        last = per_file.get(prefix_key)
+        if last is not None:
+            last_time, _ = last
+            if (now_mono - last_time) < 1.0 and percent < 100:
+                return
+        per_file[prefix_key] = (now_mono, percent_str)
+    except TypeError:
+        # Fallback for file-like objects that aren't weakrefable/hashable.
+        key = (id(file), prefix_key)
+        last = _PROGRESS_LAST_PRINT_FALLBACK.get(key)
+        if last is not None:
+            last_time, _ = last
+            if (now_mono - last_time) < 1.0 and percent < 100:
+                return
+        _PROGRESS_LAST_PRINT_FALLBACK[key] = (now_mono, percent_str)
+
     now = dt.datetime.now()
     elapsed = now - backtesting_started
     elapsed_str = str(elapsed).split('.')[0]
@@ -394,12 +601,20 @@ def print_progress_bar(
     # ETA calculation
     eta_str = ""
     if progress > 0:
-        eta_seconds = elapsed.total_seconds() * (1/progress - 1)
+        if eta_override is not None:
+            eta = eta_override
+        else:
+            eta_seconds = elapsed.total_seconds() * (1/progress - 1)
         eta = dt.timedelta(seconds=int(eta_seconds))
         eta_str = str(eta).split('.')[0]
         time_info = f"[Elapsed: {elapsed_str} | ETA: {eta_str}]"
     else:
         time_info = f"[Elapsed: {elapsed_str}]"
+
+    # Make the simulation datetime string (value is the current backtest datetime)
+    sim_date_str = ""
+    if hasattr(value, 'strftime'):
+        sim_date_str = f"| Sim Time: {value.strftime('%Y-%m-%d %H:%M')}"
 
     # Portfolio formatting
     portfolio_info = ""
@@ -669,6 +884,36 @@ def create_options_symbol(stock_symbol, expiration_date, option_type, strike_pri
     return f"{stock_symbol}{expiration_str}{option_char}{strike_price_str}"
 
 
+@lru_cache(maxsize=256)
+def _parse_timestep_qty_and_unit_cached(timestep_str: str) -> tuple[int, str]:
+    """Cached implementation of `parse_timestep_qty_and_unit()`.
+
+    This is a hot path in backtesting: strategies frequently request history using the same
+    few timesteps (`minute`, `day`, and common multi-minute multiples). Caching avoids repeated
+    regex parsing and normalization work.
+    """
+    quantity = 1
+    unit = timestep_str
+    m = re.search(r"(\d+)\s*(\w+)", timestep_str)
+    if m:
+        quantity = int(m.group(1))
+        unit = m.group(2).rstrip("s")  # remove trailing 's' if any
+
+    raw_unit = str(unit or "").strip().lower()
+    canonical_unit = {
+        "m": "minute",
+        "min": "minute",
+        "minute": "minute",
+        "h": "hour",
+        "hr": "hour",
+        "hour": "hour",
+        "d": "day",
+        "day": "day",
+    }.get(raw_unit, raw_unit)
+
+    return quantity, canonical_unit
+
+
 def parse_timestep_qty_and_unit(timestep):
     """
     Parse the timestep string and return the quantity and unit.
@@ -683,15 +928,7 @@ def parse_timestep_qty_and_unit(timestep):
     tuple
         The quantity and unit.
     """
-
-    quantity = 1
-    unit = timestep
-    m = re.search(r"(\d+)\s*(\w+)", timestep)
-    if m:
-        quantity = int(m.group(1))
-        unit = m.group(2).rstrip("s")  # remove trailing 's' if any
-
-    return quantity, unit
+    return _parse_timestep_qty_and_unit_cached(str(timestep or ""))
 
 
 def get_decimals(number):
@@ -750,4 +987,3 @@ def get_timezone_from_datetime(dtm: dt.datetime) -> pytz.timezone:
         return pytz.timezone(timezone_name)
     except (AttributeError, pytz.exceptions.UnknownTimeZoneError):
         return LUMIBOT_DEFAULT_PYTZ
-

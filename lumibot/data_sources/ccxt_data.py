@@ -6,8 +6,8 @@ from typing import Union
 import ccxt
 import pandas as pd
 
-from lumibot.tools.lumibot_logger import get_logger
 from lumibot.entities import Asset, Bars
+from lumibot.tools.lumibot_logger import get_logger
 
 from .data_source import DataSource
 
@@ -52,7 +52,22 @@ class CcxtData(DataSource):
         self.api = exchange_class(config)
         is_sandbox = True if "sandbox" not in config else config["sandbox"]
         self.api.set_sandbox_mode(is_sandbox)
-        self.api.load_markets()
+        # NOTE (unit-test + offline safety):
+        # `load_markets()` performs a public network call (e.g., Kraken AssetPairs). Some environments
+        # (CI sandboxes, offline dev machines, firewalled networks) block outbound traffic, which
+        # would make broker initialization fail even when no market data is needed immediately.
+        #
+        # Keep initialization robust by logging-and-continuing on transient network failures. Any
+        # subsequent call that actually needs markets can retry or raise as appropriate.
+        try:
+            self.api.load_markets()
+        except Exception as exc:
+            logger.warning(
+                "[CCXT] load_markets() failed during init for exchange_id=%s sandbox=%s: %s",
+                config.get("exchange_id"),
+                is_sandbox,
+                exc,
+            )
         # Recommended two or less api calls per second.
         self.api.enableRateLimit = True
 
@@ -98,7 +113,7 @@ class CcxtData(DataSource):
         )
 
     def get_historical_prices(
-        self, asset, length, timestep="", timeshift=None, quote=None, exchange=None, include_after_hours=True
+        self, asset, length, timestep="", timeshift=None, quote=None, exchange=None, include_after_hours=True, return_polars: bool = False
     ):
         """Get bars for a given asset"""
         if isinstance(asset, str):

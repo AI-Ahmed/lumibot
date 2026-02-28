@@ -1,21 +1,69 @@
+import datetime
 import uuid
 from collections import namedtuple
 from decimal import Decimal
 from enum import Enum
-from threading import Event
-import datetime
-from typing import Union, TYPE_CHECKING
+from threading import Event, Lock
+from typing import TYPE_CHECKING, Union
 
 if TYPE_CHECKING:
     from lumibot.entities.asset import Asset
 
 import lumibot.entities as entities
-from lumibot.tools.types import check_positive, check_price
-
+from lumibot.entities.smart_limit import SmartLimitConfig
 
 # Set up module-specific logger
 from lumibot.tools.lumibot_logger import get_logger
+from lumibot.tools.types import check_positive, check_price
+
 logger = get_logger(__name__)
+
+_LAZY_EVENT_LOCK = Lock()
+
+
+class _LazyEvent:
+    """Event-like helper that only allocates a real threading.Event when `.wait()` is used.
+
+    WHY: Creating multiple `threading.Event()` objects per Order is a measurable hot path in
+    minute-level backtests that submit many orders (each Event allocates a Condition/Lock). Most
+    backtests never call `.wait()`, so we can save significant overhead by deferring allocation.
+    """
+
+    __slots__ = ("_flag", "_event")
+
+    def __init__(self) -> None:
+        self._flag = False
+        self._event: Event | None = None
+
+    def is_set(self) -> bool:
+        return bool(self._flag)
+
+    def set(self) -> None:
+        self._flag = True
+        event = self._event
+        if event is not None:
+            event.set()
+
+    def clear(self) -> None:
+        self._flag = False
+        event = self._event
+        if event is not None:
+            event.clear()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        if self._flag:
+            return True
+
+        event = self._event
+        if event is None:
+            with _LAZY_EVENT_LOCK:
+                event = self._event
+                if event is None:
+                    event = Event()
+                    if self._flag:
+                        event.set()
+                    self._event = event
+        return bool(event.wait(timeout=timeout))
 
 
 # Custom string enum implementation for Python 3.9 compatibility
@@ -29,13 +77,19 @@ class StrEnum(str, Enum):
     3. Can be used in string comparisons without explicit conversion
     """
     def __str__(self):
-        return self.value
-        
+        # Avoid Enum.value property lookups in hot paths; StrEnum members are already `str`.
+        return str.__str__(self)
+
     def __eq__(self, other):
         if isinstance(other, str):
-            return self.value == other
+            # Avoid Enum.value property lookups; compare as plain strings.
+            return str.__eq__(self, other)
+        # Fast-path: Enum equality is identity for same-class members. Avoid the Enum
+        # machinery on hot paths (order processing performs many enum comparisons).
+        if isinstance(other, Enum):
+            return self is other
         return super().__eq__(other)
-    
+
     def __hash__(self):
         # Use the hash of the enum member, not the string value
         # This ensures proper hashability while maintaining enum identity
@@ -45,12 +99,28 @@ class StrEnum(str, Enum):
 SELL = "sell"
 BUY = "buy"
 
-VALID_STATUS = ["unprocessed", "new", "open", "submitted", "fill", "partial_fill", "cancelling", "canceled", "error", "cash_settled"]
+VALID_STATUS = [
+    "unprocessed",
+    "new",
+    "open",
+    "submitted",
+    "fill",
+    "partial_fill",
+    "cancelling",
+    "canceled",
+    "error",
+    "cash_settled",
+    "assigned",
+    "assignment",
+    "exercise",
+    "exercised",
+    "expired",
+]
 STATUS_ALIAS_MAP = {
     "cancelled": "canceled",
     "cancel": "canceled",
     "cash": "cash_settled",
-    "expired": "canceled",  # Alpaca/Tradier status
+    "expired": "expired",  # Alpaca/Tradier status
     "filled": "fill",  # IBKR/Alpaca/Tradier status
     "partially_filled": "partial_filled",  # Alpaca/Tradier status
     "pending": "open",  # Tradier status
@@ -74,6 +144,8 @@ STATUS_ALIAS_MAP = {
     "calculated": "open",  # Alpaca status
     "accepted_for_bidding": "open",  # Alpaca status
     "held": "open",  # Alpaca status
+    "assignment": "assigned",
+    "exercise": "exercised",
 }
 
 NONE_TYPE = type(None)  # Order is shadowing 'type' parameter, this is a workaround to still access type(None)
@@ -94,6 +166,7 @@ class Order:
         STOP = "stop"
         STOP_LIMIT = "stop_limit"
         TRAIL = "trailing_stop"
+        SMART_LIMIT = "smart_limit"
 
     class OrderSide(StrEnum):
         BUY = "buy"
@@ -115,8 +188,15 @@ class Order:
         FILLED = "fill"
         PARTIALLY_FILLED = "partial_fill"
         CASH_SETTLED = "cash_settled"
+        ASSIGNED = "assigned"
+        EXERCISED = "exercised"
         ERROR = "error"
         EXPIRED = "expired"
+
+    # PERF: avoid iterating Enum classes in every `Order.__init__` call (hot path in backtests).
+    _ORDER_CLASS_BY_VALUE = {oc.value: oc for oc in OrderClass}
+    _ORDER_CLASS_VALUES_STR = ", ".join(oc.value for oc in OrderClass)
+    _ORDER_TYPE_VALUES_STR = ", ".join(ot.value for ot in OrderType)
 
     def __init__(
         self,
@@ -148,6 +228,7 @@ class Order:
         order_type: Union[OrderType, None] = None,
         order_class: Union[OrderClass, None] = OrderClass.SIMPLE,
         trade_cost: float = None,
+        trade_slippage: float = None,
         custom_params: dict = None,
         identifier: str = None,
         avg_fill_price: float = None,
@@ -155,6 +236,7 @@ class Order:
         child_orders: Union[list, None] = None,
         tag: str = "",
         status: OrderStatus = "unprocessed",
+        smart_limit: SmartLimitConfig = None,
     ):
         """Order class for managing individual orders.
 
@@ -270,9 +352,12 @@ class Order:
             The type of order. Possible values are: `market`, `limit`, `stop`, `stop_limit`, `trail`, `trail_limit`.
             (Deprecated, use 'order_type' instead)
         order_type : str or Order.OrderType
-            The type of order. Possible values are: `market`, `limit`, `stop`, `stop_limit`, `trail`, `trail_limit`.
+            The type of order. Possible values are: `market`, `limit`, `stop`, `stop_limit`, `trail`, `trail_limit`,
+            `smart_limit`.
         order_class : str
             The order class. Possible values are: `simple`, `bracket`, `oco`, `oto`, `multileg`.
+        smart_limit : SmartLimitConfig
+            Configuration for SMART_LIMIT orders. When set, the order type defaults to `smart_limit`.
         trade_cost : float
             The cost of this order in the quote currency.
         custom_params : dict
@@ -357,7 +442,7 @@ class Order:
 
         # It is possible for crypto currencies to arrive as a tuple of
         # two assets.
-        if isinstance(asset, tuple) and asset[0].asset_type == "crypto":
+        if isinstance(asset, tuple) and "crypto" == asset[0].asset_type:
             self.asset = asset[0]
             self.quote = asset[1]
         else:
@@ -387,7 +472,9 @@ class Order:
         self.dependent_order = None
         self.dependent_order_filled = False
         self.order_type = order_type
+        self.smart_limit = smart_limit
         self.trade_cost = trade_cost
+        self.trade_slippage = 0.0 if trade_slippage is None else trade_slippage
         self.custom_params = custom_params
         self._trail_stop_price = None  # Used by backtesting broker to track desired trailing stop price so far
         self.tag = tag
@@ -400,17 +487,19 @@ class Order:
         self.exchange = exchange
 
         # Cryptocurrency market.
-        if self.asset and self.asset.asset_type == "crypto":
+        if self.asset and "crypto" == self.asset.asset_type:
             self.pair = f"{self.asset.symbol}/{self.quote.symbol}"
-        else: 
+        else:
             self.pair = pair
 
         # setting events
-        self._new_event = Event()
-        self._canceled_event = Event()
-        self._partial_filled_event = Event()
-        self._filled_event = Event()
-        self._closed_event = Event()
+        # PERF: use lazy events to avoid allocating multiple Condition/Lock objects per Order when
+        # no code is awaiting order lifecycle transitions (common in backtests).
+        self._new_event = _LazyEvent()
+        self._canceled_event = _LazyEvent()
+        self._partial_filled_event = _LazyEvent()
+        self._filled_event = _LazyEvent()
+        self._closed_event = _LazyEvent()
 
         # setting internal variables
         self._raw = None
@@ -434,28 +523,38 @@ class Order:
                              f" {', '.join([str(oc.value) for oc in self.OrderClass])}") from None
 
         # Check - deprecated parameters and inform the user
-        deprecated_params = {
-            "take_profit_price": "limit_price",
-            "stop_loss_price": "stop_price",
-            "stop_loss_limit_price": "stop_limit_price",
-            "type": "order_type",
-        }
-        for param, new_param in deprecated_params.items():
-            if locals()[param] is not None:
-                # Get caller information for better debugging
-                import inspect
-                frame = inspect.currentframe().f_back
-                filename = frame.f_code.co_filename.split('/')[-1]  # Just the filename
-                lineno = frame.f_lineno
-                function_name = frame.f_code.co_name
-                
-                logger.warning(f"DEPRECATED in {filename}:{function_name}:{lineno} - "
-                             f"Order parameter '{param}' is deprecated. Use '{new_param}' instead.")
-                
-                if locals()[new_param]:
-                    raise ValueError(f"You cannot set both {param} and {new_param}. "
-                                   f"This may cause unexpected behavior.")
-                locals()[new_param] = locals()[param]
+        #
+        # PERF: This constructor is a hot path in minute-level backtests that can create 100k+
+        # orders. Avoid building the deprecated-parameter map and calling `locals()` on every
+        # Order when none of the deprecated parameters are used (the common case).
+        if (
+            take_profit_price is not None
+            or stop_loss_price is not None
+            or stop_loss_limit_price is not None
+            or type is not None
+        ):
+            deprecated_params = {
+                "take_profit_price": "limit_price",
+                "stop_loss_price": "stop_price",
+                "stop_loss_limit_price": "stop_limit_price",
+                "type": "order_type",
+            }
+            for param, new_param in deprecated_params.items():
+                if locals()[param] is not None:
+                    # Get caller information for better debugging
+                    import inspect
+                    frame = inspect.currentframe().f_back
+                    filename = frame.f_code.co_filename.split('/')[-1]  # Just the filename
+                    lineno = frame.f_lineno
+                    function_name = frame.f_code.co_name
+
+                    logger.warning(f"DEPRECATED in {filename}:{function_name}:{lineno} - "
+                                 f"Order parameter '{param}' is deprecated. Use '{new_param}' instead.")
+
+                    if locals()[new_param]:
+                        raise ValueError(f"You cannot set both {param} and {new_param}. "
+                                       f"This may cause unexpected behavior.")
+                    locals()[new_param] = locals()[param]
 
         # TODO: Remove when type//take_profit_price/stop_loss_price/stop_loss_limit_price are finally
         #  deprecated permanently
@@ -470,36 +569,75 @@ class Order:
         # Check - only provide a single stoploss modifier like trail_price, trail_percent, stop_limit_price, etc.
         unique_sl_modifiers = ["stop_limit_price", "trail_price", "trail_percent"]
         unique_secondary_modifiers = ["secondary_stop_limit_price", "secondary_trail_price", "secondary_trail_percent"]
-        local_vars = locals()
-        for unique_mods in [unique_sl_modifiers, unique_secondary_modifiers]:
-            unique_count = sum([1 for unique_mod in unique_mods
-                                if unique_mod in local_vars and local_vars[unique_mod] is not None])
-            if unique_count > 1:
-                raise ValueError(f"Order: You can only specify one of {', '.join(unique_mods)}. "
-                                 f"{unique_count} were given.")
+
+        # PERF: avoid `locals()` + list scanning in the common case where these modifiers are unset.
+        unique_count = int(stop_limit_price is not None) + int(trail_price is not None) + int(trail_percent is not None)
+        if unique_count > 1:
+            raise ValueError(
+                f"Order: You can only specify one of {', '.join(unique_sl_modifiers)}. {unique_count} were given."
+            )
+        secondary_unique_count = (
+            int(secondary_stop_limit_price is not None)
+            + int(secondary_trail_price is not None)
+            + int(secondary_trail_percent is not None)
+        )
+        if secondary_unique_count > 1:
+            raise ValueError(
+                f"Order: You can only specify one of {', '.join(unique_secondary_modifiers)}. "
+                f"{secondary_unique_count} were given."
+            )
 
         # Check - Order Class values passed in the 'type' parameter is depricated. OTO/Bracket/etc should
         # be passed in the 'order_class' parameter. The 'type' parameter should only be used for order types like
         # market, limit, stop, etc.
-        valid_order_classes = [order_class for order_class in Order.OrderClass]
-        valid_order_types = [order_type for order_type in Order.OrderType]
-        if order_type in valid_order_classes:
+        deprecated_order_class = None
+        if isinstance(order_type, self.OrderClass):
+            deprecated_order_class = order_type
+        elif isinstance(order_type, str):
+            deprecated_order_class = self._ORDER_CLASS_BY_VALUE.get(order_type.strip().lower())
+
+        if deprecated_order_class is not None:
             logger.warning(f"Order: Passing Advanced order class ({self.order_type}) in 'order_type' field is "
                             f"deprecated. Please use 'order_class' instead. "
-                            f"Valid Classes: {', '.join(valid_order_classes)} | "
-                            f"Valid Types: {', '.join(valid_order_types)}")
-            self.order_class = order_type
+                            f"Valid Classes: {self._ORDER_CLASS_VALUES_STR} | "
+                            f"Valid Types: {self._ORDER_TYPE_VALUES_STR}")
+            self.order_class = deprecated_order_class
             self.order_type = None
             order_type = None
 
         # Check - Order Class values passed in the 'type' parameter is depricated. OTO/Bracket/etc should
         # This is done here so that the older depricated parameters are still accepted for backwards compatibility
+        if order_type in (self.OrderType.SMART_LIMIT, "smart_limit") and self.smart_limit is None:
+            self.smart_limit = SmartLimitConfig()
+
         try:
             self.order_type = order_type \
                 if isinstance(order_type, (self.OrderType, NONE_TYPE)) else self.OrderType(order_type)
         except ValueError:
             raise ValueError(f"Order: Invalid order_type {order_type}. Must be one of:"
                              f" {', '.join([str(t.value) for t in self.OrderType])}") from None
+
+        # PERF: Market orders are extremely common (especially in backtests/benchmarks). When all
+        # price modifiers are unset and the order is a simple MARKET, we already initialized the
+        # price fields to `None` above. Skip the additional helper calls/validation to reduce
+        # per-order overhead (this code path can run 100k+ times per backtest).
+        if (
+            self.order_class is self.OrderClass.SIMPLE
+            and self.order_type is self.OrderType.MARKET
+            and self.smart_limit is None
+            and limit_price
+            is stop_price
+            is stop_limit_price
+            is trail_price
+            is trail_percent
+            is secondary_limit_price
+            is secondary_stop_price
+            is secondary_stop_limit_price
+            is secondary_trail_price
+            is secondary_trail_percent
+            is None
+        ):
+            return
 
         self._set_prices(
             limit_price,
@@ -530,26 +668,42 @@ class Order:
             secondary_trail_percent,
         )
     def is_advanced_order(self):
-        return self.order_class in [self.OrderClass.OCO, self.OrderClass.BRACKET, self.OrderClass.OTO]
+        order_class = self.order_class
+        return (
+            order_class is self.OrderClass.OCO
+            or order_class is self.OrderClass.BRACKET
+            or order_class is self.OrderClass.OTO
+        )
 
     def is_buy_order(self):
-        return self.side is not None and (
-            self.side == self.OrderSide.BUY or
-            self.side == self.OrderSide.BUY_TO_OPEN or
-            self.side == self.OrderSide.BUY_TO_COVER or
-            self.side == self.OrderSide.BUY_TO_CLOSE
+        side = self.side
+        if side is None:
+            return False
+        return (
+            side is self.OrderSide.BUY
+            or side is self.OrderSide.BUY_TO_OPEN
+            or side is self.OrderSide.BUY_TO_COVER
+            or side is self.OrderSide.BUY_TO_CLOSE
         )
 
     def is_sell_order(self):
-        return self.side is not None and (
-            self.side == self.OrderSide.SELL or
-            self.side == self.OrderSide.SELL_SHORT or
-            self.side == self.OrderSide.SELL_TO_OPEN or
-            self.side == self.OrderSide.SELL_TO_CLOSE
+        side = self.side
+        if side is None:
+            return False
+        return (
+            side is self.OrderSide.SELL
+            or side is self.OrderSide.SELL_SHORT
+            or side is self.OrderSide.SELL_TO_OPEN
+            or side is self.OrderSide.SELL_TO_CLOSE
         )
 
     def is_stop_order(self):
-        return self.order_type in [self.OrderType.STOP, self.OrderType.STOP_LIMIT, self.OrderType.TRAIL]
+        order_type = self.order_type
+        return (
+            order_type is self.OrderType.STOP
+            or order_type is self.OrderType.STOP_LIMIT
+            or order_type is self.OrderType.TRAIL
+        )
 
     def is_parent(self) -> bool:
         """
@@ -586,17 +740,28 @@ class Order:
             The last price of the asset. For trailing stop orders, this is the price that will be used to update the trail stop price.
         """
         # If the order is not a trailing stop order, then do nothing.
-        if self.order_type != self.OrderType.TRAIL:
+        if self.order_type is not self.OrderType.TRAIL:
             return
 
+        # Trail modifiers are validated as numeric, but may be `Decimal` depending on how the
+        # strategy constructed the order. Convert to floats to keep arithmetic stable across
+        # backtesting/live code paths.
+        trail_percent = self.trail_percent
+        if isinstance(trail_percent, Decimal):
+            trail_percent = float(trail_percent)
+
+        trail_price = self.trail_price
+        if isinstance(trail_price, Decimal):
+            trail_price = float(trail_price)
+
         # Update the trail stop price if we have a trail_percent
-        if self.trail_percent is not None:
+        if trail_percent is not None:
             # Get potential trail stop price
             if self.is_buy_order():
-                potential_trail_stop_price = price * (1 + self.trail_percent)
+                potential_trail_stop_price = price * (1 + trail_percent)
             # Buy/Sell are the only valid sides, so we can use else here.
             else:
-                potential_trail_stop_price = price * (1 - self.trail_percent)
+                potential_trail_stop_price = price * (1 - trail_percent)
 
             # Set the trail stop price if it has not been set yet.
             if self._trail_stop_price is None:
@@ -614,12 +779,12 @@ class Order:
                 self._trail_stop_price = potential_trail_stop_price
 
         # Update the trail stop price if we have a trail_price
-        if self.trail_price is not None:
+        if trail_price is not None:
             # Get potential trail stop price
             if self.is_buy_order():
-                potential_trail_stop_price = price + self.trail_price
+                potential_trail_stop_price = price + trail_price
             elif self.is_sell_order():
-                potential_trail_stop_price = price - self.trail_price
+                potential_trail_stop_price = price - trail_price
             else:
                 raise ValueError(f"side must be either 'buy' or 'sell'. Got {self.side} instead.")
 
@@ -662,21 +827,46 @@ class Order:
             secondary_trail_price,
             secondary_trail_percent,
     ):
-        self.limit_price = check_price(limit_price, "limit_price must be float.", nullable=True)
-        self.stop_price = check_price(stop_price, "stop_price must be float.", nullable=True)
-        self.stop_limit_price = check_price(stop_limit_price, "stop_limit_price must be float.",
-                                            nullable=True)
-        self.trail_price = check_price(trail_price, "trail_price must be positive float.", nullable=True)
-        self.trail_percent = check_positive(trail_percent, float, "trail_percent must be positive float.")
-        self.secondary_limit_price = check_price(secondary_limit_price, "secondary_limit_price must be float.",
-                                                 nullable=True)
-        self.secondary_stop_price = check_price(secondary_stop_price, "secondary_stop_price must be float.",
-                                                nullable=True)
-        self.secondary_stop_limit_price = check_price(secondary_stop_limit_price,
-                                                      "secondary_stop_limit_price must be float.", nullable=True)
-        self.secondary_trail_price = check_price(secondary_trail_price, "secondary_trail_price must be positive float.",
-                                                 nullable=True)
-        self.secondary_trail_percent = check_positive(secondary_trail_percent, float, "secondary_trail_percent must be positive float.")
+        # PERF: these helpers are called for every Order, but most Orders are market orders
+        # (all price inputs are `None`). Avoid the function call overhead in that common case.
+        cp = check_price
+        cpos = check_positive
+
+        self.limit_price = None if limit_price is None else cp(limit_price, "limit_price must be float.", nullable=True)
+        self.stop_price = None if stop_price is None else cp(stop_price, "stop_price must be float.", nullable=True)
+        self.stop_limit_price = (
+            None
+            if stop_limit_price is None
+            else cp(stop_limit_price, "stop_limit_price must be float.", nullable=True)
+        )
+        self.trail_price = None if trail_price is None else cp(trail_price, "trail_price must be positive float.", nullable=True)
+        self.trail_percent = None if trail_percent is None else cpos(trail_percent, float, "trail_percent must be positive float.")
+
+        self.secondary_limit_price = (
+            None
+            if secondary_limit_price is None
+            else cp(secondary_limit_price, "secondary_limit_price must be float.", nullable=True)
+        )
+        self.secondary_stop_price = (
+            None
+            if secondary_stop_price is None
+            else cp(secondary_stop_price, "secondary_stop_price must be float.", nullable=True)
+        )
+        self.secondary_stop_limit_price = (
+            None
+            if secondary_stop_limit_price is None
+            else cp(secondary_stop_limit_price, "secondary_stop_limit_price must be float.", nullable=True)
+        )
+        self.secondary_trail_price = (
+            None
+            if secondary_trail_price is None
+            else cp(secondary_trail_price, "secondary_trail_price must be positive float.", nullable=True)
+        )
+        self.secondary_trail_percent = (
+            None
+            if secondary_trail_percent is None
+            else cpos(secondary_trail_percent, float, "secondary_trail_percent must be positive float.")
+        )
 
     def _set_type_and_prices(
         self,
@@ -688,6 +878,9 @@ class Order:
         position_filled,
     ):
         if self.order_type is None:
+            if self.smart_limit is not None:
+                self.order_type = self.OrderType.SMART_LIMIT
+                return
             # Check if this is a trailing stop order
             if trail_price is not None or trail_percent is not None:
                 self.order_type = self.OrderType.TRAIL
@@ -704,7 +897,7 @@ class Order:
             elif limit_price is not None and stop_price is None:
                 self.order_type = self.OrderType.LIMIT
 
-            elif self.order_class == self.OrderClass.OCO:
+            elif self.order_class is self.OrderClass.OCO:
                 # This is a "One-Cancel-Other" advanced order. All info needed to calculate the child orders exists
                 # so they will be created automatically here unless specified directly by the user. It is expected that
                 # the broker will only submit the child orders as active orders, the parent order is just to tie them
@@ -721,7 +914,7 @@ class Order:
     def _set_order_class_children(self, secondary_limit_price, secondary_stop_price, secondary_stop_limit_price,
                                   secondary_trail_price, secondary_trail_percent):
 
-        if self.order_class == self.OrderClass.OCO:
+        if self.order_class is self.OrderClass.OCO:
             # This is a "One-Cancel-Other" advanced order. All info needed to calculate the child orders exists
             # so they will be created automatically here unless specified directly by the user. It is expected that
             # the broker will only submit the child orders as active orders, the parent order is just to tie them
@@ -735,7 +928,7 @@ class Order:
                     side=self.side,
                     limit_price=self.limit_price,
                     order_type=Order.OrderType.LIMIT,
-                    quote=self.quote, 
+                    quote=self.quote,
                 )
                 stop_order = Order(
                     # Stop Type will be filled in automatically for child based on the Stop Modifiers
@@ -747,7 +940,7 @@ class Order:
                     stop_limit_price=self.stop_limit_price,
                     trail_price=self.trail_price,
                     trail_percent=self.trail_percent,
-                    quote=self.quote, 
+                    quote=self.quote,
                 )
                 # Set dependencies so that the two orders will cancel the other in BackTesting
                 limit_order.dependent_order = stop_order
@@ -763,7 +956,7 @@ class Order:
                 raise ValueError("Order class is OCO but child orders are not set and no limit/stop prices have "
                                  "been provided.")
 
-        elif self.order_class == self.OrderClass.BRACKET:
+        elif self.order_class is self.OrderClass.BRACKET:
             # This is a "Bracket" advanced order which typically consists of a primary (entry) order and
             # two child orders. The user can provide their own list of child orders to the parent order object to
             # override the defaults. It is expected that the broker object will submit the parent (entry) order as
@@ -782,7 +975,7 @@ class Order:
                             side=child_side,
                             limit_price=secondary_limit_price,
                             order_type=Order.OrderType.LIMIT,
-                            quote=self.quote, 
+                            quote=self.quote,
                         )
                     )
                 if secondary_stop_price is not None:
@@ -797,7 +990,7 @@ class Order:
                             stop_limit_price=secondary_stop_limit_price,
                             trail_price=secondary_trail_price,
                             trail_percent=secondary_trail_percent,
-                            quote=self.quote, 
+                            quote=self.quote,
                         )
                     )
 
@@ -810,7 +1003,7 @@ class Order:
                 self.child_orders[0].dependent_order = self.child_orders[1]
                 self.child_orders[1].dependent_order = self.child_orders[0]
 
-        elif self.order_class == self.OrderClass.OTO:
+        elif self.order_class is self.OrderClass.OTO:
             # This is a "One-Triggers-One" advanced order. This order is typically used as a "half-bracket" where the
             # parent order is an entry order and the child order is either the stop or limit order that will be
             # placed if the parent order is filled. It is expected that the broker object will submit the
@@ -834,7 +1027,7 @@ class Order:
                             side=child_side,
                             limit_price=secondary_limit_price,
                             order_type=Order.OrderType.LIMIT,
-                            quote=self.quote, 
+                            quote=self.quote,
                         )
                     )
                 elif secondary_stop_price is not None:
@@ -849,7 +1042,7 @@ class Order:
                             stop_limit_price=secondary_stop_limit_price,
                             trail_price=secondary_trail_price,
                             trail_percent=secondary_trail_percent,
-                            quote=self.quote, 
+                            quote=self.quote,
                         )
                     )
 
@@ -909,12 +1102,13 @@ class Order:
 
         # Update the quantity for all OCO child orders. Multileg orders will have child orders that
         # can have different quantities, so do not update them here.
-        if self.order_class != self.OrderClass.MULTILEG and self.child_orders:
+        if self.order_class is not self.OrderClass.MULTILEG and self.child_orders:
             for child_order in self.child_orders:
                 child_order.quantity = quantity
 
     def __hash__(self):
-        return hash(self.identifier)
+        # PERF: `identifier` is a property; hashing uses the backing field directly.
+        return hash(self._identifier)
 
     # Compares two order objects to see if they are the same.
     def __eq__(self, other):
@@ -922,23 +1116,20 @@ class Order:
         if not isinstance(other, Order):
             return False
 
-        # If the other object is an Order object, then compare the identifier.
-        return (
-            self.identifier == other.identifier
-            and self.asset == other.asset
-            and self.quantity == other.quantity
-            and self.side == other.side
-        )
+        # Orders are uniquely identified by their identifier; comparing deeper fields is expensive
+        # and can be inconsistent with `__hash__` which also hashes the identifier.
+        # PERF: compare backing fields directly (avoid property getters).
+        return self._identifier == other._identifier
 
     def __repr__(self):
         if self.asset is None:
             self.rep_asset = self.symbol
         else:
-            if self.asset.asset_type == "crypto":
+            if "crypto" == self.asset.asset_type:
                 self.rep_asset = f"{self.pair}"
-            elif self.asset.asset_type == "future":
+            elif "future" == self.asset.asset_type:
                 self.rep_asset = f"{self.symbol} {self.asset.expiration}"
-            elif self.asset.asset_type == "option":
+            elif "option" == self.asset.asset_type:
                 self.rep_asset = f"{self.symbol} {self.asset.expiration} " f"{self.asset.right} {self.asset.strike}"
             else:
                 self.rep_asset = self.symbol
@@ -1027,8 +1218,13 @@ class Order:
         bool
             True if the order is active, False otherwise.
         """
-        active_children = any([child for child in self.child_orders if child.is_active()])
-        return not self.is_filled() and not self.is_canceled() or active_children
+        # Fast-path: most orders are simple and active; avoid recursively scanning children
+        # unless the parent itself is no longer active.
+        if not self.is_filled() and not self.is_canceled():
+            return True
+        if not self.child_orders:
+            return False
+        return any(child.is_active() for child in self.child_orders)
 
     def is_canceled(self):
         """
@@ -1039,7 +1235,7 @@ class Order:
         bool
             True if the order has been cancelled, False otherwise.
         """
-        return self.status.lower() in ["cancelled", "canceled", "cancel", "error"]
+        return self.status.lower() in ["cancelled", "canceled", "cancel", "error", "expired"]
 
     def is_filled(self):
         """
@@ -1052,7 +1248,15 @@ class Order:
         """
         if self.position_filled:
             return True
-        elif self.status.lower() in ["filled", "fill", "cash_settled"]:
+        elif self.status.lower() in [
+            "filled",
+            "fill",
+            "cash_settled",
+            "assigned",
+            "assignment",
+            "exercise",
+            "exercised",
+        ]:
             return True
         else:
             return False
@@ -1065,8 +1269,11 @@ class Order:
             return False
         elif self.status.lower() in [status.lower(), STATUS_ALIAS_MAP.get(status.lower(), "")]:
             return True
-        # open/new status is equivalent
-        elif {self.status.lower(), status.lower()}.issubset({"open", "new"}):
+        # Treat active "acknowledged" statuses as equivalent across brokers.
+        # WHY: Some brokers (notably Tradier) can report an active order as "submitted" for extended
+        # periods or flip between "open" and "submitted". Treating these as distinct can cause polling
+        # streams to emit repeated NEW events in long-running workers.
+        elif {self.status.lower(), status.lower()}.issubset({"open", "new", "submitted"}):
             return True
         else:
             return False
@@ -1084,7 +1291,7 @@ class Order:
         elif status2.lower() in STATUS_ALIAS_MAP.get(status1.lower(), []):
             # Bidirectional alias check
             return True
-        elif {status1.lower(), status2.lower()}.issubset({"open", "new"}):
+        elif {status1.lower(), status2.lower()}.issubset({"open", "new", "submitted"}):
             return True
         else:
             return False
@@ -1104,9 +1311,14 @@ class Order:
             self._raw = raw
 
     def to_position(self, quantity):
-        position_qty = quantity
-        if self.side == SELL:
-            position_qty = -quantity
+        # Safety check for invalid orders
+        if self.asset is None:
+            logger.error(f"Cannot create position from order {self.identifier} - asset is None")
+            return None
+
+        position_qty = Decimal(quantity)
+        if self.is_sell_order():
+            position_qty = -position_qty
 
         position = entities.Position(
             self.strategy,
@@ -1129,7 +1341,7 @@ class Order:
 
     def is_option(self):
         """Return true if this order is an option."""
-        return True if self.asset.asset_type == "option" else False
+        return True if "option" == self.asset.asset_type else False
 
     # ======Setting the events methods===========
 
@@ -1161,19 +1373,75 @@ class Order:
 
     # ========= Serialization methods ===========
 
+    def to_minimal_dict(self) -> dict:
+        """
+        Return a minimal dictionary representation of the order for progress logging.
+
+        This creates a lightweight representation suitable for real-time progress updates,
+        containing only the essential fields needed to display the order.
+
+        Returns
+        -------
+        dict
+            A minimal dictionary with keys:
+            - asset: Minimal asset dict (from asset.to_minimal_dict())
+            - side: Order side (buy, sell, etc.)
+            - qty: Order quantity
+            - type: Order type (market, limit, stop, etc.)
+            - status: Order status (new, filled, canceled, etc.)
+            - limit: Limit price (only if set)
+            - stop: Stop price (only if set)
+
+        Example
+        -------
+        >>> order = Order(strategy="MyStrategy", asset=Asset("AAPL"), quantity=100,
+        ...               side="buy", order_type="limit", limit_price=150.00)
+        >>> order.to_minimal_dict()
+        {'asset': {'symbol': 'AAPL', 'type': 'stock'}, 'side': 'buy', 'qty': 100,
+         'type': 'limit', 'status': 'new', 'limit': 150.0}
+        """
+        result = {
+            "asset": self.asset.to_minimal_dict() if self.asset and hasattr(self.asset, 'to_minimal_dict') else None,
+            "side": str(self.side) if self.side else None,
+            "qty": float(self.quantity) if self.quantity else 0,
+            "type": str(self.order_type) if self.order_type else "market",
+            "status": str(self.status) if self.status else "unprocessed",
+        }
+
+        # Only include prices if they're set
+        if self.limit_price is not None:
+            result["limit"] = float(self.limit_price)
+        if self.stop_price is not None:
+            result["stop"] = float(self.stop_price)
+        if self.smart_limit is not None:
+            result["smart_limit"] = self.smart_limit.to_dict()
+
+        return result
+
     def to_dict(self):
         # Initialize an empty dictionary for serializable attributes
         order_dict = {}
 
-        # List of non-serializable keys (thread locks, events, etc.)
+        # List of non-serializable keys (thread locks, events, internal data, etc.)
+        # EXPANDED to exclude problematic fields that cause DynamoDB 400KB errors
         non_serializable_keys = [
-            "_new_event", "_canceled_event", "_partial_filled_event", "_filled_event", "_closed_event"
+            "_new_event", "_canceled_event", "_partial_filled_event", "_filled_event", "_closed_event",
+            "_bars",        # Historical bar data (can be 1.8MB+)
+            "_raw",         # Raw broker response (can be 22KB+)
+            "_transmitted", # Internal state
+            "_error",       # Internal error tracking
+            "_broker",      # Broker reference
+            "transactions", # Can be large transaction history
         ]
 
         # Iterate through all attributes in the object's __dict__
         for key, value in self.__dict__.items():
             # Skip known non-serializable attributes by name
             if key in non_serializable_keys:
+                continue
+
+            # Skip ALL fields starting with underscore (Python internals)
+            if key.startswith('_'):
                 continue
 
             # Convert datetime objects to ISO format for JSON serialization
@@ -1196,8 +1464,12 @@ class Order:
             else:
                 order_dict[key] = value
 
+        # Add essential properties that might be stored with underscores
+        order_dict['quantity'] = float(self.quantity) if isinstance(self.quantity, Decimal) else self.quantity
+        order_dict['status'] = self.status
+
         return order_dict
-    
+
     @classmethod
     def from_dict(cls, order_dict):
         # Extract the core essential arguments to pass to __init__
@@ -1206,12 +1478,12 @@ class Order:
         if asset_data and isinstance(asset_data, dict):
             # Assuming Asset has its own from_dict method
             asset_obj = entities.Asset.from_dict(asset_data)
-        
+
         # Extract essential arguments, using None if the values are missing
         strategy = order_dict.get('strategy', None)
         side = order_dict.get('side', None)  # Default to None if side is missing
         quantity = order_dict.get('quantity', None)
-        
+
         # Create the initial object using the essential arguments
         obj = cls(
             strategy=strategy,
@@ -1228,24 +1500,27 @@ class Order:
         # Handle additional fields directly after the instance is created
         for key, value in order_dict.items():
             if key not in ['strategy', 'side', 'asset', 'quantity'] and key not in non_serializable_keys:
-                
+
                 # Convert datetime strings back to datetime objects
                 if isinstance(value, str) and "T" in value:
                     try:
                         setattr(obj, key, datetime.datetime.fromisoformat(value))
                     except ValueError:
                         setattr(obj, key, value)
-                
+
+                elif key == "smart_limit":
+                    setattr(obj, key, SmartLimitConfig.from_dict(value))
+
                 # Recursively convert nested objects using from_dict (for objects like quote)
                 elif isinstance(value, dict) and hasattr(cls, key) and hasattr(getattr(cls, key), 'from_dict'):
                     nested_class = getattr(cls, key)
                     setattr(obj, key, nested_class.from_dict(value))
-                
+
                 # Handle list of orders (child_orders)
                 elif isinstance(value, list) and key == 'child_orders':
                     child_orders = [cls.from_dict(item) for item in value]  # Recursively create Order objects
                     setattr(obj, key, child_orders)
-                
+
                 # Set simple values directly
                 else:
                     setattr(obj, key, value)

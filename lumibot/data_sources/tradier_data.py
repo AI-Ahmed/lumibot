@@ -1,20 +1,17 @@
-from collections import defaultdict
 import datetime as dt
+from collections import defaultdict
 from decimal import Decimal
 from typing import Union
-import pytz
 
 import pandas as pd
-
-from lumibot import LUMIBOT_DEFAULT_TIMEZONE
-from lumibot.entities import Asset, Bars, Quote
-from lumibot.tools.helpers import (
-    create_options_symbol,
-    parse_timestep_qty_and_unit,
-    date_n_trading_days_from_date
-)
-from lumibot.tools.lumibot_logger import get_logger
+import pytz
 from lumiwealth_tradier import Tradier
+
+from lumibot.constants import LUMIBOT_DEFAULT_TIMEZONE
+from lumibot.entities import Asset, Bars, Quote
+from lumibot.tools import black_scholes
+from lumibot.tools.helpers import create_options_symbol, date_n_trading_days_from_date, parse_timestep_qty_and_unit
+from lumibot.tools.lumibot_logger import get_logger
 
 from .data_source import DataSource
 
@@ -153,8 +150,16 @@ class TradierData(DataSource):
                   "Chains": {"CALL": defaultdict(list), "PUT": defaultdict(list)}}
         for row in df_chains.reset_index().to_dict("records"):
             exp_date = row["date"].strftime('%Y-%m-%d')
-            chains["Chains"]["CALL"][exp_date] = row["strikes"]
-            chains["Chains"]["PUT"][exp_date] = row["strikes"]
+            strikes = row["strikes"]
+            try:
+                strikes = sorted(float(s) for s in strikes)
+            except Exception:
+                try:
+                    strikes = sorted(strikes)
+                except Exception:
+                    pass
+            chains["Chains"]["CALL"][exp_date] = strikes
+            chains["Chains"]["PUT"][exp_date] = strikes
 
         return chains
 
@@ -202,7 +207,7 @@ class TradierData(DataSource):
         return df
 
     def get_historical_prices(
-        self, asset, length, timestep="", timeshift=None, quote=None, exchange=None, include_after_hours=True
+        self, asset, length, timestep="", timeshift=None, quote=None, exchange=None, include_after_hours=True, return_polars: bool = False
     ):
         """
         Get bars for a given asset
@@ -259,8 +264,9 @@ class TradierData(DataSource):
             days_needed = length
         else:
             # For minute bars, calculate additional days needed accounting for weekends/holidays
-            minutes_per_day = 390  # ~6.5 hours of trading per day
-            days_needed = (length // minutes_per_day) + 1
+            # minutes_per_day = 390  # ~6.5 hours of trading per day
+            minutes_per_day = 24 * 60 / timestep_qty  # Need to include premarket and after hours
+            days_needed = int(length // minutes_per_day) + 1
 
         start_date = date_n_trading_days_from_date(
             n_days=days_needed,
@@ -449,4 +455,48 @@ class TradierData(DataSource):
         for col in [x for x in df.columns if 'greeks' in x]:
             greek_name = col.replace('greeks.', '')
             greeks[greek_name] = df[col].iloc[0]
+
+        # Tradier can round extremely small deltas to 0.0 for far OTM options.
+        # When we have IV available, compute a more precise delta as a best-effort fallback
+        # so callers (and legacy tests) can rely on delta sign being correct.
+        try:
+            delta = float(greeks.get("delta", 0.0) or 0.0)
+        except Exception:
+            delta = 0.0
+
+        if asset.right.upper() == "CALL" and delta == 0.0:
+            try:
+                iv = float(greeks.get("mid_iv") or greeks.get("ask_iv") or greeks.get("bid_iv") or 0.0)
+            except Exception:
+                iv = 0.0
+
+            if iv > 0:
+                try:
+                    underlying_price = self.get_last_price(Asset(stock_symbol, asset_type="stock"))
+                    underlying_price = float(underlying_price) if underlying_price is not None else None
+                except Exception:
+                    underlying_price = None
+
+                if underlying_price is not None:
+                    expiration = asset.expiration
+                    if isinstance(expiration, str):
+                        expiration = dt.datetime.strptime(expiration, "%Y-%m-%d").date()
+                    if isinstance(expiration, dt.datetime):
+                        expiration = expiration.date()
+
+                    if isinstance(expiration, dt.date):
+                        expiration_dt = dt.datetime.combine(expiration, dt.time.min)
+                        expiration_dt = self.tzinfo.localize(expiration_dt).replace(hour=16, minute=0, second=0, microsecond=0)
+                        now = self.get_datetime()
+                        days_to_expiration = (expiration_dt - now).total_seconds() / (60 * 60 * 24)
+                        # Options can be queried after market close in CI/local runs. Avoid a near-zero
+                        # time-to-expiration that would underflow deltas to 0.0 for slightly OTM calls.
+                        days_to_expiration = max(days_to_expiration, 1.0 / 24.0)
+
+                        interest = 0.0
+                        c = black_scholes.BS(
+                            [underlying_price, float(asset.strike), interest, days_to_expiration],
+                            volatility=iv * 100,
+                        )
+                        greeks["delta"] = float(c.callDelta)
         return greeks

@@ -42,52 +42,24 @@ class TestProjectXDataSource:
             assert data_source.name == "data_source"  # Inherited from parent DataSource class
             assert data_source.firm == "TEST"
 
-    def test_asset_to_contract_id_no_hardcoded_mappings(self, projectx_data_source):
-        """
-        Test that asset resolution doesn't use hardcoded contract mappings.
-        Previously had: 'MES': 'CON.F.US.MES.U25' which would expire.
-        """
-        # Mock the Asset class method for dynamic contract resolution
-        with patch.object(Asset, 'get_potential_futures_contracts') as mock_contracts:
-            mock_contracts.return_value = ['MESU25', 'MES.U25', 'MESU2025']
-
-            # Test asset conversion
-            asset = Asset(symbol="MES", asset_type=Asset.AssetType.CONT_FUTURE)
-            contract_id = projectx_data_source._get_contract_id_from_asset(asset)
-
-            # Should use Asset class logic, not hardcoded mappings
-            mock_contracts.assert_called_once()
-            assert contract_id  # Should return a valid contract ID
-
-    def test_contract_id_generation_dynamic(self, projectx_data_source):
-        """Test dynamic contract ID generation using Asset class"""
-
-        # Mock client to return a contract ID
-        projectx_data_source.client.find_contract_by_symbol = MagicMock(return_value="CON.F.US.MES.U25")
-
-        # Test with continuous futures asset
-        asset = Asset(symbol="MES", asset_type=Asset.AssetType.CONT_FUTURE)
-
-        # Should use dynamic search, not hardcoded mappings
-        contract_id = projectx_data_source._get_contract_id_from_asset(asset)
-        assert contract_id == "CON.F.US.MES.U25"  # Should pick appropriate contract
-
     def test_timespan_parsing(self, projectx_data_source):
         """Test timespan parsing for ProjectX unit conversion"""
 
         # Test various timespan formats
         test_cases = [
-            ("minute", 1, 1),    # Fixed: returns (unit_id, unit_number)
-            ("1minute", 1, 1),
-            ("5minute", 1, 5),
-            ("15minute", 1, 15),
-            ("hour", 2, 1),      # Fixed: returns (unit_id, unit_number)
-            ("1hour", 2, 1),
-            ("4hour", 2, 4),
-            ("day", 3, 1),       # Fixed: returns (unit_id, unit_number)
-            ("1day", 3, 1),
-            ("week", 4, 1),      # Fixed: returns (unit_id, unit_number)
-            ("month", 5, 1),     # Fixed: returns (unit_id, unit_number)
+            ("second", 1, 1),
+            ("1second", 1, 1),
+            ("minute", 2, 1),
+            ("1minute", 2, 1),
+            ("5minute", 2, 5),
+            ("15minute", 2, 15),
+            ("hour", 3, 1),
+            ("1hour", 3, 1),
+            ("4hour", 3, 4),
+            ("day", 4, 1),
+            ("1day", 4, 1),
+            ("week", 5, 1),
+            ("month", 6, 1),
         ]
 
         for timespan, expected_unit, expected_number in test_cases:
@@ -100,12 +72,12 @@ class TestProjectXDataSource:
 
         # Test unit name to ProjectX unit mapping - using correct attribute name
         unit_mappings = projectx_data_source.TIME_UNIT_MAPPING
-
-        assert unit_mappings["minute"] == 1
-        assert unit_mappings["hour"] == 2
-        assert unit_mappings["day"] == 3
-        assert unit_mappings["week"] == 4
-        assert unit_mappings["month"] == 5
+        assert unit_mappings["second"] == 1
+        assert unit_mappings["minute"] == 2
+        assert unit_mappings["hour"] == 3
+        assert unit_mappings["day"] == 4
+        assert unit_mappings["week"] == 5
+        assert unit_mappings["month"] == 6
 
     def test_get_historical_prices_bars_conversion(self, projectx_data_source):
         """Test historical price retrieval and bars conversion"""
@@ -126,19 +98,20 @@ class TestProjectXDataSource:
     def test_get_last_price(self, projectx_data_source):
         """Test last price retrieval"""
 
-        # Mock get_bars to return bars with price data
+        # Mock _get_contract_id_from_asset to return a valid contract ID
+        projectx_data_source._get_contract_id_from_asset = MagicMock(return_value="test_contract_id")
+
+        # Mock client.history_retrieve_bars to return bars with price data
         mock_df = pd.DataFrame({
             'close': [5150.25]
         })
-        mock_bars = MagicMock()
-        mock_bars.df = mock_df
-        projectx_data_source.get_bars = MagicMock(return_value=mock_bars)
+        projectx_data_source.client.history_retrieve_bars = MagicMock(return_value=mock_df)
 
         asset = Asset(symbol="MES", asset_type=Asset.AssetType.CONT_FUTURE)
         price = projectx_data_source.get_last_price(asset)
 
         assert price == 5150.25
-        projectx_data_source.get_bars.assert_called_once()
+        projectx_data_source.client.history_retrieve_bars.assert_called_once()
 
     def test_dividends_not_supported(self, projectx_data_source):
         """Test that dividends return 0 for futures broker"""
@@ -189,17 +162,34 @@ class TestProjectXDataSource:
 
         # Mock Asset class to return multiple potential formats
         with patch.object(Asset, 'get_potential_futures_contracts') as mock_contracts:
-            mock_contracts.return_value = ['MESU25', 'MES.U25', 'MESU2025']
+            with patch.object(projectx_data_source.client, "find_contract_by_symbol") as mock_api_lookup:
+                mock_api_lookup.return_value = "CON.F.US.MES.Z25"
+                mock_contracts.return_value = ['MESU25', 'MES.U25', 'MESU2025']
 
-            # Mock client method to return valid contract
-            projectx_data_source.client.find_contract_by_symbol = MagicMock(return_value="CON.F.US.MES.U25")
+                # Mock client method to return valid contract
+                assert not projectx_data_source._contract_cache
+                asset = Asset(symbol="MES", asset_type=Asset.AssetType.CONT_FUTURE)
+                contract_id = projectx_data_source._get_contract_id_from_asset(asset)
 
-            asset = Asset(symbol="MES", asset_type=Asset.AssetType.CONT_FUTURE)
-            contract_id = projectx_data_source._get_contract_id_from_asset(asset)
+                # Should find contract using API logic
+                assert contract_id == "CON.F.US.MES.Z25"
+                assert mock_api_lookup.call_count == 1
+                mock_contracts.assert_not_called()
+                assert projectx_data_source._contract_cache
 
-            # Should find contract using Asset class logic
-            assert contract_id == "CON.F.US.MES.U25"
-            mock_contracts.assert_called_once()
+                # Subsequent call should hit cache
+                mock_api_lookup.reset_mock()
+                contract_id = projectx_data_source._get_contract_id_from_asset(asset)
+                assert contract_id == "CON.F.US.MES.Z25"
+                mock_api_lookup.assert_not_called()
+                mock_contracts.assert_not_called()
+
+                # Test Asset method called if cache cleared
+                projectx_data_source._contract_cache.clear()
+                mock_api_lookup.return_value = None
+                contract_id = projectx_data_source._get_contract_id_from_asset(asset)
+                mock_contracts.assert_called_once()
+                assert contract_id == "CON.F.US.MES.U25"
 
     def test_error_handling_no_contracts_found(self, projectx_data_source):
         """Test error handling when no contracts are found"""
@@ -338,20 +328,3 @@ class TestProjectXDataSourceIntegration:
         assert len(bars.df) == 2
         assert bars.asset.symbol == "MES"
         assert bars.source == "PROJECTX"  # Source is uppercase
-
-    def test_asset_resolution_workflow_with_fallbacks(self, projectx_data_source):
-        """Test asset resolution workflow with multiple format fallbacks"""
-
-        # Mock Asset class to return multiple formats
-        with patch.object(Asset, 'get_potential_futures_contracts') as mock_contracts:
-            mock_contracts.return_value = ['MESU25', 'MES.U25', 'MESU2025']
-
-            # Mock client to eventually succeed
-            projectx_data_source.client.find_contract_by_symbol = MagicMock(return_value="CON.F.US.MES.U25")
-
-            asset = Asset(symbol="MES", asset_type=Asset.AssetType.CONT_FUTURE)
-            contract_id = projectx_data_source._get_contract_id_from_asset(asset)
-
-            # Should eventually find contract
-            assert contract_id == "CON.F.US.MES.U25"
-            mock_contracts.assert_called_once() 

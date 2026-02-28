@@ -51,7 +51,6 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Tuple, Optional
-from functools import lru_cache
 from enum import Enum
 
 # Import LUMIWEALTH_API_KEY from credentials
@@ -246,20 +245,24 @@ class BotspotErrorHandler(logging.Handler):
     """
     
     def __init__(self):
-        super().__init__(level=logging.WARNING)
+        # Only handle ERROR and CRITICAL messages for external reporting
+        super().__init__(level=logging.ERROR)
         self.base_url = "https://api.botspot.trade/bots/report-bot-error"
         # Use LUMIWEALTH_API_KEY from credentials or environment
         self.api_key = LUMIWEALTH_API_KEY or os.environ.get("LUMIWEALTH_API_KEY")
-        self._error_counts: Dict[Tuple[str, str, str], int] = {}
-        self._last_sent_times: Dict[Tuple[str, str, str], float] = {}
+        # Fingerprint state keyed by simplified fingerprint (error_code, filename, function, message_signature)
+        # to reduce API spam while preserving differentiation between distinct error messages sharing same location.
+        # fingerprint -> dict(last_sent: float|None, suppressed_count: int, total_count: int, last_details: str, last_message: str)
+        self._fingerprints: Dict[Tuple[str, str, str, str], Dict[str, object]] = {}
+
         self._total_errors_sent = 0
         self._minute_start_time = time.time()
         self._lock = threading.Lock()
-        
+
         # Rate limiting configuration
         self.rate_limit_window = int(os.environ.get("BOTSPOT_RATE_LIMIT_WINDOW", "60"))
         self.max_errors_per_minute = int(os.environ.get("BOTSPOT_MAX_ERRORS_PER_MINUTE", "100"))
-        
+
         # Only import requests if we need it
         if self.api_key:
             try:
@@ -381,69 +384,110 @@ class BotspotErrorHandler(logging.Handler):
             logger.debug(f"Botspot API exception: {e}")
             return False
     
-    def _check_rate_limits(self, error_key: Tuple[str, str, str]) -> bool:
-        """
-        Check if we should send this error based on rate limits.
-        
-        Returns True if the error should be sent, False if rate limited.
-        """
+    def _check_global_rate_limit(self) -> bool:
+        """Check global per-minute rate cap only (fingerprint logic handled separately)."""
         current_time = time.time()
-        
-        # Reset minute counter if a minute has passed
         if current_time - self._minute_start_time >= 60:
             self._total_errors_sent = 0
             self._minute_start_time = current_time
-        
-        # Check global rate limit (max errors per minute)
         if self._total_errors_sent >= self.max_errors_per_minute:
             return False
-        
-        # Check per-error rate limit (deduplication window)
-        if error_key in self._last_sent_times:
-            time_since_last_sent = current_time - self._last_sent_times[error_key]
-            if time_since_last_sent < self.rate_limit_window:
-                return False
-        
         return True
+
+    def _make_fingerprint(self, error_code: str, record: logging.LogRecord) -> Tuple[str, str, str, str]:
+        """Create a fingerprint including message signature so distinct messages aren't incorrectly coalesced.
+
+        We intentionally exclude line numbers (they can fluctuate) but include a truncated, normalized message to ensure
+        tests expecting multiple distinct errors (different messages) see multiple sends.
+        """
+        filename = os.path.basename(record.pathname) if hasattr(record, 'pathname') else '<unknown>'
+        func = getattr(record, 'funcName', '<unknown>')
+        try:
+            raw_msg = record.getMessage().strip() if hasattr(record, 'getMessage') else str(getattr(record, 'msg', ''))
+        except Exception:
+            raw_msg = str(getattr(record, 'msg', ''))
+        # Use only portion before first pipe as message signature for dedupe (treat differing details as same base error)
+        base_part = raw_msg.split('|', 1)[0].strip()
+        if not base_part:
+            base_part = raw_msg[:120]
+        msg_sig = re.sub(r"\s+", " ", base_part)[:120]
+        return (error_code, filename, func, msg_sig)
+
+    def _should_send_now(self, fp_state: Dict[str, object], now: float) -> bool:
+        last_sent = fp_state.get('last_sent')  # may be None
+        if last_sent is None:
+            return True  # first occurrence -> send immediately
+        return (now - float(last_sent)) >= self.rate_limit_window
     
     def emit(self, record):
-        """Handle a log record by reporting to Botspot API."""
-        if not self.api_key:
+        """Report to Botspot with simplified fingerprint dedupe while preserving full detail payloads."""
+        # Only send ERROR and CRITICAL to external service
+        if not self.api_key or record.levelno < logging.ERROR:
             return
-        if record.levelno < logging.WARNING:
-            return
-        
         try:
             with self._lock:
+                now = time.time()
                 severity = self._map_log_level_to_severity(record.levelno)
                 error_code, message, details = self._extract_error_info(record)
-                
-                # Create a key for deduplication
-                error_key = (error_code, message, details)
-                
-                # Update count
-                if error_key in self._error_counts:
-                    self._error_counts[error_key] += 1
-                else:
-                    self._error_counts[error_key] = 1
-                
-                # Check rate limits
-                if not self._check_rate_limits(error_key):
-                    # Rate limited - don't send
+                fp = self._make_fingerprint(error_code, record)
+
+                fp_state = self._fingerprints.get(fp)
+                if fp_state is None:
+                    fp_state = {
+                        'last_sent': None,
+                        'suppressed_count': 0,
+                        'total_count': 0,
+                        'last_details': details,
+                        'last_message': message,
+                    }
+                    self._fingerprints[fp] = fp_state
+
+                # always keep latest details/message so we don't lose most recent stack/uuid
+                fp_state['last_details'] = details
+                fp_state['last_message'] = message
+                fp_state['total_count'] = int(fp_state['total_count']) + 1
+
+                send_now = self._should_send_now(fp_state, now)
+
+                if not send_now:
+                    # inside window -> just accumulate
+                    fp_state['suppressed_count'] = int(fp_state['suppressed_count']) + 1
                     return
-                
-                # Update tracking for rate limiting
-                current_time = time.time()
-                self._last_sent_times[error_key] = current_time
-                self._total_errors_sent += 1
-                
-                count = self._error_counts[error_key]
-                
-                # Report to Botspot
-                self._report_to_botspot(severity, error_code, message, details, count)
-                
-        except Exception as e:
-            # Don't let Botspot errors break the main application
+
+                # Outside window OR first occurrence -> check global cap
+                if not self._check_global_rate_limit():
+                    # global cap reached; skip sending but still accumulate suppressed
+                    fp_state['suppressed_count'] = int(fp_state['suppressed_count']) + 1
+                    return
+
+                # Prepare counts
+                suppressed = int(fp_state['suppressed_count'])
+                count_for_payload = 1 + suppressed  # current event + suppressed during window
+
+                # Send with latest details/message and aggregated count
+                success = self._report_to_botspot(
+                    severity,
+                    error_code,
+                    fp_state['last_message'],
+                    fp_state['last_details'],
+                    count_for_payload,
+                )
+                if success:
+                    self._total_errors_sent += 1
+                    fp_state['last_sent'] = now
+                    fp_state['suppressed_count'] = 0
+
+                # Opportunistic pruning: drop stale fingerprints occasionally
+                if len(self._fingerprints) > 500:  # arbitrary soft cap
+                    to_delete = []
+                    for k, v in self._fingerprints.items():
+                        last_sent = v.get('last_sent') or 0
+                        if now - float(last_sent) > 3600 and v.get('suppressed_count', 0) == 0:  # 1h inactivity
+                            to_delete.append(k)
+                    for k in to_delete:
+                        del self._fingerprints[k]
+        except Exception:
+            # Swallow all exceptions to avoid interfering with main execution
             pass
 
 
@@ -558,6 +602,9 @@ _logger_registry: Dict[str, logging.Logger] = {}
 _strategy_logger_registry: Dict[str, 'StrategyLoggerAdapter'] = {}
 _handlers_configured = False
 _config_lock = threading.Lock()
+# PERF: `StrategyLoggerAdapter.isEnabledFor()` is called extremely frequently in backtests. Avoid
+# per-call environment lookups by caching the effective "quiet logs" mode during logger setup.
+_BACKTESTING_QUIET_LOGS_ENABLED = False
 
 
 class StrategyLoggerAdapter(logging.LoggerAdapter):
@@ -579,17 +626,9 @@ class StrategyLoggerAdapter(logging.LoggerAdapter):
         return f"[{self.strategy_name}] {msg}", kwargs
     
     def isEnabledFor(self, level):
-        """Override to respect BACKTESTING_QUIET_LOGS for strategy loggers"""
-        # BACKTESTING_QUIET_LOGS only applies during backtesting, not live trading
-        is_backtesting = os.environ.get("IS_BACKTESTING", "").lower() == "true"
-        
-        if is_backtesting:
-            # During backtesting, check quiet logs setting
-            quiet_logs = os.environ.get("BACKTESTING_QUIET_LOGS", "true").lower() == "true"  # Default to True
-            if quiet_logs and level < logging.ERROR:
-                return False
-        
-        # For live trading, always show messages
+        """Respect BACKTESTING_QUIET_LOGS without per-call environment lookups."""
+        if _BACKTESTING_QUIET_LOGS_ENABLED and level < logging.ERROR:
+            return False
         return self.logger.isEnabledFor(level)
     
     def info(self, msg, *args, **kwargs):
@@ -620,9 +659,11 @@ class StrategyLoggerAdapter(logging.LoggerAdapter):
 def _ensure_handlers_configured():
     """
     Ensure that the root logger has the appropriate handlers configured.
-    This is called once globally to set up consistent formatting.
-    Thread-safe implementation using double-checked locking pattern.
-    
+    This is called once globally to set up consistent formatting, but we also
+    re-apply the environment driven log levels when invoked repeatedly.  This is
+    important for the unit test-suite which toggles environment variables between
+    tests and expects the console handler level to follow suit.
+
     Environment Variables Used:
     - LUMIBOT_LOG_LEVEL: Set global log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
     - LOG_ERRORS_TO_CSV: Enable CSV error logging (true/false)
@@ -630,29 +671,90 @@ def _ensure_handlers_configured():
     - BACKTESTING_QUIET_LOGS: Enable quiet logs for backtesting (true/false)
     - LUMIWEALTH_API_KEY: API key for Lumiwealth/Botspot error reporting (when set, enables automatic error reporting)
     """
-    global _handlers_configured
-    
+    global _handlers_configured, _BACKTESTING_QUIET_LOGS_ENABLED
+
+    # Resolve baseline log level from the environment (default INFO)
+    default_level = os.environ.get('LUMIBOT_LOG_LEVEL', 'INFO').upper()
+    try:
+        log_level = getattr(logging, default_level)
+    except AttributeError:
+        log_level = logging.INFO
+
+    is_backtesting = os.environ.get("IS_BACKTESTING", "").lower() == "true"
+
+    # Determine the effective file (root) log level and console level
+    if is_backtesting:
+        backtesting_quiet = os.environ.get("BACKTESTING_QUIET_LOGS")
+        if backtesting_quiet is None:
+            backtesting_quiet = "true"
+
+        quiet_logs_enabled = backtesting_quiet.lower() == "true"
+        _BACKTESTING_QUIET_LOGS_ENABLED = quiet_logs_enabled
+
+        if quiet_logs_enabled:
+            # Quiet mode: only ERROR+ messages to console and file
+            console_level = logging.ERROR
+            effective_log_level = logging.ERROR
+        else:
+            # Verbose mode: respect LUMIBOT_LOG_LEVEL for both console and file
+            console_level = log_level
+            effective_log_level = log_level
+    else:
+        _BACKTESTING_QUIET_LOGS_ENABLED = False
+        console_level = log_level
+        effective_log_level = log_level
+
+    def _apply_levels(root_logger: logging.Logger):
+        """Ensure root level and console handler levels reflect the desired state."""
+        root_logger.setLevel(effective_log_level)
+        # Some environments/tests toggle `propagate` to avoid duplicate output. For Lumibot's unified logger we want
+        # records to remain capturable by upstream handlers (pytest caplog, app-level root handlers, etc.).
+        root_logger.propagate = True
+
+        console_handlers = [
+            handler
+            for handler in root_logger.handlers
+            if isinstance(handler, logging.StreamHandler)
+            and not isinstance(handler, logging.FileHandler)
+        ]
+
+        if not console_handlers:
+            # Guarantee a console handler exists (needed on some CI environments)
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setFormatter(LumibotFormatter())
+            root_logger.addHandler(console_handler)
+            console_handlers = [console_handler]
+
+        for handler in console_handlers:
+            handler.setLevel(console_level)
+            # Normalise formatter – some tests replace handlers without our formatter
+            if handler.formatter is None or not isinstance(handler.formatter, LumibotFormatter):
+                handler.setFormatter(LumibotFormatter())
+
     if _handlers_configured:
+        root_logger = logging.getLogger("lumibot")
+        _apply_levels(root_logger)
         return
 
     with _config_lock:
-        # Double-check pattern to avoid race conditions
         if _handlers_configured:
+            root_logger = logging.getLogger("lumibot")
+            _apply_levels(root_logger)
             return
-        
+
         # Set the logger class to our custom LumibotLogger
         logging.setLoggerClass(LumibotLogger)
-            
-        # Get the root logger directly to avoid circular calls
+
         root_logger = logging.getLogger("lumibot")
-        
+
         # Remove any existing handlers to avoid duplicates
         for handler in root_logger.handlers[:]:
             root_logger.removeHandler(handler)
-        
-        # Create console handler with our custom formatter
+
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setFormatter(LumibotFormatter())
+        console_handler.setLevel(console_level)
+
         
         # Install progress bar aware handler on the Python root logger
         # This catches ALL log messages from any package
@@ -669,66 +771,29 @@ def _ensure_handlers_configured():
             progress_bar_handler.setLevel(logging.DEBUG)  # Catch all levels
             python_root_logger.addHandler(progress_bar_handler)
 
-        # Set default level (can be overridden by environment variable)
-        default_level = os.environ.get('LUMIBOT_LOG_LEVEL', 'INFO').upper()
-        try:
-            log_level = getattr(logging, default_level)
-        except AttributeError:
-            log_level = logging.INFO
-
-        # Handle console output based on mode
-        is_backtesting = os.environ.get("IS_BACKTESTING", "").lower() == "true"
-        
-        if is_backtesting:
-            # During backtesting, console should ALWAYS be quiet (ERROR+ only)
-            # regardless of BACKTESTING_QUIET_LOGS setting
-            # BACKTESTING_QUIET_LOGS only controls file logging
-            console_handler.setLevel(logging.ERROR)
-            
-            # File logging level is controlled by BACKTESTING_QUIET_LOGS
-            backtesting_quiet = os.environ.get("BACKTESTING_QUIET_LOGS")
-            if backtesting_quiet is None:
-                # Default to quiet logs for backtesting
-                backtesting_quiet = "true"
-            
-            if backtesting_quiet.lower() == "true":
-                # Quiet logs: file logging at ERROR+ level
-                log_level = logging.ERROR
-            else:
-                # Verbose logs: file logging at INFO+ level (but console still ERROR+)
-                pass  # Keep original log_level
-        else:
-            # Live trading: always show console messages at full level
-            console_handler.setLevel(log_level)
-        
-        root_logger.setLevel(log_level)
+        root_logger.setLevel(effective_log_level)
         root_logger.addHandler(console_handler)
-        
+
         # Add CSV error handler if enabled
         log_errors_to_csv = os.environ.get("LOG_ERRORS_TO_CSV")
         if log_errors_to_csv and log_errors_to_csv.lower() in ("true", "1", "yes", "on"):
             csv_path = os.environ.get("LUMIBOT_ERROR_CSV_PATH", "logs/errors.csv")
             csv_handler = CSVErrorHandler(csv_path)
             root_logger.addHandler(csv_handler)
-        
+
         # Add Botspot error handler if API key is available
-        # Check environment variable (this is what tests patch)
         api_key = os.environ.get("LUMIWEALTH_API_KEY")
-        
-        # Fall back to the imported value if not in environment
         if not api_key and LUMIWEALTH_API_KEY:
             api_key = LUMIWEALTH_API_KEY
-        
+
         if api_key:
             botspot_handler = BotspotErrorHandler()
             root_logger.addHandler(botspot_handler)
-        # Keep propagation enabled for proper logging behavior
+
         root_logger.propagate = True
-        
         _handlers_configured = True
 
 
-@lru_cache(maxsize=128)
 def get_logger(name: str) -> logging.Logger:
     """
     Get a logger instance for the given name with consistent Lumibot formatting.
@@ -843,27 +908,35 @@ def set_log_level(level: str):
         # Get the actual lumibot root logger
         root_logger = logging.getLogger("lumibot")
         root_logger.setLevel(log_level)
-        
-        # Update handlers but respect console handler's ERROR level during backtesting
+
+        # Update handlers with respect to backtesting quiet logs setting
         is_backtesting = os.environ.get("IS_BACKTESTING", "").lower() == "true"
-        
+
         if is_backtesting:
-            # During backtesting, we need special handling to ensure console stays quiet
-            # Set root logger to allow messages through (for file logging)
-            root_logger.setLevel(log_level)
-            
-            # But ensure ALL console handlers stay at ERROR level
-            for handler in root_logger.handlers:
-                if isinstance(handler, logging.StreamHandler):
-                    handler.setLevel(logging.ERROR)
-            
-            # Don't update individual logger levels - this would bypass handler filtering
+            # Check if quiet logs are enabled
+            backtesting_quiet = os.environ.get("BACKTESTING_QUIET_LOGS")
+            if backtesting_quiet is None:
+                backtesting_quiet = "true"
+
+            if backtesting_quiet.lower() == "true":
+                # Quiet mode: console stays at ERROR, but allow file handlers to use requested level
+                root_logger.setLevel(log_level)
+                for handler in root_logger.handlers:
+                    if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+                        handler.setLevel(logging.ERROR)  # Console: quiet
+                    else:
+                        handler.setLevel(log_level)  # File handlers: verbose
+            else:
+                # Verbose mode: respect requested level for all handlers
+                root_logger.setLevel(log_level)
+                for handler in root_logger.handlers:
+                    handler.setLevel(log_level)
         else:
-            # For live trading, set everything normally
+            # Live trading: set everything normally
             root_logger.setLevel(log_level)
             for handler in root_logger.handlers:
                 handler.setLevel(log_level)
-            
+
             # Update all existing loggers in our registry
             for logger in _logger_registry.values():
                 logger.setLevel(log_level)

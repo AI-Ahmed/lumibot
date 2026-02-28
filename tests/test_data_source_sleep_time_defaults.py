@@ -1,0 +1,56 @@
+from lumibot.data_sources.data_source import DataSource
+from lumibot.entities import Asset
+
+
+class _DummyDataSource(DataSource):
+    SOURCE = "DUMMY"
+    TIMESTEP_MAPPING = []
+
+    def __init__(self, *, backtesting: bool):
+        # Do not call DataSource.__init__ (it expects real provider setup).
+        self.IS_BACKTESTING_DATA_SOURCE = backtesting
+        self._thread_pool = None
+        self._thread_pool_max_workers = 4
+
+    def _get_or_create_thread_pool(self):
+        # Use a real thread pool from the base implementation.
+        return super()._get_or_create_thread_pool()
+
+    def get_historical_prices(self, *args, **kwargs):
+        # Return a non-None sentinel; DataSource.get_bars only cares about exceptions.
+        return {"ok": True}
+
+    def get_last_price(self, asset, quote=None, exchange=None):
+        return 0.0
+
+    def get_chains(self, asset):
+        return {}
+
+
+def test_get_bars_default_sleep_time_is_zero_in_backtesting(monkeypatch):
+    ds = _DummyDataSource(backtesting=True)
+
+    calls = {"n": 0}
+
+    def _sleep(_):
+        calls["n"] += 1
+
+    monkeypatch.setattr("lumibot.data_sources.data_source.time.sleep", _sleep)
+
+    ds.get_bars([Asset("SPY")], length=1, timestep="minute", chunk_size=1, max_workers=1)
+    assert calls["n"] == 0
+
+
+def test_get_bars_default_sleep_time_applies_in_live(monkeypatch):
+    ds = _DummyDataSource(backtesting=False)
+
+    calls = {"n": 0}
+
+    def _sleep(_):
+        calls["n"] += 1
+
+    monkeypatch.setattr("lumibot.data_sources.data_source.time.sleep", _sleep)
+
+    ds.get_bars([Asset("SPY"), Asset("AAPL")], length=1, timestep="minute", chunk_size=1, max_workers=1)
+    # One sleep per asset by default.
+    assert calls["n"] == 2

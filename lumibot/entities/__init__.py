@@ -1,10 +1,36 @@
 from .asset import Asset, AssetsMapping
 from .bar import Bar
-from .bars import Bars
-from .data import Data
+
+# Import base implementations
+from .bars import Bars as _BarsBase
+from .chains import Chains
+from .data import Data as _DataBase
+from .data_polars import DataPolars
 from .dataline import Dataline
 from .order import Order
 from .position import Position
-from .trading_fee import TradingFee
 from .quote import Quote
-from .chains import Chains
+from .trading_fee import TradingFee
+from .trading_slippage import TradingSlippage
+from .smart_limit import SmartLimitConfig, SmartLimitPreset
+
+# Use base implementations directly
+Bars = _BarsBase
+Data = _DataBase
+__all__ = [
+    "Asset",
+    "AssetsMapping",
+    "Bar",
+    "Bars",
+    "Chains",
+    "Data",
+    "DataPolars",
+    "Dataline",
+    "Order",
+    "Position",
+    "Quote",
+    "TradingFee",
+    "TradingSlippage",
+    "SmartLimitConfig",
+    "SmartLimitPreset",
+]

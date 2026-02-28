@@ -21,6 +21,8 @@ class PolygonDataBacktesting(PandasData):
     Backtesting implementation of Polygon
     """
 
+    option_quote_fallback_allowed = True
+
     def __init__(
         self,
         datetime_start,
@@ -31,7 +33,8 @@ class PolygonDataBacktesting(PandasData):
         **kwargs,
     ):
         super().__init__(
-            datetime_start=datetime_start, datetime_end=datetime_end, pandas_data=pandas_data, api_key=api_key, **kwargs
+            datetime_start=datetime_start, datetime_end=datetime_end, pandas_data=pandas_data, api_key=api_key,
+            allow_option_quote_fallback=True, **kwargs
         )
 
         # Memory limit, off by default
@@ -139,26 +142,31 @@ class PolygonDataBacktesting(PandasData):
             # Assuming e.message or similar attribute contains the error message
             formatted_start_datetime = start_datetime.strftime("%Y-%m-%d")
             formatted_end_datetime = self.datetime_end.strftime("%Y-%m-%d")
-            if "Your plan doesn't include this data timeframe" in str(e):
-                error_message = colored(
+            text = str(e)
+            plan_msgs = (
+                "Your plan doesn't include this data timeframe",
+                "Your plan doesn\u2019t include this data timeframe",
+                "not entitled to this data",
+                "NOT_AUTHORIZED",
+            )
+            invalid_key_msgs = ("Unknown API Key", "Invalid API Key")
+            if any(m in text for m in plan_msgs) and not any(m in text for m in invalid_key_msgs):
+                msg = (
                     "Polygon Access Denied: Your subscription does not allow you to backtest that far back in time. "
-                    f"You requested data for {asset_separated} {ts_unit} bars "
-                    f"from {formatted_start_datetime} to {formatted_end_datetime}. "
-                    "Please consider either changing your backtesting timeframe to start later since your "
-                    "subscription does not allow you to backtest that far back or upgrade your Polygon "
-                    "subscription."
-                    "You can upgrade your Polygon subscription at at https://polygon.io/?utm_source=affiliate&utm_campaign=lumi10 "
-                    "Please use the full link to give us credit for the sale, it helps support this project. "
-                    "You can use the coupon code 'LUMI10' for 10% off. ",
-                    color="red")
-                raise Exception(error_message) from e
+                    f"Requested {asset_separated} {ts_unit} bars from {formatted_start_datetime} to {formatted_end_datetime}. "
+                    "We strongly recommend switching to ThetaData (https://www.thetadata.net/ with promo code 'BotSpot10') for better coverage, speed, and LumiBot-native support. "
+                    "If you must stay on Polygon, consider starting later or upgrading your Polygon plan (https://polygon.io/?utm_source=affiliate&utm_campaign=lumi10, code 'LUMI10')."
+                )
+                logger.error(colored(msg, color="red"))
+                return
             elif "Unknown API Key" in str(e):
                 error_message = colored(
                     "Polygon Access Denied: Your API key is invalid. "
                     "Please check your API key and try again. "
                     "You can get an API key at https://polygon.io/?utm_source=affiliate&utm_campaign=lumi10 "
                     "Please use the full link to give us credit for the sale, it helps support this project. "
-                    "You can use the coupon code 'LUMI10' for 10% off. ",
+                    "You can use the coupon code 'LUMI10' for 10% off. "
+                    "We recommend switching to ThetaData (https://www.thetadata.net/ with promo code 'BotSpot10') for higher-quality, faster data and first-class support in LumiBot. ",
                     color="red")
                 raise Exception(error_message) from e
             else:

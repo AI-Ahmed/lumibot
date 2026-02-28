@@ -2,15 +2,43 @@ import os
 import sys
 import warnings
 import importlib
+import re
+from pathlib import Path
 
 from lumibot.tools.lumibot_logger import get_logger
 
 logger = get_logger(__name__)
 
+
+def _read_version_from_setup_py() -> str | None:
+    """Best-effort: when running from a source checkout via PYTHONPATH, prefer setup.py's version.
+
+    This avoids the common confusion where importlib.metadata returns the *installed* wheel
+    version (e.g. 4.4.16) while the runtime is actually importing source (e.g. 4.4.18).
+    """
+
+    try:
+        module_path = Path(__file__).resolve()
+        for parent in module_path.parents:
+            setup_py = parent / "setup.py"
+            if not setup_py.is_file():
+                continue
+            text = setup_py.read_text(encoding="utf-8", errors="ignore")
+            match = re.search(r"version\s*=\s*['\"]([^'\"]+)['\"]", text)
+            if match:
+                return match.group(1).strip()
+    except Exception:
+        pass
+    return None
+
+
 # Get and display the version
 try:
-    from importlib.metadata import version
-    __version__ = version("lumibot")
+    __version__ = _read_version_from_setup_py()
+    if __version__ is None:
+        from importlib.metadata import version
+
+        __version__ = version("lumibot")
 except ImportError:
     # Fallback for Python < 3.8
     try:
@@ -33,23 +61,18 @@ if (major, minor) < (3, 10):
 from loguru import logger as log
 
 # SOURCE PATH
-# Import constants from constants module
+# Import constants from constants module (before importing submodules to avoid circular imports)
 from .constants import (
-    LUMIBOT_SOURCE_PATH,
-    LUMIBOT_DEFAULT_TIMEZONE,
+    LUMIBOT_CACHE_FOLDER,
     LUMIBOT_DEFAULT_PYTZ,
     LUMIBOT_DEFAULT_QUOTE_ASSET_SYMBOL,
     LUMIBOT_DEFAULT_QUOTE_ASSET_TYPE,
-    LUMIBOT_CACHE_FOLDER
+    LUMIBOT_DEFAULT_TIMEZONE,
+    LUMIBOT_SOURCE_PATH,
 )
 
-# Import main submodules
-from . import strategies
-from . import brokers
-from . import backtesting
-from . import entities
-from . import data_sources
-from . import traders
+# Import main submodules (after constants to avoid circular imports)
+from . import backtesting, brokers, data_sources, entities, strategies, traders
 
 # Ensure cache folder exists
 if not os.path.exists(LUMIBOT_CACHE_FOLDER):

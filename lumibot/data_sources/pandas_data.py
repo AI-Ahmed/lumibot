@@ -1,11 +1,13 @@
-from collections import defaultdict, OrderedDict
+from collections import OrderedDict, defaultdict
 from datetime import timedelta
 from decimal import Decimal
 from typing import Union
 
 import pandas as pd
+
 from lumibot.data_sources import DataSourceBacktesting
 from lumibot.entities import Asset, Bars, Quote
+from lumibot.tools.helpers import parse_timestep_qty_and_unit
 from lumibot.tools.lumibot_logger import get_logger
 
 logger = get_logger(__name__)
@@ -23,8 +25,9 @@ class PandasData(DataSourceBacktesting):
         {"timestep": "minute", "representations": ["1M", "minute"]},
     ]
 
-    def __init__(self, *args, pandas_data=None, auto_adjust=True, **kwargs):
+    def __init__(self, *args, pandas_data=None, auto_adjust=True, allow_option_quote_fallback: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
+        self.option_quote_fallback_allowed = allow_option_quote_fallback
         self.name = "pandas"
         self.pandas_data = self._set_pandas_data_keys(pandas_data)
         self.auto_adjust = auto_adjust
@@ -32,6 +35,9 @@ class PandasData(DataSourceBacktesting):
         self._date_index = None
         self._date_supply = None
         self._timestep = "minute"
+        # PERF: `find_asset_in_data_store()` is called in tight loops (quotes + history). Cache the
+        # resolved key for repeated `(asset, quote, timestep)` lookups within a backtest run.
+        self._find_asset_in_data_store_cache = {}
 
     @staticmethod
     def _set_pandas_data_keys(pandas_data):
@@ -69,6 +75,8 @@ class PandasData(DataSourceBacktesting):
     def load_data(self):
         self._data_store = self.pandas_data
         self._date_index = self.update_date_index()
+        # Invalidate lookup cache whenever we reload/replace the underlying data store.
+        self._find_asset_in_data_store_cache.clear()
 
         if len(self._data_store.values()) > 0:
             self._timestep = list(self._data_store.values())[0].timestep
@@ -80,16 +88,19 @@ class PandasData(DataSourceBacktesting):
         return pcal
 
     def clean_trading_times(self, dt_index, pcal):
-        """
-        Fill in blanks in the data on trading days within market trading hours.
+        """Fill gaps within trading days using the supplied market calendar.
 
-        Parameters:
-        dt_index (DatetimeIndex): The original datetime index.
-        pcal (DataFrame): A calendar DataFrame containing "market_open" and "market_close" columns,
-                            indexed by dates.
+        Parameters
+        ----------
+        dt_index : pandas.DatetimeIndex
+            Original datetime index.
+        pcal : pandas.DataFrame
+            Calendar with ``market_open`` and ``market_close`` columns indexed by date.
 
-        Returns:
-        DatetimeIndex: The cleaned index with one-minute frequency within the market hours.
+        Returns
+        -------
+        pandas.DatetimeIndex
+            Cleaned index with one-minute frequency during market hours.
         """
         # Ensure the datetime index is in datetime format and drop duplicate timestamps
         dt_index = pd.to_datetime(dt_index).drop_duplicates()
@@ -98,8 +109,8 @@ class PandasData(DataSourceBacktesting):
         df = pd.DataFrame(range(len(dt_index)), index=dt_index)
         df = df.sort_index()
 
-        # Create a column for the date portion only
-        df["dates"] = df.index.date
+        # Create a column for the date portion only (normalize to date, keeping as datetime64 type)
+        df["dates"] = df.index.normalize()
 
         # Merge with the trading calendar on the 'dates' column to get market open/close times.
         # Use a left join to keep all rows from the original index.
@@ -122,6 +133,12 @@ class PandasData(DataSourceBacktesting):
         else:
             result_index = df.index
 
+        # Backtests should never iterate beyond the requested end bound. Keep any pre-start buffer
+        # (needed for lookbacks), but drop dates strictly after `datetime_end` so daily pandas
+        # backtests stop at the correct last trading day (see tests/test_momentum.py).
+        if self.datetime_end is not None:
+            result_index = result_index[result_index <= self.datetime_end]
+
         return result_index
 
     def get_trading_days_pandas(self):
@@ -140,7 +157,8 @@ class PandasData(DataSourceBacktesting):
 
         else:
             pcal.columns = ["datetime"]
-            pcal["date"] = pcal["datetime"].dt.date
+            # Normalize to date but keep as datetime64 type (not date objects)
+            pcal["date"] = pcal["datetime"].dt.normalize()
             result = pcal.groupby("date").agg(
                 market_open=(
                     "datetime",
@@ -218,6 +236,17 @@ class PandasData(DataSourceBacktesting):
         # Takes an asset and returns the last known price
         tuple_to_find = self.find_asset_in_data_store(asset, quote)
 
+        # If the asset is not yet cached, try a quick fetch using the current timestep
+        # so daily-cadence strategies do not trigger minute downloads by default.
+        if tuple_to_find not in self._data_store:
+            try:
+                target_ts = self._timestep or self.MIN_TIMESTEP
+                # Fetch a single bar to seed the cache
+                self.get_historical_prices(asset, length=1, timestep=target_ts, quote=quote, exchange=exchange)
+            except Exception:
+                pass
+            tuple_to_find = self.find_asset_in_data_store(asset, quote)
+
         if tuple_to_find in self._data_store:
             data = self._data_store[tuple_to_find]
             try:
@@ -231,6 +260,23 @@ class PandasData(DataSourceBacktesting):
                         logger.warning(f"Index asset `{asset.symbol}` returned NaN price. This could be due to missing data for the index or a subscription issue if using Polygon.io. Note that some index data (like SPX) requires a paid subscription. Consider using Yahoo Finance for broader index data coverage.")
                     else:
                         logger.info(f"Error getting last price for {tuple_to_find}: price is NaN")
+                    return None
+
+                if price is None:
+                    return None
+
+                # Treat non-positive prices as missing data.
+                try:
+                    numeric_price = float(price)
+                except (TypeError, ValueError):
+                    numeric_price = None
+
+                if numeric_price is not None and numeric_price <= 0:
+                    logger.warning(
+                        "Ignoring non-positive price %.4f for %s; treating as missing data.",
+                        numeric_price,
+                        tuple_to_find,
+                    )
                     return None
 
                 return price
@@ -277,6 +323,16 @@ class PandasData(DataSourceBacktesting):
                 logger.info(f"Error getting ohlcv_bid_ask for {tuple_to_find}: ohlcv_bid_ask_dict is NaN")
                 return Quote(asset=asset)
 
+            for side_key in ("bid", "ask"):
+                value = ohlcv_bid_ask_dict.get(side_key)
+                if value is not None:
+                    try:
+                        numeric_value = float(value)
+                    except (TypeError, ValueError):
+                        numeric_value = value
+                    if isinstance(numeric_value, (int, float)) and numeric_value <= 0:
+                        ohlcv_bid_ask_dict[side_key] = None
+
             # Convert dictionary to Quote object
             return Quote(
                 asset=asset,
@@ -285,6 +341,8 @@ class PandasData(DataSourceBacktesting):
                 ask=ohlcv_bid_ask_dict.get('ask'),
                 volume=ohlcv_bid_ask_dict.get('volume'),
                 timestamp=dt,
+                bid_size=ohlcv_bid_ask_dict.get('bid_size'),
+                ask_size=ohlcv_bid_ask_dict.get('ask_size'),
                 raw_data=ohlcv_bid_ask_dict
             )
         else:
@@ -296,17 +354,96 @@ class PandasData(DataSourceBacktesting):
             result[asset] = self.get_last_price(asset, quote=quote, exchange=exchange)
         return result
 
-    def find_asset_in_data_store(self, asset, quote=None):
-        if asset in self._data_store:
-            return asset
-        elif quote is not None:
-            asset = (asset, quote)
-            if asset in self._data_store:
-                return asset
-        elif isinstance(asset, Asset) and asset.asset_type in ["option", "future", "stock", "index"]:
-            asset = (asset, Asset("USD", "forex"))
-            if asset in self._data_store:
-                return asset
+    def find_asset_in_data_store(self, asset, quote=None, timestep=None):
+        # PERF: Avoid rebuilding candidate lists and repeatedly probing `_data_store` when the same
+        # `(asset, quote, timestep)` is requested every iteration (common in backtests).
+        #
+        # IMPORTANT: Do not treat a cached `None` as authoritative.
+        #
+        # Some backtesting data sources (notably ThetaDataBacktestingPandas) *mutate* `_data_store`
+        # during the run by fetching/warming new datasets on-demand. If we cache "misses" (None),
+        # a lookup performed *before* the dataset is fetched will poison all future lookups for that
+        # `(asset, quote, timestep)` and make the freshly loaded data unreachable.
+        try:
+            cache_key = (asset, quote, timestep)
+            cached = self._find_asset_in_data_store_cache.get(cache_key)
+            if cached is not None:
+                return cached
+        except Exception:
+            cache_key = None
+
+        requested_unit = None
+        normalized_key = None
+        if timestep is not None:
+            try:
+                qty, requested_unit = parse_timestep_qty_and_unit(str(timestep))
+            except Exception:
+                qty, requested_unit = 1, str(timestep)
+                requested_unit = str(timestep)
+            requested_unit = (requested_unit or "").strip().lower()
+            if requested_unit in {"m", "min", "mins"}:
+                requested_unit = "minute"
+            elif requested_unit in {"minutes"}:
+                requested_unit = "minute"
+            elif requested_unit in {"h", "hr", "hrs", "hour", "hours"}:
+                requested_unit = "hour"
+            elif requested_unit in {"d", "day", "days"}:
+                requested_unit = "day"
+
+            # Normalize timestep key so "15min" can match cached datasets stored as "15minute".
+            try:
+                qty = int(qty)
+            except Exception:
+                qty = 1
+            if requested_unit and requested_unit in {"minute", "hour", "day"}:
+                normalized_key = requested_unit if qty == 1 else f"{qty}{requested_unit}"
+            else:
+                normalized_key = str(timestep)
+
+        def _accepts_timestep(data_obj) -> bool:
+            if requested_unit is None:
+                return True
+            data_ts = str(getattr(data_obj, "timestep", "") or "").strip().lower()
+            if requested_unit == "minute":
+                return data_ts == "minute"
+            if requested_unit == "hour":
+                # Hour requests can be satisfied by either hour data or minute data (resample).
+                return data_ts in {"hour", "minute"}
+            if requested_unit == "day":
+                # Day requests can be satisfied by either day data or minute data (resample).
+                return data_ts in {"day", "minute"}
+            # Fallback: require exact match for other timesteps.
+            return data_ts == requested_unit
+
+        candidates = []
+
+        if timestep is not None:
+            base_quote = quote if quote is not None else Asset("USD", "forex")
+            candidates.append((asset, base_quote, timestep))
+            if normalized_key is not None and str(normalized_key) != str(timestep):
+                candidates.append((asset, base_quote, normalized_key))
+            if quote is not None:
+                candidates.append((asset, Asset("USD", "forex"), timestep))
+                if normalized_key is not None and str(normalized_key) != str(timestep):
+                    candidates.append((asset, Asset("USD", "forex"), normalized_key))
+
+        if quote is not None:
+            candidates.append((asset, quote))
+
+        if isinstance(asset, Asset) and asset.asset_type in ["option", "future", "cont_future", "stock", "index"]:
+            candidates.append((asset, Asset("USD", "forex")))
+
+        candidates.append(asset)
+
+        for key in candidates:
+            if key in self._data_store:
+                data_obj = self._data_store.get(key)
+                if data_obj is None:
+                    continue
+                if _accepts_timestep(data_obj):
+                    if cache_key is not None:
+                        self._find_asset_in_data_store_cache[cache_key] = key
+                    return key
         return None
 
     def _pull_source_symbol_bars(
@@ -328,7 +465,7 @@ class PandasData(DataSourceBacktesting):
         if not timeshift:
             timeshift = 0
 
-        asset_to_find = self.find_asset_in_data_store(asset, quote)
+        asset_to_find = self.find_asset_in_data_store(asset, quote, timestep)
 
         if asset_to_find in self._data_store:
             data = self._data_store[asset_to_find]
@@ -362,7 +499,7 @@ class PandasData(DataSourceBacktesting):
     ):
         """Pull all bars for an asset"""
         timestep = timestep if timestep else self.MIN_TIMESTEP
-        asset_to_find = self.find_asset_in_data_store(asset, quote)
+        asset_to_find = self.find_asset_in_data_store(asset, quote, timestep)
 
         if asset_to_find in self._data_store:
             data = self._data_store[asset_to_find]
@@ -408,20 +545,24 @@ class PandasData(DataSourceBacktesting):
 
         return result
 
-    def _parse_source_symbol_bars(self, response, asset, quote=None, length=None):
-        """parse broker response for a single asset"""
+    def _parse_source_symbol_bars(self, response, asset, quote=None, length=None, return_polars: bool = False):
+        """parse broker response for a single asset
+
+        CRITICAL: return_polars defaults to False for backwards compatibility.
+        PandasData always returns pandas-backed Bars for consistency.
+        """
         asset1 = asset
         asset2 = quote
         if isinstance(asset, tuple):
             asset1, asset2 = asset
-        bars = Bars(response, self.SOURCE, asset1, quote=asset2, raw=response)
+        bars = Bars(response, self.SOURCE, asset1, quote=asset2, raw=response, return_polars=return_polars)
         return bars
 
     def get_yesterday_dividend(self, asset, quote=None):
-        pass
+        return super().get_yesterday_dividend(asset, quote=quote)
 
     def get_yesterday_dividends(self, assets, quote=None):
-        pass
+        return super().get_yesterday_dividends(assets, quote=quote)
 
     # =======Options methods.=================
     def get_chains(self, asset: Asset, quote: Asset = None, exchange: str = None):
@@ -443,14 +584,10 @@ class PandasData(DataSourceBacktesting):
 
         Returns
         -------
-        dictionary of dictionary
-            Format:
-            - `Multiplier` (str) eg: `100`
-            - 'Chains' - paired Expiration/Strke info to guarentee that the stikes are valid for the specific
-                         expiration date.
-                         Format:
-                           chains['Chains']['CALL'][exp_date] = [strike1, strike2, ...]
-                         Expiration Date Format: 2023-07-31
+        dict
+            Mapping with keys such as ``Multiplier`` (e.g. ``"100"``) and ``Chains``.
+            ``Chains`` is a nested dictionary where expiration dates map to strike lists,
+            e.g. ``chains['Chains']['CALL']['2023-07-31'] = [strike1, strike2, ...]``.
         """
         chains = dict(
             Multiplier=100,
@@ -509,7 +646,7 @@ class PandasData(DataSourceBacktesting):
         return start_datetime, ts_unit
 
     def get_historical_prices(
-        self, 
+        self,
         asset: Asset,
         length: int,
         timestep: str = None,
@@ -517,6 +654,9 @@ class PandasData(DataSourceBacktesting):
         quote: Asset = None,
         exchange: str = None,
         include_after_hours: bool = True,
+        # Accept `return_polars` for API compatibility with other data sources.
+        # PandasData always returns pandas-backed Bars, so this flag is ignored.
+        return_polars: bool = False,
     ):
         """Get bars for a given asset"""
         if isinstance(asset, str):
@@ -538,5 +678,5 @@ class PandasData(DataSourceBacktesting):
         elif response is None:
             return None
 
-        bars = self._parse_source_symbol_bars(response, asset, quote=quote, length=length)
+        bars = self._parse_source_symbol_bars(response, asset, quote=quote, length=length, return_polars=return_polars)
         return bars

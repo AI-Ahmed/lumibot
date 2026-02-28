@@ -193,23 +193,28 @@ class ProjectXStreaming:
         """Handle user hub connection error"""
         self.logger.error(f"User hub error: {data}")
     
-    def _handle_account_update(self, data):
-        """Handle account update event"""
+    def _handle_account_update(self, *args):
+        """Handle account update event - SignalR might pass multiple args"""
+        data = args[0] if args else None
         if self.on_account_update:
             self.on_account_update(data)
     
-    def _handle_order_update(self, data):
-        """Handle order update event"""
+    def _handle_order_update(self, *args):
+        """Handle order update event - SignalR might pass multiple args"""
+        # SignalR can pass data as multiple arguments
+        data = args[0] if args else None
         if self.on_order_update:
             self.on_order_update(data)
     
-    def _handle_position_update(self, data):
-        """Handle position update event"""
+    def _handle_position_update(self, *args):
+        """Handle position update event - SignalR might pass multiple args"""
+        data = args[0] if args else None
         if self.on_position_update:
             self.on_position_update(data)
     
-    def _handle_trade_update(self, data):
-        """Handle trade update event"""
+    def _handle_trade_update(self, *args):
+        """Handle trade update event - SignalR might pass multiple args"""
+        data = args[0] if args else None
         if self.on_trade_update:
             self.on_trade_update(data)
     
@@ -388,46 +393,136 @@ class ProjectX:
             self.logger.error(f"Request error: {e}")
             return {"success": False, "error": str(e)}
     
+    def trade_search(self, account_id: int, start_timestamp: str, end_timestamp: str = None) -> dict:
+        """Search for trades in an account - trades are ground truth for fills"""
+        url = f"{self.base_url}api/trade/search"
+        
+        payload = {
+            "accountId": account_id,
+            "startTimestamp": start_timestamp,
+        }
+        if end_timestamp:
+            payload["endTimestamp"] = end_timestamp
+        
+        try:
+            # Light rate limiting
+            import time
+            time.sleep(0.05)  # 50ms delay between requests
+            
+            self.logger.debug(f"API Request: POST {url}")
+            self.logger.debug(f"Request Data: {payload}")
+            
+            response = requests.post(url, headers=self.headers, json=payload, timeout=10)
+            
+            self.logger.debug(f"Response Status: {response.status_code}")
+            
+            if response.status_code == 200:
+                result = response.json()
+                # Don't log huge trade lists in detail 
+                trade_count = len(result.get("trades", [])) if result.get("success") else 0
+                self.logger.debug(f"Retrieved {trade_count} trades")
+                return result
+            elif response.status_code == 429:
+                self.logger.warning(f"Rate limited, retrying in 1 second...")
+                time.sleep(1)  # Wait 1 second for rate limit
+                return {"success": False, "error": "Rate limited"}
+            else:
+                self.logger.error(f"API request failed: {response.status_code} {response.reason}")
+                return {"success": False, "error": f"HTTP {response.status_code}"}
+                
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Request error: {e}")
+            return {"success": False, "error": str(e)}
+    
     def order_place(self, account_id: int, contract_id: str, type: int, side: int, size: int,
                    limit_price: float = None, stop_price: float = None, trail_price: float = None,
                    custom_tag: str = None, linked_order_id: int = None) -> dict:
         """Place an order for a contract"""
         url = f"{self.base_url}api/order/place"
         
-        payload = {
+        # --- Sanitize & normalize inputs ---
+        try:
+            size_int = int(size)
+        except (TypeError, ValueError):
+            self.logger.warning(f"⚠️ Invalid size '{size}' - defaulting to 1")
+            size_int = 1
+
+        # Remove None values to avoid API model binding issues
+        def _clean(d: dict) -> dict:
+            return {k: v for k, v in d.items() if v is not None}
+
+        base_payload = _clean({
             "accountId": account_id,
             "contractId": contract_id,
             "type": type,
             "side": side,
-            "size": size,
+            "size": size_int,
             "limitPrice": limit_price,
             "stopPrice": stop_price,
             "trailPrice": trail_price,
             "customTag": custom_tag,
             "linkedOrderId": linked_order_id,
-        }
-        
+        })
+
+        # Log the outgoing request (compact)
+        self.logger.debug(f"ProjectX.order_place payload: {base_payload}")
+
+        def _post(json_payload):
+            return requests.post(url, headers=self.headers, json=json_payload, timeout=10)
+
         try:
-            response = requests.post(url, headers=self.headers, json=payload)
-            return response.json()
+            response = _post(base_payload)
+            try:
+                data = response.json()
+            except ValueError:
+                data = {"success": False, "error": f"Non-JSON response {response.status_code}"}
+
+            # Fast path success
+            if response.status_code == 200 and data.get("success"):
+                return data
+
+            # Detect validation pattern requiring wrapper {"request": {...}}
+            errors = (data or {}).get("errors") or {}
+            needs_wrapper = False
+            if isinstance(errors, dict):
+                if "request" in errors or any("The request field is required" in err for err_list in errors.values() for err in (err_list if isinstance(err_list, list) else [err_list])):
+                    needs_wrapper = True
+            # Also if size conversion failed, we retry after forcing int already and potentially wrapping
+            size_error = any("$.size" in err for err_list in errors.values() for err in (err_list if isinstance(err_list, list) else [err_list])) if errors else False
+            
+            if needs_wrapper or size_error:
+                wrapped_payload = {"request": base_payload}
+                self.logger.info("Retrying order_place with wrapped 'request' payload structure")
+                retry_resp = _post(wrapped_payload)
+                try:
+                    retry_data = retry_resp.json()
+                except ValueError:
+                    retry_data = {"success": False, "error": f"Non-JSON response {retry_resp.status_code}"}
+                if retry_resp.status_code == 200 and retry_data.get("success"):
+                    return retry_data
+                # Merge error context
+                return {"success": False, "error": retry_data.get("error") or retry_data, "first_attempt": data}
+
+            # If no specific wrapper need detected just return original data
+            return data if data else {"success": False, "error": f"HTTP {response.status_code}"}
+
         except requests.exceptions.RequestException as e:
-            self.logger.error(f"Error: {e}")
+            self.logger.error(f"Error placing order: {e}")
             return {"success": False, "error": str(e)}
     
     def order_cancel(self, account_id: int, order_id: int) -> dict:
         """Cancel an order"""
         url = f"{self.base_url}api/order/cancel"
-        
-        payload = {
-            "accountId": account_id,
-            "orderId": order_id,
-        }
-        
+        payload = {"accountId": account_id, "orderId": order_id}
         try:
-            response = requests.post(url, headers=self.headers, json=payload)
-            return response.json()
+            response = requests.post(url, headers=self.headers, json=payload, timeout=10)
+            try:
+                data = response.json()
+            except ValueError:
+                data = {"success": False, "error": f"Non-JSON response {response.status_code}"}
+            return data
         except requests.exceptions.RequestException as e:
-            self.logger.error(f"Error: {e}")
+            self.logger.error(f"Error cancelling order: {e}")
             return {"success": False, "error": str(e)}
     
     def contract_search(self, search_text: str, live: bool = False) -> dict:
@@ -481,26 +576,20 @@ class ProjectX:
             self.logger.error(f"Error getting contract details: {e}")
             return {"success": False, "error": str(e)}
     
-    def history_retrieve_bars(self, contract_id: str, start_datetime: str, end_datetime: str,
+    def history_retrieve_bars(self, contract_id: str, start_datetime: str | datetime, end_datetime: str | datetime,
                              unit: int, unit_number: int, limit: int = 1000,
                              include_partial_bar: bool = True, live: bool = False,
                              is_est: bool = True) -> pd.DataFrame:
         """Retrieve historical bars for a contract"""
         url = f"{self.base_url}api/history/retrievebars"
-        
-        # Convert timezone if needed
+
+        # Convert timezone if needed (handle both str and datetime inputs)
         if is_est:
-            est = pytz.timezone("America/New_York")
-            start_datetime = (
-                est.localize(datetime.fromisoformat(start_datetime[:-1]))
-                .astimezone(pytz.utc)
-                .isoformat()
-            )
-            end_datetime = (
-                est.localize(datetime.fromisoformat(end_datetime[:-1]))
-                .astimezone(pytz.utc)
-                .isoformat()
-            )
+            start_datetime = _to_utc_iso(start_datetime, is_est=True)
+            end_datetime = _to_utc_iso(end_datetime, is_est=True)
+        else:
+            start_datetime = _to_utc_iso(start_datetime, is_est=False)
+            end_datetime = _to_utc_iso(end_datetime, is_est=False)
         
         payload = {
             "contractId": contract_id,
@@ -535,34 +624,28 @@ class ProjectX:
                 (df["t"] >= pd.to_datetime(start_datetime))
                 & (df["t"] <= pd.to_datetime(end_datetime))
             ]
-            
-            # Add date and time columns
-            df["date"] = df["t"].dt.date
-            df["time"] = df["t"].dt.time
-            
+
             # Map ProjectX column names to standard OHLCV format
             column_mapping = {
                 'o': 'open',
                 'h': 'high', 
                 'l': 'low',
                 'c': 'close',
-                'v': 'volume'
+                'v': 'volume',
+                't': 'datetime',
             }
             
             # Rename columns to standard format
             df.rename(columns=column_mapping, inplace=True)
             
             # Reorder columns to standard format
-            standard_columns = ["date", "time", "open", "high", "low", "close", "volume"]
+            standard_columns = ["datetime", "open", "high", "low", "close", "volume"]
             available_columns = [col for col in standard_columns if col in df.columns]
             extra_columns = [col for col in df.columns if col not in standard_columns]
             df = df[available_columns + extra_columns]
-            
-            # Drop timestamp column
-            df.drop(columns=["t"], inplace=True)
-            
+
             # Sort and reset index
-            df.sort_values(by=["date", "time"], inplace=True)
+            df.sort_values(by=["datetime"], inplace=True)
             df.reset_index(drop=True, inplace=True)
             
             return df
@@ -628,28 +711,36 @@ class ProjectXClient:
             raise Exception(f"Failed to retrieve accounts: {response}")
     
     def get_preferred_account_id(self) -> int:
-        """Get preferred account ID"""
+        """Get preferred account ID - use configured preferred account or highest balance"""
         accounts = self.get_accounts()
         
-        # Filter for practice accounts
-        practice_accounts = [
-            account for account in accounts
-            if account.get("name", "").lower().startswith(("prac", "tof-px"))
-        ]
+        if not accounts:
+            raise Exception("No accounts found")
         
-        if not practice_accounts:
-            raise Exception("No practice accounts found")
+        self.logger.debug(f"Found {len(accounts)} accounts: {[acc.get('name', 'Unknown') for acc in accounts]}")
         
-        # Use preferred account if specified
+        # First priority: Use specifically configured preferred account name
         preferred_name = self.config.get("preferred_account_name")
         if preferred_name:
-            for account in practice_accounts:
+            self.logger.info(f"Looking for preferred account: {preferred_name}")
+            for account in accounts:
                 if account.get('name') == preferred_name:
-                    return account.get('id')
+                    account_id = account.get('id')
+                    account_balance = account.get('balance', 0)
+                    self.logger.info(f"✅ Using preferred account: {preferred_name} (ID: {account_id}, Balance: ${account_balance:,.2f})")
+                    return account_id
+            
+            # If preferred account not found, log warning but continue
+            self.logger.warning(f"⚠️ Preferred account '{preferred_name}' not found, using highest balance account")
         
-        # Fallback to highest balance account
-        selected_account = max(practice_accounts, key=lambda x: x.get('balance', 0))
-        return selected_account.get('id')
+        # Fallback: Select account with highest balance
+        selected_account = max(accounts, key=lambda x: x.get('balance', 0))
+        account_id = selected_account.get('id')
+        account_name = selected_account.get('name', 'Unknown')
+        account_balance = selected_account.get('balance', 0)
+        
+        self.logger.info(f"✅ Selected highest balance account: {account_name} (ID: {account_id}, Balance: ${account_balance:,.2f})")
+        return account_id
     
     def get_account_balance(self, account_id: int) -> Dict:
         """Get account balance and details"""
@@ -771,7 +862,7 @@ class ProjectXClient:
         
         return df
     
-    def history_retrieve_bars(self, contract_id: str, start_datetime: str, end_datetime: str,
+    def history_retrieve_bars(self, contract_id: str, start_datetime: str | datetime, end_datetime: str | datetime,
                              unit: int, unit_number: int, limit: int = 1000,
                              include_partial_bar: bool = True, live: bool = False,
                              is_est: bool = True) -> pd.DataFrame:
@@ -869,7 +960,32 @@ class ProjectXClient:
             
             symbol_upper = symbol.upper()
             self.logger.info(f"🔍 Searching for contract: {symbol} -> {symbol_upper}")
-            
+
+            # Search using the contract search API
+            self.logger.info(f"🔍 Searching via API for: {symbol}")
+            try:
+                contracts = self.search_contracts(symbol)
+                if contracts:
+                    self.logger.info(f"📋 Found {len(contracts)} contracts via search")
+
+                    # Find the most recent/active contract (usually sorted by expiry)
+                    active_contracts = [c for c in contracts if c.get('active', True)]
+                    to_search = active_contracts if active_contracts else contracts
+                    # If the 'name' field exists, try to match symbol
+                    to_search = [c for c in to_search if c.get('name', '').startswith(symbol_upper)] or to_search
+
+                    # Try different possible field names for contract ID
+                    contract_id = (to_search[0].get('contractId') or
+                                   to_search[0].get('id') or
+                                   to_search[0].get('symbol') or '')
+                    self.logger.info(f"✅ Using active contract: {contract_id}")
+                    return contract_id
+
+                else:
+                    self.logger.warning(f"⚠️ No contracts found via API search, falling back to search Asset logic")
+            except Exception as search_e:
+                self.logger.error(f"❌ API search failed: {search_e}, falling back to search Asset logic")
+
             # Use Asset class logic for continuous futures resolution
             try:
                 # Create continuous futures asset
@@ -905,56 +1021,7 @@ class ProjectXClient:
                     return contract_id
                 
             except Exception as asset_error:
-                self.logger.warning(f"⚠️ Asset class method failed: {asset_error}, falling back to API search")
-            
-            # Fallback: Use hardcoded mapping for immediate compatibility
-            common_futures_fallback = {
-                'MES': 'CON.F.US.MES.U25',
-                'ES': 'CON.F.US.ES.U25',    
-                'NQ': 'CON.F.US.NQ.U25',    
-                'YM': 'CON.F.US.YM.U25',    
-                'RTY': 'CON.F.US.RTY.U25',  
-            }
-            
-            if symbol_upper in common_futures_fallback:
-                contract_id = common_futures_fallback[symbol_upper]
-                self.logger.debug(f"📋 Using fallback mapping: {contract_id}")
-                self._contract_cache[contract_id] = {"id": contract_id, "symbol": symbol_upper}
-                return contract_id
-            
-            # Search using the contract search API
-            self.logger.info(f"🔍 Searching via API for: {symbol}")
-            try:
-                contracts = self.search_contracts(symbol)
-                if contracts:
-                    self.logger.info(f"📋 Found {len(contracts)} contracts via search")
-                    
-                    # Find the most recent/active contract (usually sorted by expiry)  
-                    active_contracts = [c for c in contracts if c.get('active', True)]
-                    if active_contracts:
-                        # Try different possible field names for contract ID
-                        contract_id = (active_contracts[0].get('contractId') or 
-                                     active_contracts[0].get('id') or 
-                                     active_contracts[0].get('symbol') or '')
-                        self.logger.info(f"✅ Using active contract: {contract_id}")
-                        return contract_id
-                    elif contracts:
-                        # Try different possible field names for contract ID
-                        contract_id = (contracts[0].get('contractId') or 
-                                     contracts[0].get('id') or 
-                                     contracts[0].get('symbol') or '')
-                        self.logger.info(f"✅ Using first contract: {contract_id}")
-                        return contract_id
-                else:
-                    self.logger.warning(f"⚠️ No contracts found via API search")
-            except Exception as search_e:
-                self.logger.error(f"❌ API search failed: {search_e}")
-            
-            # If all else fails, return the hardcoded mapping anyway (might work for orders)
-            if symbol_upper in common_futures:
-                fallback_contract = common_futures[symbol_upper]
-                self.logger.info(f"🔄 Fallback to hardcoded mapping: {fallback_contract}")
-                return fallback_contract
+                self.logger.warning(f"⚠️ Asset class method failed: {asset_error}")
             
             self.logger.error(f"❌ No contract found for symbol: {symbol}")
             return ''
@@ -996,6 +1063,302 @@ class ProjectXClient:
         return round(price / tick_size) * tick_size
     
     def order_cancel(self, account_id: int, order_id: int) -> dict:
-        """Cancel an order"""
-        response = self.api.order_cancel(account_id, order_id)
-        return response and response.get("success", False) 
+        """Cancel an order via high-level client; always return dict."""
+        try:
+            response = self.api.order_cancel(account_id, order_id)
+            # Underlying api.order_cancel returns dict (or False); normalize
+            if isinstance(response, dict):
+                return response
+            return {"success": bool(response)}
+        except Exception as e:
+            self.logger.error(f"Error in order_cancel wrapper: {e}")
+            return {"success": False, "error": str(e)}
+
+
+def _to_utc_iso(dt_or_str, is_est: bool = True) -> str:
+    """
+    Normalize input (datetime or ISO string) to a UTC ISO formatted string.
+    - If input is a string it accepts ISO formats with or without trailing 'Z'.
+    - If input is a naive datetime and is_est is True, localize to America/New_York.
+      If is_est is False and naive, assume UTC.
+    - If input is timezone-aware, convert to UTC.
+    Returns ISO string with +00:00 timezone.
+    """
+    if isinstance(dt_or_str, datetime):
+        dt = dt_or_str
+    elif isinstance(dt_or_str, str):
+        s = dt_or_str
+        if s.endswith('Z'):
+            s = s[:-1]
+        # fromisoformat handles YYYY-MM-DDTHH:MM:SS[.ffffff][+HH:MM]
+        dt = datetime.fromisoformat(s)
+    else:
+        raise TypeError("start/end datetime must be a str or datetime")
+
+    if is_est:
+        est = pytz.timezone("America/New_York")
+        # If naive, localize to EST; if aware, convert to EST first (keeps DST correctness)
+        if dt.tzinfo is None:
+            dt = est.localize(dt)
+        else:
+            dt = dt.astimezone(est)
+        dt_utc = dt.astimezone(pytz.utc)
+    else:
+        # Assume UTC for naive datetimes when is_est is False
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=pytz.utc)
+        dt_utc = dt.astimezone(pytz.utc)
+
+    return dt_utc.isoformat()
+
+
+# ================= Bracket Helpers Overview =================
+# The bracket-related helpers below encapsulate pure or minimally stateful logic
+# originally embedded in the ProjectX broker. Goals:
+#   - Reduce branching/noise inside broker methods
+#   - Make race handling (early meta store / restoration) explicit
+#   - Centralize naming/tagging conventions for bracket parent & children
+#   - Enable future unit tests without broker wiring
+# Helper Groups:
+#   Creation/meta: create_bracket_meta, early_store_bracket_meta, restore_bracket_meta_if_needed
+#   Tagging: normalize_bracket_entry_tag, derive_base_tag, bracket_child_tag, build_unique_order_tag
+#   Pricing: select_effective_prices
+#   Spawn flow: should_spawn_bracket_children, build_bracket_child_spec
+# All helpers are defensive (swallow exceptions) to preserve original broker robustness.
+# ===========================================================
+# Core metadata factory
+def create_bracket_meta(tp_price, sl_price):
+    """Return the synthetic bracket metadata dict (pure function).
+
+    Shape identical to inline version used in ProjectX broker so spawning/restoration logic stays unchanged.
+    """
+    return {
+        'tp_price': tp_price,
+        'sl_price': sl_price,
+        'children': {},
+        'active': True,
+        'base_tag': None,
+    }
+
+
+def normalize_bracket_entry_tag(tag: str):
+    """Normalize tag to BRK_ENTRY_<base>; return (normalized_tag, base_tag).
+
+    If tag already has one of the bracket prefixes it is rewritten to entry form.
+    Pure; no logging.
+    """
+    if not tag:
+        return tag, None
+    base = tag
+    for prefix in ("BRK_ENTRY_", "BRK_TP_", "BRK_STOP_"):
+        if base.startswith(prefix):
+            base = base[len(prefix):]
+            break
+    return f"BRK_ENTRY_{base}", base
+
+# ================= Additional Low-Risk Helpers =================
+def build_unique_order_tag(order):
+    """Generate (or normalize) a unique order tag.
+
+    Mirrors existing inline logic in ProjectX broker: if tag absent or blank create
+    STRAT-<millis><rand2>. Keeps existing tag if non-empty. Returns tag string.
+    Pure with respect to broker state (only uses order + time/random).
+    """
+    try:
+        import time, random
+        if not getattr(order, 'tag', None):
+            strat_part = ''
+            try:
+                if hasattr(order, 'strategy') and order.strategy:
+                    strat_name = order.strategy if isinstance(order.strategy, str) else getattr(order.strategy, 'name', '')
+                    strat_part = (strat_name or 'LB')[:8].upper()
+            except Exception:
+                strat_part = 'LB'
+            unique_suffix = f"{int(time.time()*1000)%100000000:08d}{random.randint(10,99)}"
+            order.tag = f"{strat_part}-{unique_suffix}"
+        else:
+            if not str(order.tag).strip():
+                order.tag = f"LB-{int(time.time()*1000)}"
+    except Exception:
+        # Silent; caller already logs on failure in original logic
+        pass
+    return order.tag
+
+
+def select_effective_prices(order, client, tick_size):
+    """Return (limit_price, stop_price) applying secondary_* precedence.
+
+    Logic copied from inline broker section (non-bracket path):
+    - Warn if deprecated take_profit_price / stop_loss_price present & not None.
+    - secondary_limit_price supersedes order.limit_price (rounded)
+    - secondary_stop_price supersedes order.stop_price (rounded)
+    """
+    limit_price = None
+    stop_price = None
+
+    # Deprecated warnings handled here so caller stays compact
+    if hasattr(order, 'take_profit_price') and getattr(order, 'take_profit_price') is not None:
+        try:
+            # Expect caller's logger warning; if unavailable, ignore
+            if hasattr(order, 'strategy') and hasattr(order.strategy, 'logger'):
+                order.strategy.logger.warning("Order has deprecated attribute 'take_profit_price'. Set 'secondary_limit_price' instead.")
+        except Exception:
+            pass
+    if hasattr(order, 'stop_loss_price') and getattr(order, 'stop_loss_price') is not None:
+        try:
+            if hasattr(order, 'strategy') and hasattr(order.strategy, 'logger'):
+                order.strategy.logger.warning("Order has deprecated attribute 'stop_loss_price'. Set 'secondary_stop_price' instead.")
+        except Exception:
+            pass
+
+    # Limit price precedence
+    if hasattr(order, 'secondary_limit_price') and getattr(order, 'secondary_limit_price') is not None:
+        try:
+            limit_price = client.round_to_tick_size(getattr(order, 'secondary_limit_price'), tick_size)
+        except Exception:
+            if getattr(order, 'limit_price', None) is not None:
+                try:
+                    limit_price = client.round_to_tick_size(order.limit_price, tick_size)
+                except Exception:
+                    pass
+    elif getattr(order, 'limit_price', None) is not None:
+        try:
+            limit_price = client.round_to_tick_size(order.limit_price, tick_size)
+        except Exception:
+            pass
+
+    # Stop price precedence
+    if hasattr(order, 'secondary_stop_price') and getattr(order, 'secondary_stop_price') is not None:
+        try:
+            stop_price = client.round_to_tick_size(getattr(order, 'secondary_stop_price'), tick_size)
+        except Exception:
+            if getattr(order, 'stop_price', None) is not None:
+                try:
+                    stop_price = client.round_to_tick_size(order.stop_price, tick_size)
+                except Exception:
+                    pass
+    elif getattr(order, 'stop_price', None) is not None:
+        try:
+            stop_price = client.round_to_tick_size(order.stop_price, tick_size)
+        except Exception:
+            pass
+
+    return limit_price, stop_price
+
+
+def bracket_child_tag(kind: str, base_tag: str) -> str:
+    """Return standardized child tag for bracket order.
+
+    kind: 'tp' or 'sl'. Mirrors existing naming scheme.
+    """
+    if kind == 'tp':
+        return f"BRK_TP_{base_tag}"
+    if kind == 'sl':
+        return f"BRK_STOP_{base_tag}"
+    raise ValueError(f"Unsupported bracket child kind: {kind}")
+
+
+def derive_base_tag(tag: str) -> str:
+    """Derive the base tag (without BRK_*_ prefix). Safe if tag empty.
+
+    Used when restoring meta or spawning children if base_tag missing.
+    """
+    if not tag:
+        return tag
+    base = tag
+    for prefix in ("BRK_ENTRY_", "BRK_TP_", "BRK_STOP_"):
+        if base.startswith(prefix):
+            base = base[len(prefix):]
+            break
+    return base
+
+
+def early_store_bracket_meta(store: dict, temp_key: str, meta: dict, logger=None):
+    """Early store bracket meta under a provisional key if not already present.
+
+    Mirrors inline try/except logic; silent on failure except optional debug logging.
+    """
+    try:
+        if store is None:
+            return
+        if temp_key not in store:
+            store[temp_key] = dict(meta)
+            if logger:
+                logger.debug(f"[BRACKET META EARLY] stored temp_key={temp_key} tp={meta.get('tp_price')} sl={meta.get('sl_price')}")
+    except Exception:
+        pass
+
+
+def restore_bracket_meta_if_needed(order, cache, meta_map, logger=None):
+    """Ensure order._synthetic_bracket is attached if present in cache or meta_map.
+
+    Returns True if restoration / attachment happened, else False.
+    """
+    restored = False
+    try:
+        if hasattr(order, '_synthetic_bracket'):
+            return False
+        broker_id = getattr(order, 'id', None)
+        # Check cached order first
+        if cache and broker_id in cache:
+            cached = cache.get(broker_id)
+            if cached and hasattr(cached, '_synthetic_bracket'):
+                order._synthetic_bracket = dict(getattr(cached, '_synthetic_bracket'))
+                restored = True
+        # Fallback to meta_map
+        if not restored and meta_map and broker_id in meta_map:
+            meta = meta_map.get(broker_id)
+            if meta:
+                order._synthetic_bracket = dict(meta)
+                restored = True
+        if restored and logger:
+            logger.debug(f"[BRACKET META RESTORE] order_id={broker_id} restored={restored}")
+    except Exception:
+        pass
+    return restored
+
+
+def should_spawn_bracket_children(meta: dict, parent) -> tuple:
+    """Determine if bracket children should be spawned.
+
+    Returns (eligible: bool, reason: str). Mutates meta for the 'no tp/sl' case to mirror current logic.
+    This contains only decision logic; side effects like logging remain in caller.
+    """
+    if meta is None:
+        return False, 'no_meta'
+    if meta.get('children') is None:
+        return False, 'children_missing'
+    if meta.get('children_submitted') or getattr(parent, '_bracket_children_submitted', False):
+        return False, 'already_submitted'
+    tp_price = meta.get('tp_price')
+    sl_price = meta.get('sl_price')
+    if tp_price is None and sl_price is None:
+        meta['children_submitted'] = True
+        meta['active'] = False
+        return False, 'no_tp_sl'
+    return True, 'ok'
+
+
+def build_bracket_child_spec(parent, kind: str, price: float, base_tag: str) -> dict:
+    """Return a pure spec dict for a bracket child before creating Order.
+
+    Fields: side, order_type, tag, price_key, price_value.
+    price_key is 'limit_price' for tp and 'stop_price' for sl.
+    """
+    side = 'sell' if parent.side.lower() == 'buy' else 'buy'
+    if kind == 'tp':
+        order_type = 'limit'
+        price_key = 'limit_price'
+    elif kind == 'sl':
+        order_type = 'stop'
+        price_key = 'stop_price'
+    else:
+        raise ValueError(f"Unknown bracket child kind: {kind}")
+    tag = bracket_child_tag(kind, base_tag)
+    return {
+        'side': side,
+        'order_type': order_type,
+        'tag': tag,
+        'price_key': price_key,
+        'price_value': price,
+    }

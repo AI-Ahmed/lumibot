@@ -1,19 +1,19 @@
 import os
+import time
+import traceback
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
-import traceback
-import time
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Union
-import pytz
 
 import pandas as pd
+import pytz
 
-from lumibot import LUMIBOT_DEFAULT_PYTZ, LUMIBOT_DEFAULT_TIMEZONE
-from lumibot.tools.lumibot_logger import get_logger
+from lumibot.constants import LUMIBOT_DEFAULT_PYTZ, LUMIBOT_DEFAULT_TIMEZONE
 from lumibot.entities import Asset, AssetsMapping, Bars, Quote
 from lumibot.tools import black_scholes, create_options_symbol
+from lumibot.tools.lumibot_logger import get_logger
 
 from .exceptions import UnavailabeTimestep
 
@@ -27,6 +27,7 @@ class DataSource(ABC):
     TIMESTEP_MAPPING = []
     DEFAULT_TIMEZONE = LUMIBOT_DEFAULT_TIMEZONE
     DEFAULT_PYTZ = LUMIBOT_DEFAULT_PYTZ
+    option_quote_fallback_allowed = False
 
     def __init__(
             self,
@@ -68,6 +69,34 @@ class DataSource(ABC):
             tzinfo = pytz.timezone(self.DEFAULT_TIMEZONE)
         self.tzinfo = tzinfo
 
+        # Initialize caches centrally (avoid ad-hoc hasattr checks in methods)
+        self._greeks_cache = {}
+
+        # Thread pool for parallel operations - reuse to avoid creation/destruction overhead
+        self._thread_pool = None
+        self._thread_pool_max_workers = kwargs.get('max_workers', 10)
+
+        # Dividend cache for backtest performance
+        self._dividend_cache = {}  # {asset: {date: dividend_value}}
+        self._dividend_cache_enabled = kwargs.get('cache_dividends', True)
+
+        # Ensure the instance has an explicit attribute for fallback behaviour
+        if not hasattr(self, "option_quote_fallback_allowed"):
+            self.option_quote_fallback_allowed = False
+
+    def _get_or_create_thread_pool(self):
+        """Get or create the thread pool for parallel operations"""
+        if self._thread_pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+            self._thread_pool = ThreadPoolExecutor(max_workers=self._thread_pool_max_workers)
+        return self._thread_pool
+
+    def shutdown(self):
+        """Cleanup thread pool resources"""
+        if self._thread_pool is not None:
+            self._thread_pool.shutdown(wait=True)
+            self._thread_pool = None
+
     # ========Required Implementations ======================
     @abstractmethod
     def get_chains(self, asset: Asset, quote: Asset = None) -> dict:
@@ -85,20 +114,16 @@ class DataSource(ABC):
 
         Returns
         -------
-        dictionary of dictionary
-            Format:
-            - `Multiplier` (str) eg: `100`
-            - 'Chains' - paired Expiration/Strike info to guarentee that the strikes are valid for the specific
-                         expiration date.
-                         Format:
-                           chains['Chains']['CALL'][exp_date] = [strike1, strike2, ...]
-                         Expiration Date Format: 2023-07-31
+        dict
+            Mapping with keys such as ``Multiplier`` (e.g. ``"100"``) and ``Chains``.
+            ``Chains`` is a nested dictionary where expiration dates map to strike lists,
+            e.g. ``chains['Chains']['CALL']['2023-07-31'] = [strike1, strike2, ...]``.
         """
         pass
 
     @abstractmethod
     def get_historical_prices(
-        self, asset, length, timestep="", timeshift=None, quote=None, exchange=None, include_after_hours=True
+        self, asset, length, timestep="", timeshift=None, quote=None, exchange=None, include_after_hours=True, **kwargs
     ) -> Bars:
         """
         Get bars for a given asset, going back in time from now, getting length number of bars by timestep.
@@ -128,11 +153,15 @@ class DataSource(ABC):
             The exchange to get the bars for.
         include_after_hours : bool
             Whether to include after hours data.
+        return_polars : bool (deprecated)
+            Deprecated. Do not use in strategy code. This keyword will be removed in a future release.
+            Strategy logic should use pandas operations on ``bars.pandas_df`` and should not depend on
+            the underlying DataFrame backend.
 
         Returns
         -------
         Bars
-            The bars for the asset.
+            The bars for the asset. For strategy code, prefer ``bars.pandas_df`` for a pandas DataFrame.
         """
         pass
 
@@ -274,6 +303,7 @@ class DataSource(ABC):
         # Define mapping from timestep units to equivalent minutes
         time_unit_map = {
             "minute": 1,
+            "min": 1,  # Common shorthand (e.g., "15min")
             "hour": 60,
             "day": 24 * 60,
             "m": 1,  # "M" is for minutes
@@ -305,7 +335,16 @@ class DataSource(ABC):
             quantity_in_minutes = quantity * time_unit_map[unit]
             # Convert minutes to timedelta
             delta = timedelta(minutes=quantity_in_minutes)
-            return delta, unit
+            canonical_unit = {
+                "m": "minute",
+                "min": "minute",
+                "minute": "minute",
+                "h": "hour",
+                "hour": "hour",
+                "d": "day",
+                "day": "day",
+            }.get(unit, unit)
+            return delta, canonical_unit
         else:
             raise ValueError(f"Unknown unit: {unit}. Valid units are minute, hour, day, M, H, D")
 
@@ -347,10 +386,15 @@ class DataSource(ABC):
         quote=None,
         exchange=None,
         include_after_hours=True,
+        sleep_time: float | None = None,
     ):
         """Get bars for the list of assets"""
         if not isinstance(assets, list):
             assets = [assets]
+
+        effective_sleep_time = sleep_time
+        if effective_sleep_time is None:
+            effective_sleep_time = 0.0 if getattr(self, "IS_BACKTESTING_DATA_SOURCE", False) else 0.1
 
         def process_chunk(chunk):
             chunk_result = {}
@@ -373,7 +417,8 @@ class DataSource(ABC):
                     )
 
                     # Sleep to prevent rate limiting
-                    time.sleep(0.1)
+                    if effective_sleep_time:
+                        time.sleep(effective_sleep_time)
                 except Exception as e:
                     # Log once per asset to avoid spamming with a huge traceback
                     logger.warning(f"Error retrieving data for {base_asset.symbol}: {e}")
@@ -389,10 +434,11 @@ class DataSource(ABC):
         chunks = [assets[i : i + chunk_size] for i in range(0, len(assets), chunk_size)]
 
         results = {}
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(process_chunk, chunk) for chunk in chunks]
-            for future in as_completed(futures):
-                results.update(future.result())
+        # Reuse thread pool to avoid creation/destruction overhead
+        executor = self._get_or_create_thread_pool()
+        futures = [executor.submit(process_chunk, chunk) for chunk in chunks]
+        for future in as_completed(futures):
+            results.update(future.result())
 
         return results
 
@@ -425,9 +471,90 @@ class DataSource(ABC):
         return bars.get_last_dividend()
 
     def get_yesterday_dividends(self, assets, quote=None):
-        """Return dividend per share for a list of
-        assets for the day before"""
+        """Return dividend per share for a list of assets for the day before.
+
+        For backtesting, this method caches all dividend data to avoid repeated API calls.
+        On the first call for an asset, it fetches ALL historical dividend data and caches it.
+        Subsequent calls use the cache.
+        """
         result = {}
+
+        # For backtesting with dividends, use an efficient caching strategy
+        if hasattr(self, '_datetime') and self._datetime:
+            current_date = self._datetime.date() if hasattr(self._datetime, 'date') else self._datetime
+
+            # Process each asset
+            for asset in assets:
+                # Check if we've already cached ALL dividends for this asset
+                if asset not in self._dividend_cache:
+                    # First time seeing this asset - fetch ALL its historical data and cache dividends
+                    # Get enough bars to cover the entire backtest period
+                    # Most backtests are < 1000 days; limit the fetch to what's needed for this backtest
+                    # to avoid slow API calls (especially Polygon) and keep CI fast.
+                    try:
+                        # Default to a conservative upper bound, but shrink for short backtests.
+                        length = 2000
+                        if (
+                            hasattr(self, "datetime_start")
+                            and hasattr(self, "datetime_end")
+                            and getattr(self, "datetime_start", None) is not None
+                            and getattr(self, "datetime_end", None) is not None
+                        ):
+                            try:
+                                span_days = (self.datetime_end.date() - self.datetime_start.date()).days + 1
+                                # Add a small cushion for weekends/holidays; ensure at least ~1 month.
+                                length = min(2000, max(span_days + 10, 30))
+                            except Exception:
+                                length = 2000
+
+                        bars = self.get_bars([asset], length, timestep="day", quote=quote).get(asset)
+
+                        # Extract all dividends from the bars and store by date
+                        asset_dividends = {}
+                        if bars is not None and hasattr(bars, 'df') and 'dividend' in bars.df.columns:
+                            # Store dividend for each date
+                            for idx, row in bars.df.iterrows():
+                                date = idx.date() if hasattr(idx, 'date') else idx
+                                dividend_val = row.get('dividend', 0)
+                                if dividend_val and dividend_val > 0:
+                                    asset_dividends[date] = dividend_val
+
+                        # Cache the dividend dict for this asset
+                        self._dividend_cache[asset] = asset_dividends
+                        if asset_dividends:
+                            logger.debug(
+                                "[DIVIDEND][CACHE] Cached %d entries for %s (%s -> %s)",
+                                len(asset_dividends),
+                                getattr(asset, "symbol", asset),
+                                min(asset_dividends.keys()),
+                                max(asset_dividends.keys()),
+                            )
+                        else:
+                            logger.debug(
+                                "[DIVIDEND][CACHE] No dividend entries available for %s",
+                                getattr(asset, "symbol", asset),
+                            )
+                    except Exception as e:
+                        # If fetching fails, cache empty dict to avoid repeated failures
+                        self._dividend_cache[asset] = {}
+
+                # Now look up the dividend for the current trading date. Daily bars already align
+                # dividends with the ex-date, so there's no need to subtract a day here.
+                asset_dividends = self._dividend_cache.get(asset, {})
+                dividend = asset_dividends.get(current_date, 0)
+                if dividend:
+                    logger.debug(
+                        "[DIVIDEND][APPLY] %s -> %s pays %.4f on %s",
+                        getattr(asset, "symbol", asset),
+                        getattr(self, "_name", "strategy"),
+                        dividend,
+                        current_date,
+                    )
+                result[asset] = dividend
+
+            return AssetsMapping(result)
+
+        # Fallback to normal flow for non-backtesting
         assets_bars = self.get_bars(assets, 1, timestep="day", quote=quote)
         for asset, bars in assets_bars.items():
             if bars is not None:
@@ -435,7 +562,7 @@ class DataSource(ABC):
 
         return AssetsMapping(result)
 
-    def get_chain_full_info(self, asset: Asset, expiry: str, chains=None, underlying_price=float, risk_free_rate=float,
+    def get_chain_full_info(self, asset: Asset, expiry: date | datetime, chains=None, underlying_price=float, risk_free_rate=float,
                             strike_min=None, strike_max=None) -> pd.DataFrame:
         """
         Get the full chain information for an option asset, including: greeks, bid/ask, open_interest, etc. For
@@ -446,7 +573,7 @@ class DataSource(ABC):
         ----------
         asset : Asset
             The option asset to get the chain information for.
-        expiry : str | datetime.datetime | datetime.date
+        expiry : datetime.date | datetime.datetime
             The expiry date of the option chain.
         chains : dict
             The chains dictionary created by `get_chains` method. This is used
@@ -471,7 +598,13 @@ class DataSource(ABC):
         start_t = time.perf_counter()
         # Base level DataSource assumes that the data source does not support this and the greeks will be calculated
         # locally. Subclasses can override this method to provide a more efficient implementation.
-        expiry_dt = datetime.strptime(expiry, "%Y-%m-%d") if isinstance(expiry, str) else expiry
+        if isinstance(expiry, datetime):
+            expiry_dt = expiry.date()
+        elif isinstance(expiry, date):
+            expiry_dt = expiry
+        else:
+            raise TypeError("expiry must be a datetime.date or datetime.datetime instance")
+
         expiry_str = expiry_dt.strftime("%Y-%m-%d")
         if chains is None:
             chains = self.get_chains(asset)
@@ -479,7 +612,10 @@ class DataSource(ABC):
         rows = []
         query_total = 0
         for right in chains["Chains"]:
-            for strike in chains["Chains"][right][expiry_str]:
+            expirations_map = chains["Chains"].get(right, {})
+            if expiry_str not in expirations_map:
+                raise KeyError(f"Expiry {expiry_str} not available for option type {right}")
+            for strike in expirations_map[expiry_str]:
                 # Skip strikes outside the requested range. Saves querying time.
                 if strike_min and strike < strike_min or strike_max and strike > strike_max:
                     continue
@@ -534,10 +670,38 @@ class DataSource(ABC):
         risk_free_rate: float,
     ):
         """Returns Greeks in backtesting."""
+        # Handle None values - don't cache or calculate if inputs are invalid
+        if asset_price is None or underlying_price is None or risk_free_rate is None:
+            return None
+
+        # Optimization: Cache Greeks calculations based on key parameters
+        # Round prices to 2 decimal places for cache key to handle minor price fluctuations
+        current_date = self.get_datetime()
+        cache_key = (
+            asset.symbol,
+            asset.strike,
+            asset.right,
+            asset.expiration,
+            round(asset_price, 2),
+            round(underlying_price, 2),
+            round(risk_free_rate, 4),
+            current_date.date() if hasattr(current_date, 'date') else current_date  # Cache per day to handle time decay
+        )
+
+        # Check cache
+        if cache_key in self._greeks_cache:
+            return self._greeks_cache[cache_key]
+
+        # Keep cache size limited to prevent memory issues
+        if len(self._greeks_cache) > 10000:
+            # Clear oldest half of cache
+            keys_to_remove = list(self._greeks_cache.keys())[:5000]
+            for key in keys_to_remove:
+                del self._greeks_cache[key]
+
         opt_price = asset_price
         und_price = underlying_price
         interest = risk_free_rate * 100
-        current_date = self.get_datetime()
 
         # If asset expiration is a datetime object, convert it to date
         expiration = asset.expiration
@@ -583,6 +747,9 @@ class DataSource(ABC):
             theta=c.callTheta if is_call else c.putTheta,
             underlying_price=und_price,
         )
+
+        # Cache the result
+        self._greeks_cache[cache_key] = greeks
 
         return greeks
 

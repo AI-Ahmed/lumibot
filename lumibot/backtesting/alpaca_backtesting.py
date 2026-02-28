@@ -27,17 +27,31 @@ from alpaca.data.timeframe import TimeFrame
 from lumibot.tools.lumibot_logger import get_logger
 from lumibot.data_sources import DataSourceBacktesting, AlpacaData
 from lumibot.entities import Asset, Bars, AssetsMapping
-from lumibot import (
-    LUMIBOT_CACHE_FOLDER,
-)
+from lumibot.constants import LUMIBOT_CACHE_FOLDER
 from lumibot.tools.helpers import (
     date_n_trading_days_from_date,
+    get_decimals,
+    get_timezone_from_datetime,
     get_trading_days,
     get_trading_times,
-    get_timezone_from_datetime,
-    get_decimals,
     quantize_to_num_decimals,
 )
+from lumibot.tools.lumibot_logger import get_logger
+
+try:
+    from tenacity import retry, stop_after_attempt, wait_exponential
+except ImportError:
+    # Fallback if tenacity is not installed
+    def retry(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    stop_after_attempt = wait_exponential = retry_if_exception_type = None
+
+try:
+    from fpap.data.utils.data_processing import data_prep
+except ImportError:
+    data_prep = None
 
 try:
     from tenacity import retry, stop_after_attempt, wait_exponential
@@ -916,7 +930,14 @@ class AlpacaBacktesting(DataSourceBacktesting):
         # as the last price). This approach works for daily and minute bars. For daily bars, this returns the open
         # price, even if now is 9:30 and the daily bar was indexed at 00:00. Thats the only weird thing. But it makes
         # sense. The open of the daily bar for stocks was not at 00:00. It was at 9:30 anyway.
-        price = bars.df.iloc[0].open
+        # Support both pandas and polars-backed Bars without exceptions
+        df_local = bars.df
+        if hasattr(df_local, "iloc"):
+            # pandas: scalar-fast path
+            price = df_local["open"].iat[0]
+        else:
+            # polars
+            price = df_local["open"][0]
         num_decimals = get_decimals(price)
         return quantize_to_num_decimals(price, num_decimals)
         
@@ -984,6 +1005,7 @@ class AlpacaBacktesting(DataSourceBacktesting):
             quote: Asset | None = None,
             exchange: str | None = None,
             include_after_hours: bool = True,
+            return_polars: bool = False,
             remove_incomplete_current_bar: Optional[bool] = None,
     ) -> Bars | None:
         """Get historical price bars for an asset.
@@ -1107,7 +1129,14 @@ class AlpacaBacktesting(DataSourceBacktesting):
         else:
             result_df = df.iloc[max(0, current_index - length + 1): current_index + 1]
 
-        return Bars(result_df, self.SOURCE, asset=asset, quote=quote)
+        return Bars(
+            result_df,
+            self.SOURCE,
+            asset=asset,
+            quote=quote,
+            return_polars=return_polars,
+            tzinfo=self.tzinfo,
+        )
 
     def get_chains(self, asset, quote=None):
         """Get option chains for an asset.

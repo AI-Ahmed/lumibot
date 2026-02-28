@@ -75,7 +75,7 @@ class Momentum(Strategy):
                 # Calculate the quantity and send the buy order for the new asset
                 self.asset = best_asset
                 best_asset_price = best_asset_data["price"]
-                self.quantity = int(self.portfolio_value // best_asset_price)
+                self.quantity = int(self.get_portfolio_value() // best_asset_price)
                 order = self.create_order(self.asset, self.quantity, "buy")
                 self.submit_order(order)
             else:
@@ -151,8 +151,8 @@ if __name__ == "__main__":
     is_live = False
 
     if is_live:
-        from lumibot.credentials import ALPACA_CONFIG
         from lumibot.brokers import Alpaca
+        from lumibot.credentials import ALPACA_CONFIG
 
         broker = Alpaca(ALPACA_CONFIG)
 
