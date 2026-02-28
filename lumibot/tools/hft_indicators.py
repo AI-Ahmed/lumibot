@@ -27,6 +27,47 @@ from .indicators import (
 )
 
 
+def _infer_entries_per_year(returns):
+    """
+    Infer the number of return observations per year from the return series index.
+
+    Handles intraday (sub-daily), daily, and irregular bar intervals by using
+    median time delta between observations. Falls back to len(returns)/span_years
+    when time diffs are too irregular.
+
+    Parameters
+    ----------
+    returns : pd.Series
+        Return series with a DatetimeIndex.
+
+    Returns
+    -------
+    float
+        Estimated entries per year (e.g., 252 for daily, ~252*390 for 1-min bars).
+    """
+    if returns is None or len(returns) < 2:
+        return 252.0
+    idx = returns.index
+    if not hasattr(idx, 'to_series'):
+        return 252.0
+    diffs = idx.to_series().diff().dropna()
+    if len(diffs) == 0:
+        return 252.0
+    # Use total_seconds for sub-daily; median for irregular bars
+    try:
+        median_sec = float(diffs.dt.total_seconds().median())
+    except (AttributeError, TypeError):
+        median_sec = float(diffs.median()) if hasattr(diffs.iloc[0], 'total_seconds') else 86400
+    seconds_per_year = 365.25 * 24 * 3600
+    if median_sec > 0 and median_sec < seconds_per_year:
+        return float(seconds_per_year / median_sec)
+    # Fallback: observations per year from span
+    delta = idx[-1] - idx[0]
+    span = delta.total_seconds() if hasattr(delta, 'total_seconds') else getattr(delta, 'days', 1) * 86400
+    span_years = max(span / seconds_per_year, 1e-9)
+    return len(returns) / span_years
+
+
 # =================== INSTITUTIONAL HFT SOLUTION ===================
 
 class DualTrackAnalyzer:
@@ -64,6 +105,8 @@ class DualTrackAnalyzer:
     def calculate_information_driven_metrics(self):
         """Calculate metrics preserving original bar structure with benchmark comparison."""
         returns = self.strategy_data['portfolio_value'].pct_change().fillna(0)
+        entries_per_year = _infer_entries_per_year(returns)
+        ann_factor = np.sqrt(entries_per_year)
         
         # Calculate information-driven benchmark metrics using original bar timing
         info_benchmark_data = self._get_information_driven_benchmark()
@@ -71,7 +114,8 @@ class DualTrackAnalyzer:
         self.info_metrics = {
             'total_bars': len(self.strategy_data),
             'average_bar_duration': self._calculate_avg_bar_duration(),
-            'information_sharpe': returns.mean() / returns.std() * np.sqrt(252) if returns.std() > 0 else 0,
+            'information_sharpe': returns.mean() / returns.std() * ann_factor if returns.std() > 0 else 0,
+            'entries_per_year': entries_per_year,
             'bar_type': self.bar_type,
             'microstructure_efficiency': self._calculate_microstructure_efficiency(),
             'information_density': len(self.strategy_data) / self._calculate_time_span_days(),
@@ -81,7 +125,7 @@ class DualTrackAnalyzer:
             'info_beta': self._calculate_beta(returns, info_benchmark_data['benchmark_returns']),
             'info_alpha': self._calculate_alpha(returns, info_benchmark_data['benchmark_returns']),
             'info_information_ratio': self._calculate_information_ratio(returns, info_benchmark_data['benchmark_returns']),
-            'info_tracking_error': (returns - info_benchmark_data['benchmark_returns']).std() * np.sqrt(252),
+            'info_tracking_error': (returns - info_benchmark_data['benchmark_returns']).std() * ann_factor,
         }
         
         logger.info(f"📊 Information-driven metrics calculated: Sharpe={self.info_metrics['information_sharpe']:.4f}")
@@ -93,12 +137,15 @@ class DualTrackAnalyzer:
         
         strategy_returns = aligned_data['strategy_returns']
         benchmark_returns = aligned_data['benchmark_returns']
+        entries_per_year = _infer_entries_per_year(strategy_returns)
+        ann_factor = np.sqrt(entries_per_year)
         
         self.aligned_metrics = {
             'aligned_sharpe': self._calculate_sharpe(strategy_returns),
+            'entries_per_year': entries_per_year,
             'beta': self._calculate_beta(strategy_returns, benchmark_returns),
             'alpha': self._calculate_alpha(strategy_returns, benchmark_returns),
-            'tracking_error': (strategy_returns - benchmark_returns).std() * np.sqrt(252),
+            'tracking_error': (strategy_returns - benchmark_returns).std() * ann_factor,
             'information_ratio': self._calculate_information_ratio(strategy_returns, benchmark_returns),
             'alignment_method': alignment_method,
         }
@@ -311,10 +358,11 @@ class DualTrackAnalyzer:
         return time_diffs.autocorr(lag=1) if not time_diffs.isna().all() else 0
     
     def _calculate_sharpe(self, returns):
-        """Calculate annualized Sharpe ratio."""
+        """Calculate annualized Sharpe ratio using inferred entries_per_year."""
         if returns.std() == 0:
             return 0
-        return returns.mean() / returns.std() * np.sqrt(252)
+        entries_per_year = _infer_entries_per_year(returns)
+        return returns.mean() / returns.std() * np.sqrt(entries_per_year)
     
     def _calculate_beta(self, strategy_returns, benchmark_returns):
         """Calculate beta coefficient with improved numerical stability."""
@@ -492,7 +540,11 @@ def create_institutional_hft_tearsheet(
     
     # =================== SECTION 6: CREATE SUPPLEMENTARY REPORTS ===================
     info_driven_file = tearsheet_file.replace('.html', '_information_structure.html')
-    create_information_structure_report(info_metrics, aligned_metrics, info_driven_file, bar_type, strat_name)
+    create_information_structure_report(
+        info_metrics, aligned_metrics, info_driven_file, bar_type, strat_name,
+        benchmark_name=str(benchmark_asset),
+        returns_df=df_final
+    )
     
     if show_tearsheet:
         url = "file://" + os.path.abspath(str(tearsheet_file))
@@ -849,6 +901,12 @@ def create_information_structure_report(
     else:
         alignment_display = alignment_display.replace('_', ' ').title()
     
+    # Annualize alpha for display (entries_per_year from analyzer; fallback 252)
+    epy_info = info_metrics.get('entries_per_year', 252)
+    epy_aligned = aligned_metrics.get('entries_per_year', 252)
+    info_alpha_ann = info_metrics.get('info_alpha', 0) * epy_info
+    aligned_alpha_ann = aligned_metrics.get('alpha', 0) * epy_aligned
+    
     # Build FPAP metrics section HTML
     fpap_section = _build_fpap_section_html(fpap_metrics) if fpap_metrics else ""
     
@@ -1101,10 +1159,10 @@ def create_information_structure_report(
                             <td class="highlight {'negative' if abs(info_metrics['info_beta'] - aligned_metrics['beta']) > 0.5 else ''}">{info_metrics['info_beta'] - aligned_metrics['beta']:+.4f}</td>
                         </tr>
                         <tr>
-                            <td><strong>Alpha vs {benchmark_name}</strong></td>
-                            <td>{info_metrics['info_alpha']:.6f}</td>
-                            <td>{aligned_metrics['alpha']:.6f}</td>
-                            <td class="highlight">{info_metrics['info_alpha'] - aligned_metrics['alpha']:+.6f}</td>
+                            <td><strong>Alpha (Ann.) vs {benchmark_name}</strong></td>
+                            <td>{info_alpha_ann:.6f}</td>
+                            <td>{aligned_alpha_ann:.6f}</td>
+                            <td class="highlight">{info_alpha_ann - aligned_alpha_ann:+.6f}</td>
                         </tr>
                         <tr>
                             <td><strong>Information Ratio</strong></td>
@@ -1130,7 +1188,8 @@ def create_information_structure_report(
             <div class="footer">
                 🏛️ Generated by Institutional HFT Analysis Framework<br>
                 Professional-grade performance evaluation powered by FPAP statistical methods<br>
-                <small>Reference: López de Prado, M. (2018). Advances in Financial Machine Learning. Wiley.</small>
+                <small>Reference: López de Prado, M. (2018). Advances in Financial Machine Learning. Wiley.</small><br>
+                <small>(!) All metrics use simple (percentage) returns. FPAP accepts both; we use simple for consistency.</small>
             </div>
         </div>
     </body>
@@ -1191,63 +1250,65 @@ def _calculate_fpap_metrics(returns_df):
         # Calculate moments for PSR/DSR
         m1, m2, m3, m4 = compute_moments(returns)
         
-        # Estimate frequency (entries per year)
-        if hasattr(returns.index, 'to_series'):
-            freq_mode = returns.index.to_series().diff().dropna().mode()
-            if len(freq_mode) > 0 and hasattr(freq_mode.iloc[0], 'days'):
-                days_per_obs = max(freq_mode.iloc[0].days, 1/1440)  # At least 1 minute
-                entries_per_year = 252 / days_per_obs if days_per_obs > 0 else 252
-            else:
-                entries_per_year = 252  # Default to daily
-        else:
-            entries_per_year = 252
+        # Infer entries per year (handles intraday, daily, irregular bars)
+        entries_per_year = _infer_entries_per_year(returns)
         
-        # Calculate Sharpe Ratio
+        # Calculate Sharpe Ratio (annualized)
         sr = fpap_sharpe(returns, int(entries_per_year), 0.0)
+        sr_period = sr / np.sqrt(entries_per_year)
         
-        # HHI Concentration
-        hhi_pos, hhi_neg, hhi_time = get_all_bets_concentration(returns, frequency='ME')
+        # HHI Concentration (use 'D' for HFT intraday; 'ME' understates time concentration)
+        hhi_pos, hhi_neg, hhi_time = get_all_bets_concentration(returns, frequency='D')
         
-        # Drawdown and Time Under Water
+        # Drawdown and Time Under Water (tuw_period_freq='D' for HFT)
         cumulative_returns = (1 + returns).cumprod()
-        dd, tuw = drawdown_n_time_under_water(cumulative_returns)
+        dd, tuw = drawdown_n_time_under_water(cumulative_returns, tuw_period_freq='D')
         dd_95 = np.quantile(dd, 0.95) if len(dd) > 0 else 0
         tuw_95 = np.quantile(tuw, 0.95) if len(tuw) > 0 else 0
         
-        # Probabilistic Sharpe Ratio (vs SR=0 benchmark)
+        # Probabilistic Sharpe Ratio: pass annualized SR (PSR formula expects it)
         psr_stat, psr = compute_psr(
-            sr_estimates=sr / np.sqrt(entries_per_year),
+            sr_estimates=sr,
             skew=m3,
             kurtosis=m4,
             sample_length=len(returns),
             sr_ref=0.0
         )
         
-        # Deflated Sharpe Ratio (assuming 100 trials)
+        # Deflated Sharpe Ratio: backtest_var must be variance of SR estimate V[SR̂], not return variance
+        # Per López de Prado: V[SR̂_per] = (1/(T-1)) * (1 - skew*sr_per + (kurtosis-1)/4 * sr_per^2)
+        # FPAP divides backtest_var by freq, so pass var_sr_period * freq
+        sample_length = len(returns)
+        var_sr_period = (1 / max(sample_length - 1, 1)) * (
+            1 - m3 * sr_period + (m4 - 1) / 4 * sr_period ** 2
+        )
+        backtest_var = var_sr_period * entries_per_year
         N_trials = 100
-        backtest_var = m2 ** 2
         em_sr, dsr = compute_dsr(
             sr_estimates=sr,
             backtest_var=backtest_var,
-            sample_length=len(returns),
+            sample_length=sample_length,
             N_trials=N_trials,
             skewness_of_returns=m3,
             kurtosis_of_returns=m4,
             freq=entries_per_year
         )
         
-        # Minimum Track Record Length (years needed for 90% confidence)
-        min_trl = MinTRL(
-            sr_estimates=sr / np.sqrt(entries_per_year),
+        # MinTRL expects per-period SR; returns number of observations (convert to years for display)
+        min_trl_obs = MinTRL(
+            sr_estimates=sr_period,
             skew=m3,
             kurtosis=m4,
             benchmark_sr=0.0,
             confidence_lv=0.90
         )
+        min_trl_years = min_trl_obs / entries_per_year if entries_per_year > 0 else float('inf')
         
         # Current track record in years
         if len(returns) > 1:
-            track_record_years = (returns.index[-1] - returns.index[0]).days / 365.25
+            delta = returns.index[-1] - returns.index[0]
+            span_sec = delta.total_seconds() if hasattr(delta, 'total_seconds') else getattr(delta, 'days', 0) * 86400
+            track_record_years = span_sec / (365.25 * 24 * 3600)
         else:
             track_record_years = 0
         
@@ -1266,7 +1327,7 @@ def _calculate_fpap_metrics(returns_df):
             'psr': psr,
             'dsr': dsr,
             'expected_max_sr': em_sr,
-            'min_trl': min_trl,
+            'min_trl': min_trl_years,
             'track_record_years': track_record_years,
             'sample_size': len(returns),
             'entries_per_year': entries_per_year,
@@ -1327,6 +1388,9 @@ def _build_fpap_section_html(fpap_metrics):
                 <div class="section-title">
                     <span class="emoji">📈</span>Production-Grade Statistical Analysis (FPAP)
                 </div>
+                <div class="reference-note" style="margin-bottom: 15px;">
+                    PSR, DSR, MinTRL follow López de Prado (2018) AFML; parameters verified against FPAP docstrings.
+                </div>
                 
                 <div class="metric-grid">
                     <div class="metric-card {psr_class}">
@@ -1366,7 +1430,7 @@ def _build_fpap_section_html(fpap_metrics):
                     
                     <div class="metric-card">
                         <div class="metric-label">95th Percentile Time Under Water</div>
-                        <div class="metric-value">{fpap_metrics.get('tuw_95', 0):.1f} months</div>
+                        <div class="metric-value">{fpap_metrics.get('tuw_95', 0):.1f} days</div>
                         <div class="metric-description">
                             Maximum expected recovery time at 95% confidence level
                         </div>
@@ -1443,6 +1507,10 @@ def create_tearsheet(
     strategy_parameters: dict = None,
     resample_rule: str = "D",  # Add resample_rule parameter with default "D" for daily
     bar_type: str = "volume",  # Explicit bar type: 'volume', 'dollar', 'imbalance', 'runs', 'time', or 'auto'
+    lumibot_version: str | None = None,
+    backtesting_data_source: str | None = None,
+    backtesting_data_sources: str | None = None,
+    backtest_time_seconds: float | None = None,
 ):
     """
     ENHANCED TEARSHEET WITH INSTITUTIONAL HFT SUPPORT
@@ -1563,6 +1631,10 @@ def create_tearsheet(
                 download_filename=tearsheet_file,
                 rf=risk_free_rate,
                 parameters=strategy_parameters,
+                lumibot_version=lumibot_version,
+                backtesting_data_source=backtesting_data_source,
+                backtesting_data_sources=backtesting_data_sources,
+                backtest_time_seconds=backtest_time_seconds,
             )
         
         # Post-process tearsheet for responsive parameters
@@ -1574,12 +1646,28 @@ def create_tearsheet(
         # Generate supplementary HFT analysis report
         info_driven_file = tearsheet_file.replace('.html', '_information_structure.html')
         
+        # Canonical returns: strategy returns at strategy bar timestamps only (unify with DualTrackAnalyzer)
+        # Normalize timezone: df_final.index is tz-naive; intersection with tz-aware returns empty
+        _strategy_idx = _strategy_df.index
+        if _strategy_idx.tz is not None:
+            _strategy_idx = _strategy_idx.tz_localize(None)
+        strategy_bars_idx = df_final.index.intersection(_strategy_idx)
+        canonical_returns_df = df_final.loc[strategy_bars_idx, ['strategy', 'benchmark']].copy()
+        if canonical_returns_df.empty and not df_final.empty:
+            logger.warning(
+                "Strategy bar intersection yielded no rows; using full df_final for FPAP metrics. "
+                "Check index alignment between strategy and merged dataframe."
+            )
+            canonical_returns_df = df_final[["strategy", "benchmark"]].copy()
+        
         # Calculate dual-track metrics for supplementary report
         info_metrics = analyzer.calculate_information_driven_metrics()
         aligned_metrics = analyzer.calculate_time_aligned_metrics('benchmark_aligned')
         create_information_structure_report(
-            info_metrics, aligned_metrics, info_driven_file, 
-            detected_bar_type, strat_name, str(benchmark_asset), df_final
+            info_metrics, aligned_metrics, info_driven_file,
+            detected_bar_type, strat_name,
+            benchmark_name=str(benchmark_asset),
+            returns_df=canonical_returns_df
         )
 
         if show_tearsheet:
@@ -1612,6 +1700,10 @@ def create_tearsheet(
         risk_free_rate=risk_free_rate,
         strategy_parameters=strategy_parameters,
         resample_rule=resample_rule,
+        lumibot_version=lumibot_version,
+        backtesting_data_source=backtesting_data_source,
+        backtesting_data_sources=backtesting_data_sources,
+        backtest_time_seconds=backtest_time_seconds,
     )
 
 
@@ -1682,7 +1774,8 @@ def calculate_hft_specific_metrics(strategy_data, bar_type):
         avg_bar_duration_minutes = (time_span / total_bars / 60) if total_bars > 0 else 0
         
         # HFT-specific calculations
-        hft_sharpe = returns.mean() / returns.std() * np.sqrt(252) if returns.std() > 0 else 0
+        entries_per_year = _infer_entries_per_year(returns)
+        hft_sharpe = returns.mean() / returns.std() * np.sqrt(entries_per_year) if returns.std() > 0 else 0
         
         # Bar efficiency calculation
         timestamps = strategy_data.index
@@ -1730,9 +1823,11 @@ def calculate_benchmark_comparison_metrics(aligned_data):
     try:
         strategy_returns = aligned_data['strategy_returns']
         benchmark_returns = aligned_data['benchmark_returns']
+        entries_per_year = _infer_entries_per_year(strategy_returns)
+        ann_factor = np.sqrt(entries_per_year)
         
         # Sharpe ratio
-        aligned_sharpe = strategy_returns.mean() / strategy_returns.std() * np.sqrt(252) if strategy_returns.std() > 0 else 0
+        aligned_sharpe = strategy_returns.mean() / strategy_returns.std() * ann_factor if strategy_returns.std() > 0 else 0
         
         # Beta calculation
         covariance = np.cov(strategy_returns, benchmark_returns)[0][1] if len(strategy_returns) > 1 else 0
@@ -1752,7 +1847,7 @@ def calculate_benchmark_comparison_metrics(aligned_data):
             'beta': beta,
             'alpha': alpha,
             'information_ratio_vs_benchmark': information_ratio_vs_benchmark,
-            'tracking_error': tracking_error * np.sqrt(252),
+            'tracking_error': tracking_error * ann_factor,
         }
         
         logger.info(f"⚖️ Benchmark metrics calculated: Sharpe={aligned_sharpe:.4f}, Beta={beta:.4f}")
@@ -2596,7 +2691,8 @@ def calculate_info_sharpe(returns):
     """Calculate information Sharpe ratio."""
     if returns.std() == 0:
         return 0
-    return returns.mean() / returns.std() * np.sqrt(252)
+    entries_per_year = _infer_entries_per_year(returns)
+    return returns.mean() / returns.std() * np.sqrt(entries_per_year)
 
 
 def calculate_microstructure_alpha(returns):
