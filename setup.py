@@ -162,6 +162,8 @@ extras_require = {
     "ta": ta_extras,
     "private": private_extras,  # Will include FPAP if GIT_TOKEN is available
     "all": ta_extras + private_extras,  # All packages (public + private)
+    # Optional dependencies to enable ThetaData support
+    "thetadata": ["thetadata"],
 }
 
 theta_jar_path = PROJECT_ROOT / "lumibot" / "resources" / "ThetaTerminal.jar"
@@ -187,12 +189,6 @@ setuptools.setup(
         "lumibot": [
             "resources/conf.yaml",
         ] + (["resources/ThetaTerminal.jar"] if theta_jar_path.exists() else []),
-    },
-    extras_require={
-        # Optional dependencies to enable ThetaData support
-        "thetadata": [
-            "thetadata",
-        ],
     },
     classifiers=[
         "Programming Language :: Python :: 3",
