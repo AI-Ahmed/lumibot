@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lumibot"
-version = "3.18.8"
+version = "3.19.0"
 description = "Backtesting and Trading Library, Made by Lumiwealth."
 requires-python = ">=3.10"
 # Fields defined dynamically in setup.py
