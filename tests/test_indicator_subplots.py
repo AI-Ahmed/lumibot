@@ -433,6 +433,7 @@ def test_plot_indicators_handles_nan_marker_size(tmp_path, monkeypatch):
     )
 
     # Avoid opening the browser or writing actual files
+    monkeypatch.setenv("LUMIBOT_WRITE_INDICATORS_HTML", "1")
     mock_write = MagicMock()
     monkeypatch.setattr("plotly.graph_objects.Figure.write_html", mock_write)
 
@@ -732,6 +733,7 @@ def test_plot_indicators_scales_vertical_spacing_for_many_rows(tmp_path, monkeyp
         return real_make_subplots(*args, **kwargs)
 
     monkeypatch.setattr("lumibot.tools.indicators.make_subplots", _spy_make_subplots)
+    monkeypatch.setenv("LUMIBOT_WRITE_INDICATORS_HTML", "1")
     mock_write = MagicMock()
     monkeypatch.setattr("plotly.graph_objects.Figure.write_html", mock_write)
 
@@ -752,6 +754,7 @@ def test_plot_indicators_scales_vertical_spacing_for_many_rows(tmp_path, monkeyp
 
 
 def test_plot_indicators_skips_html_when_env_disabled(tmp_path, monkeypatch):
+    """Indicators HTML is disabled by default (redundant with trades plot); set LUMIBOT_WRITE_INDICATORS_HTML=1 to enable."""
     chart_lines_df = pd.DataFrame(
         {
             "datetime": [pd.Timestamp("2024-01-01 09:30")],
@@ -763,7 +766,7 @@ def test_plot_indicators_skips_html_when_env_disabled(tmp_path, monkeypatch):
         }
     )
 
-    monkeypatch.setenv("LUMIBOT_WRITE_INDICATORS_HTML", "false")
+    monkeypatch.delenv("LUMIBOT_WRITE_INDICATORS_HTML", raising=False)
     mock_write = MagicMock()
     monkeypatch.setattr("plotly.graph_objects.Figure.write_html", mock_write)
 
@@ -781,6 +784,7 @@ def test_plot_indicators_skips_html_when_env_disabled(tmp_path, monkeypatch):
 
 
 def test_plot_indicators_exports_artifacts_when_html_write_fails(tmp_path, monkeypatch):
+    """Even when HTML write fails, CSV/parquet are still emitted."""
     chart_lines_df = pd.DataFrame(
         {
             "datetime": [pd.Timestamp("2024-01-01 09:30")],
@@ -792,6 +796,7 @@ def test_plot_indicators_exports_artifacts_when_html_write_fails(tmp_path, monke
         }
     )
 
+    monkeypatch.setenv("LUMIBOT_WRITE_INDICATORS_HTML", "1")
     def _raise_write_html(*args, **kwargs):
         raise RuntimeError("simulated html failure")
 

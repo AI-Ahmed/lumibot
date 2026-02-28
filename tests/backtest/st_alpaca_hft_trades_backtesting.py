@@ -150,11 +150,39 @@ class TradesDataStrategy(Strategy):
             self.logger.info("This data source does not support fetching trades data")
             return
         
-        # Process each symbol independently for correct per-symbol indicators
-        for symbol in self.symbols:
-            self._process_symbol_iteration(symbol, start_dt, current_dt)
+        # Configure chunk size from sleeptime (AlpacaBacktesting)
+        if hasattr(self.broker.data_source, "configure_from_sleeptime") and hasattr(self, "_sleeptime"):
+            self.broker.data_source.configure_from_sleeptime(self._sleeptime)
+
+        # Batch fetch trades for all symbols (parallel download when supported)
+        trades_df = self.broker.data_source.get_historical_trades_between_dates(
+            base_asset=self.symbols,
+            data_datetime_start=start_dt,
+            data_datetime_end=current_dt,
+        )
+        if trades_df is None or trades_df.empty:
+            self.logger.debug("No trades data from batch fetch")
+            return
+        # Dispatch to per-symbol processing (batch returns MultiIndex)
+        if isinstance(trades_df.index, pd.MultiIndex) and trades_df.index.nlevels >= 1:
+            symbols_in_data = trades_df.index.get_level_values(0).unique().tolist()
+            for symbol in symbols_in_data:
+                try:
+                    sym_trades = trades_df.xs(symbol, level=0)
+                except KeyError:
+                    continue
+                if sym_trades.empty:
+                    continue
+                processed = self.process_trades_data(sym_trades)
+                self._process_symbol_iteration(symbol, start_dt, current_dt, trades_df=processed)
+        else:
+            # Single-symbol result (fallback)
+            processed = self.process_trades_data(trades_df) if not trades_df.empty else None
+            if processed is not None and not processed.empty:
+                sym = self.symbols[0]
+                self._process_symbol_iteration(sym, start_dt, current_dt, trades_df=processed)
     
-    def _process_symbol_iteration(self, symbol, start_dt, current_dt):
+    def _process_symbol_iteration(self, symbol, start_dt, current_dt, trades_df=None):
         """Process a single symbol's trading iteration.
         
         Parameters
@@ -165,13 +193,15 @@ class TradesDataStrategy(Strategy):
             Start datetime for trades lookup
         current_dt : datetime
             Current datetime (end of trades lookup)
+        trades_df : pandas.DataFrame, optional
+            Pre-fetched processed trades for this symbol. If None, fetches via get_historical_trades.
         """
-        # Get historical trades for THIS symbol only
-        trades_df = self.get_historical_trades(
-            asset=symbol,  # Single symbol, not list
-            data_datetime_start=start_dt,
-            data_datetime_end=current_dt
-        )
+        if trades_df is None:
+            trades_df = self.get_historical_trades(
+                asset=symbol,
+                data_datetime_start=start_dt,
+                data_datetime_end=current_dt,
+            )
         
         # Skip if no trades data available
         if trades_df is None or trades_df.empty:
@@ -554,8 +584,12 @@ class TradesDataStrategy(Strategy):
             self.logger.debug(f"Skipping trading decision for {symbol}: VWAP is None or volume bar is empty")
             return
         
-        # Get the last price for this specific symbol
-        last_price = self.get_last_price(symbol)
+        # Use volume_bar close as last_price fallback to reduce redundant data source calls
+        last_price = None
+        if "close" in volume_bar.columns and len(volume_bar) > 0:
+            last_price = float(volume_bar["close"].iloc[-1])
+        if last_price is None:
+            last_price = self.get_last_price(symbol)
         if last_price is None:
             self.logger.warning(f"Could not get last price for {symbol}")
             return

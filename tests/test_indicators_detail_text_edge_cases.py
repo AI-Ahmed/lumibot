@@ -51,6 +51,7 @@ def test_format_indicator_plotly_text_is_nan_safe(detail_text: object, expects_b
 
 
 def test_plot_indicators_handles_lines_with_detail_text_nan(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("LUMIBOT_WRITE_INDICATORS_HTML", "1")
     mock_write = MagicMock()
     monkeypatch.setattr("plotly.graph_objects.Figure.write_html", mock_write)
 
@@ -86,6 +87,7 @@ def test_plot_indicators_handles_lines_with_detail_text_nan(tmp_path, monkeypatc
 
 
 def test_plot_indicators_handles_lines_missing_detail_text_column(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("LUMIBOT_WRITE_INDICATORS_HTML", "1")
     mock_write = MagicMock()
     monkeypatch.setattr("plotly.graph_objects.Figure.write_html", mock_write)
 
@@ -110,6 +112,7 @@ def test_plot_indicators_handles_lines_missing_detail_text_column(tmp_path, monk
 
 def test_plot_indicators_emits_empty_csv_and_parquet_when_no_chart_data(tmp_path, monkeypatch) -> None:
     """Regression: indicators artifacts should exist even when a strategy emits no data."""
+    monkeypatch.setenv("LUMIBOT_WRITE_INDICATORS_HTML", "1")
     mock_write = MagicMock()
     monkeypatch.setattr("plotly.graph_objects.Figure.write_html", mock_write)
 
@@ -128,6 +131,7 @@ def test_plot_indicators_emits_empty_csv_and_parquet_when_no_chart_data(tmp_path
 
 
 def test_plot_indicators_handles_markers_missing_detail_text_column(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("LUMIBOT_WRITE_INDICATORS_HTML", "1")
     mock_write = MagicMock()
     monkeypatch.setattr("plotly.graph_objects.Figure.write_html", mock_write)
 
@@ -169,6 +173,7 @@ def test_plot_indicators_handles_markers_missing_detail_text_column(tmp_path, mo
     ids=["none", "nan", "pd_NA", "empty", "string", "float", "dict"],
 )
 def test_plot_indicators_handles_non_string_detail_text_values(tmp_path, monkeypatch, detail_text: object) -> None:
+    monkeypatch.setenv("LUMIBOT_WRITE_INDICATORS_HTML", "1")
     mock_write = MagicMock()
     monkeypatch.setattr("plotly.graph_objects.Figure.write_html", mock_write)
 
@@ -243,3 +248,118 @@ def test_get_lines_and_markers_df_include_detail_text_column() -> None:
 
     assert "detail_text" in lines_df.columns
     assert "detail_text" in markers_df.columns
+
+
+def test_plot_indicators_trade_derived_markers_preserve_detail_text_without_value_prefix(
+    tmp_path, monkeypatch
+) -> None:
+    """Trade-derived markers (used_trade_derived_markers=True) should use detail_text as-is.
+
+    When strategy emits no custom markers, plot_indicators derives markers from trades.
+    Those markers already have rich detail_text from _build_trade_marker_tooltip.
+    We must NOT wrap them with "Value: X" - that would be redundant and expose raw floats.
+    """
+    mock_write = MagicMock()
+    monkeypatch.setattr("plotly.graph_objects.Figure.write_html", mock_write)
+
+    # Strategy returns: 0% first day, 1% second day
+    strategy_df = pd.DataFrame(
+        {"return": [0.0, 0.01]},
+        index=pd.DatetimeIndex(["2024-05-01 09:30:00", "2024-05-01 10:00:00"], tz="UTC"),
+    )
+
+    # Trade with all fields needed for _build_trade_marker_tooltip
+    trades_df = pd.DataFrame(
+        [
+            {
+                "time": pd.Timestamp("2024-05-01 09:45:00", tz="UTC"),
+                "side": "buy",
+                "status": "fill",
+                "filled_quantity": 10.0,
+                "price": 170.50,
+                "symbol": "AAPL",
+                "type": "market",
+                "asset.multiplier": 1,
+                "asset.asset_type": "stock",
+                "trade_cost": 1705.0,
+                "trade_slippage": 0.0,
+            }
+        ]
+    )
+
+    plot_indicators(
+        plot_file_html=str(tmp_path / "plot.html"),
+        chart_markers_df=None,
+        chart_lines_df=None,
+        trades_df=trades_df,
+        strategy_df=strategy_df,
+        initial_budget=100_000.0,
+        strategy_name="Test",
+        show_indicators=True,
+    )
+
+    assert (tmp_path / "plot.csv").exists()
+    out_df = pd.read_csv(tmp_path / "plot.csv")
+    markers = out_df[out_df["type"] == "marker"]
+    assert not markers.empty, "Expected at least one marker from trade-derived path"
+
+    for _, row in markers.iterrows():
+        detail = row.get("detail_text", "")
+        assert not str(detail).startswith("Value: "), (
+            f"Trade-derived marker detail_text must NOT start with 'Value: '; got: {detail!r}"
+        )
+        # Should contain trade details from _build_trade_marker_tooltip
+        assert "AAPL" in str(detail) or "Price:" in str(detail)
+
+
+def test_plot_indicators_custom_markers_still_get_value_prefix(tmp_path, monkeypatch) -> None:
+    """Custom markers (from add_marker) must still get _format_indicator_plotly_text.
+
+    When chart_markers_df is provided by the strategy, used_trade_derived_markers=False.
+    Custom markers should get "Value: X" prefix (and optional detail_text appended).
+    """
+    mock_write = MagicMock()
+    monkeypatch.setattr("plotly.graph_objects.Figure.write_html", mock_write)
+
+    chart_markers_df = pd.DataFrame(
+        [
+            {
+                "plot_name": "default_plot",
+                "name": "Entry",
+                "datetime": pd.Timestamp("2024-01-01 10:00:00"),
+                "value": 150.25,
+                "symbol": "circle",
+                "color": "green",
+                "detail_text": "Custom entry signal",
+            },
+            {
+                "plot_name": "default_plot",
+                "name": "Exit",
+                "datetime": pd.Timestamp("2024-01-02 10:00:00"),
+                "value": 155.0,
+                "symbol": "circle",
+                "color": "red",
+            },
+        ]
+    )
+
+    plot_indicators(
+        plot_file_html=str(tmp_path / "plot.html"),
+        chart_markers_df=chart_markers_df,
+        chart_lines_df=None,
+        trades_df=None,
+        strategy_df=None,
+        strategy_name="Test",
+        show_indicators=True,
+    )
+
+    assert (tmp_path / "plot.csv").exists()
+    out_df = pd.read_csv(tmp_path / "plot.csv")
+    markers = out_df[out_df["type"] == "marker"]
+    assert len(markers) == 2
+
+    for _, row in markers.iterrows():
+        detail = row.get("detail_text", "")
+        assert str(detail).startswith("Value: "), (
+            f"Custom marker detail_text must start with 'Value: '; got: {detail!r}"
+        )
