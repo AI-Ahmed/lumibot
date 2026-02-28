@@ -28,9 +28,10 @@ References
 - Alpaca Historical Data API: https://alpaca.markets/docs/api-references/market-data-api/
 """
 
+import threading
 import time
 from datetime import timedelta
-from typing import Dict, List, Tuple
+from typing import Callable, Dict, List, Tuple
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -92,6 +93,39 @@ class TimeRange:
         return f"TimeRange[{self.start}, {self.end})"
 
 
+class GlobalRateLimiter:
+    """Thread-safe rate limiter shared across multiple SyncTradesDownloader instances.
+
+    Ensures all Alpaca API calls from parallel downloaders respect the account's
+    rate limit. Supports configurable limits for different Alpaca subscription tiers.
+
+    Parameters
+    ----------
+    rate_limit : int or None
+        Requests per minute. Semantics:
+        - None or positive (e.g. 200): enforce sleep before each API call
+        - 0 or negative: unlimited (no sleep; for premium/custom Alpaca agreements)
+    """
+    def __init__(self, rate_limit: int | None = ALPACA_HISTORICAL_RATE_LIMIT):
+        self._lock = threading.Lock()
+        self._last_request_time = 0.0
+        if rate_limit is None or rate_limit > 0:
+            effective = rate_limit if rate_limit is not None else ALPACA_HISTORICAL_RATE_LIMIT
+            self._request_delay = 60.0 / effective
+        else:
+            self._request_delay = 0.0
+
+    def acquire(self) -> None:
+        """Block until the next request is allowed, then update timestamp."""
+        if self._request_delay <= 0:
+            return
+        with self._lock:
+            elapsed = time.time() - self._last_request_time
+            if elapsed < self._request_delay:
+                time.sleep(self._request_delay - elapsed)
+            self._last_request_time = time.time()
+
+
 class SyncTradesDownloader:
     """Synchronous trades downloader using Alpaca Python SDK.
     
@@ -117,7 +151,9 @@ class SyncTradesDownloader:
     chunk_size_minutes : int, default 15
         Minutes of data to download per chunk
     rate_limit : int, default 200
-        API rate limit (requests per minute)
+        API rate limit (requests per minute). Use 0 or negative for unlimited (premium plans).
+    rate_limiter : callable or GlobalRateLimiter, optional
+        If provided, used instead of instance-level rate limiting (e.g. shared GlobalRateLimiter).
     
     Examples
     --------
@@ -143,6 +179,7 @@ class SyncTradesDownloader:
         memory_window_hours: int = DEFAULT_TRADES_MEMORY_WINDOW_HOURS,
         chunk_size_minutes: int = 15,
         rate_limit: int = ALPACA_HISTORICAL_RATE_LIMIT,
+        rate_limiter: Callable[[], None] | "GlobalRateLimiter" = None,
     ):
         self.asset = asset
         self.backtest_start = pendulum.instance(backtest_start) if not isinstance(backtest_start, pendulum.DateTime) else backtest_start
@@ -155,8 +192,9 @@ class SyncTradesDownloader:
         self.memory_window_hours = memory_window_hours
         self.chunk_size_minutes = chunk_size_minutes
         self.rate_limit = rate_limit
+        self._rate_limiter = rate_limiter
         
-        # Calculate delay between requests to respect rate limit
+        # Calculate delay between requests to respect rate limit (used when no injected limiter)
         self.request_delay = 60.0 / rate_limit if rate_limit > 0 else 0.3
         self._last_request_time = 0
         
@@ -344,6 +382,14 @@ class SyncTradesDownloader:
     
     def _wait_for_rate_limit(self):
         """Wait to respect API rate limit."""
+        if self._rate_limiter is not None:
+            if hasattr(self._rate_limiter, "acquire"):
+                self._rate_limiter.acquire()
+            else:
+                self._rate_limiter()
+            return
+        if self.rate_limit <= 0:
+            return
         elapsed = time.time() - self._last_request_time
         if elapsed < self.request_delay:
             time.sleep(self.request_delay - elapsed)
