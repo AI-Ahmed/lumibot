@@ -5,26 +5,31 @@ import math
 import os
 import re
 import time
-import datetime
 import uuid
-from typing import Union, List, Type, Callable, Literal
+import warnings
+from decimal import Decimal
+from typing import Callable, List, Literal, Optional, Type, Union
 
-import logging
 import jsonpickle
 import matplotlib
-from matplotlib.colors import is_color_like
 import numpy as np
 import pandas as pd
 import pandas_market_calendars as mcal
 from apscheduler.triggers.cron import CronTrigger
+from matplotlib.colors import is_color_like
 
 from loguru import logger
 from lumibot import log
-from termcolor import colored, COLORS
+from termcolor import COLORS, colored
 
+from ..constants import LUMIBOT_DEFAULT_PYTZ, LUMIBOT_DEFAULT_TIMEZONE
+from ..credentials import IS_BACKTESTING
 from ..data_sources import DataSource
-from ..entities import Asset, Data, Order, Position, Quote, TradingFee, TradingSlippage, SmartLimitConfig
+from ..entities import (
+    Asset, Data, Order, Position, Quote, TradingFee, TradingSlippage, SmartLimitConfig
+)
 from ..tools import get_risk_free_rate
+from ..tools.polars_utils import PolarsResampleError, resample_polars_ohlc
 from ..tools.smart_limit_utils import (
     build_price_ladder,
     compute_final_price,
@@ -33,13 +38,11 @@ from ..tools.smart_limit_utils import (
     infer_tick_size,
     round_to_tick,
 )
-from ..tools.polars_utils import PolarsResampleError, resample_polars_ohlc
 from ..traders import Trader
-from ..credentials import IS_BACKTESTING
 from ._strategy import _Strategy
-from ..constants import LUMIBOT_DEFAULT_TIMEZONE, LUMIBOT_DEFAULT_PYTZ
 
 matplotlib.use("Agg")
+
 
 class Strategy(_Strategy):
     @property

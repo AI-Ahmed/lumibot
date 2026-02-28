@@ -13,6 +13,7 @@ Data methods are made to get data for you to use in your strategies. You can use
         Strategy.get_last_prices
         Strategy.get_historical_prices
         Strategy.get_historical_prices_for_assets
+        Strategy.get_historical_trades
         Strategy.get_quote
         Strategy.get_yesterday_dividend
         Strategy.get_next_trading_day

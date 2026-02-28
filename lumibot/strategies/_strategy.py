@@ -30,7 +30,7 @@ from lumibot.tools.parquet_utils import (
 )
 
 from lumibot.tools.helpers import to_datetime_aware
-from ..entities import Asset, Order, Position, Data, TradingFee, Quote, Bars
+from ..entities import Asset, Order, Position, Data, Bars
 from ..backtesting import (
     AlpacaBacktesting,
     BacktestingBroker,
@@ -72,11 +72,11 @@ from ..credentials import (
     BACKTESTING_END,
     LOG_BACKTEST_PROGRESS_TO_FILE,
     BACKTESTING_SHOW_PROGRESS_BAR,
-    BACKTESTING_QUIET_LOGS
-)
+    BACKTESTING_QUIET_LOGS,
     STRATEGY_NAME,
     THETADATA_CONFIG,
 )
+
 from ..tools import (
     create_tearsheet,
     day_deduplicate,
@@ -713,6 +713,8 @@ class _Strategy:
             return asset
         elif isinstance(asset, tuple):
             return asset
+        elif isinstance(asset, list):
+            return [self._sanitize_user_asset(a) for a in asset]
         elif isinstance(asset, str):
             # Make sure the asset is uppercase for consistency (and because some brokers require it)
             asset = asset.upper()
@@ -1883,7 +1885,7 @@ class _Strategy:
                 pass
 
             strat_name = self._name if self._name is not None else "Strategy"
-            
+
             # Auto-detect appropriate resample rule if not specified
             if resample_rule is None:
                 resample_rule = self._get_appropriate_resample_rule()
@@ -1918,36 +1920,6 @@ class _Strategy:
                 strategy_parameters["Trade Metrics"]["Max Loss"] = f"${trade_metrics['max_loss']:.2f}"
                 strategy_parameters["Trade Metrics"]["Avg Win"] = f"${trade_metrics['avg_win']:.2f}"
                 strategy_parameters["Trade Metrics"]["Avg Loss"] = f"${trade_metrics['avg_loss']:.2f}"
-
-            lumibot_version = None
-            backtesting_data_sources = None
-            backtest_time_seconds = None
-
-            try:
-                if self.is_backtesting:
-                    try:
-                        import lumibot as _lumibot
-
-                        lumibot_version = getattr(_lumibot, "__version__", None)
-                    except Exception:
-                        lumibot_version = None
-
-                    try:
-                        backtesting_data_sources = (
-                            os.environ.get("BACKTESTING_DATA_SOURCES")
-                            or os.environ.get("BACKTESTING_DATA_SOURCE")
-                            or type(self.broker.data_source).__name__
-                        )
-                    except Exception:
-                        backtesting_data_sources = os.environ.get("BACKTESTING_DATA_SOURCE")
-
-                    backtest_time_seconds = getattr(self, "_backtest_time_seconds", None)
-                    if backtest_time_seconds is None:
-                        start_ts = getattr(self, "_backtest_time_start_monotonic", None)
-                        if start_ts is not None:
-                            backtest_time_seconds = time.monotonic() - float(start_ts)
-            except Exception:
-                pass
 
             lumibot_version = None
             backtesting_data_sources = None
@@ -2675,15 +2647,20 @@ class _Strategy:
         # Create chart markers dataframe
         chart_markers_df = pd.DataFrame(self._chart_markers_list)
 
-        # Check if we have at least one indicator to plot
-        if chart_markers_df is not None and chart_lines_df is not None:
+        # Always call plot_indicators when show_indicators; it handles empty data via trade-derived markers + baseline
+        if show_indicators:
             plot_indicators(
-                indicators_file,
-                chart_markers_df,
-                chart_lines_df,
-                chart_ohlc_df,
-                f"{self._log_strat_name()}Strategy Indicators",
-                show_indicators=show_indicators,
+                plot_file_html=indicators_file,
+                chart_markers_df=chart_markers_df,
+                chart_lines_df=chart_lines_df,
+                chart_ohlc_df=chart_ohlc_df,
+                strategy_name=f"{self._log_strat_name()}Strategy Indicators",
+                show_indicators=True,
+                trades_df=backtesting_broker._trade_event_log_df,
+                strategy_df=self._strategy_returns_df,
+                initial_budget=getattr(self, "_initial_budget", 1.0),
+                benchmark_df=getattr(self, "_benchmark_returns_df", None),
+                benchmark_name=str(self._benchmark_asset) if getattr(self, "_benchmark_asset", None) else None,
             )
 
         tearsheet_result = self.tearsheet(
@@ -3700,12 +3677,13 @@ class _Strategy:
         data_datetime_start=None,
         data_datetime_end=None,
     ):
-        """Get historical trades data for an asset.
+        """Get historical trades data for an asset or list of assets.
         
         Parameters
         ----------
-        asset : Asset or str
-            The asset to get historical trades for.
+        asset : Asset, str, or list of Asset/str
+            The asset(s) to get historical trades for. Pass a list for batch fetch
+            (parallel downloading when supported by the data source).
         quote : Asset or str, optional
             The quote asset for pricing. If None, uses the default quote asset.
         data_datetime_start : datetime, optional
@@ -3718,7 +3696,8 @@ class _Strategy:
         Returns
         -------
         pandas.DataFrame
-            DataFrame containing the historical trades data indexed by timestamp.
+            - Single asset: DataFrame indexed by timestamp.
+            - List of assets: DataFrame with MultiIndex (symbol, timestamp).
             
         Notes
         -----
