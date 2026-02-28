@@ -433,12 +433,19 @@ def _compute_dsr_from_series(series, risk_free_rate, periods_per_year, sr_estima
         if sr_estimates is None:
             _df = pd.DataFrame({"return": series})
             sr_estimates = sharpe(_df, risk_free_rate)
-        # FPAP compute_dsr: backtest_var is variance of SR estimate; m2 is second moment (variance)
-        backtest_var = m2**2
+        # FPAP compute_dsr: backtest_var must be variance of SR estimate V[SR̂], not return variance.
+        # Per López de Prado: V[SR̂_per] = (1/(T-1)) * (1 - skew*sr_per + (kurtosis-1)/4 * sr_per^2)
+        # FPAP divides backtest_var by freq, so pass var_sr_period * freq
+        T = len(series)
+        sr_period = sr_estimates / np.sqrt(periods_per_year)
+        var_sr_period = (1 / max(T - 1, 1)) * (
+            1 - m3 * sr_period + (m4 - 1) / 4 * sr_period ** 2
+        )
+        backtest_var = var_sr_period * periods_per_year
         em_sr, dsr_val = compute_dsr(
             sr_estimates=sr_estimates,
             backtest_var=backtest_var,
-            sample_length=len(series),
+            sample_length=T,
             N_trials=n_trials,
             skewness_of_returns=m3,
             kurtosis_of_returns=m4,
@@ -590,6 +597,81 @@ def calculate_returns(symbol, start=datetime(1900, 1, 1), end=datetime.now()):
     performance(benchmark_df, risk_free_rate, symbol)
 
 
+def _trades_to_chart_markers(trades_df, strategy_df, initial_budget=1.0):
+    """Convert trade events to chart markers when strategy emits no custom indicators.
+
+    Used as fallback so the indicators plot shows buy/sell markers when the strategy
+    does not call add_chart_marker. Requires strategy_df with 'return' column and
+    trades_df with 'time', 'side', 'status'.
+    """
+    if trades_df is None or trades_df.empty or strategy_df is None or strategy_df.empty:
+        return None
+    if "return" not in strategy_df.columns:
+        return None
+
+    trades = trades_df.copy()
+    if "time" not in trades.columns:
+        if trades.index.name in ("time", "datetime") or (
+            hasattr(trades.index, "to_pydatetime") and len(trades) > 0
+        ):
+            trades = trades.reset_index()
+            if "index" in trades.columns:
+                trades = trades.rename(columns={"index": "time"})
+        if "time" not in trades.columns:
+            return None
+    trades["time"] = pd.to_datetime(trades["time"])
+    trades = trades.loc[
+        trades["status"].astype(str).str.lower().isin(TERMINAL_TRADE_STATUSES_FOR_MARKERS)
+    ]
+    if trades.empty:
+        return None
+
+    strat = strategy_df.copy()
+    strat = strat.sort_index()
+    pv = (1 + strat["return"]).cumprod() * initial_budget
+    pv.index = pd.to_datetime(pv.index)
+    pv = pv.sort_index()
+    pv_df = pv.reset_index()
+    pv_df.columns = ["datetime", "portfolio_value"]
+
+    merged = pd.merge_asof(
+        trades.sort_values("time"),
+        pv_df,
+        left_on="time",
+        right_on="datetime",
+        direction="backward",
+    )
+    if "portfolio_value" not in merged.columns or merged["portfolio_value"].isna().all():
+        return None
+
+    def _row_to_marker(row):
+        side = str(row.get("side", "")).lower()
+        if side in ("buy", "buy_to_open", "buy_to_cover", "buy_to_close"):
+            return "Bought", "triangle-up", "green"
+        if side in ("sell", "sell_to_close", "sell_short", "sell_to_open"):
+            return "Sold", "triangle-down", "red"
+        return None, None, None
+
+    rows = []
+    for _, row in merged.iterrows():
+        name, symbol, color = _row_to_marker(row)
+        if name is None:
+            continue
+        detail = _build_trade_marker_tooltip(row)
+        rows.append({
+            "datetime": row["time"],
+            "value": row["portfolio_value"],
+            "name": name,
+            "symbol": symbol,
+            "color": color,
+            "plot_name": "default_plot",
+            "detail_text": detail if detail else "",
+        })
+    if not rows:
+        return None
+    return pd.DataFrame(rows)
+
+
 def plot_indicators(
     plot_file_html="indicators.html",
     chart_markers_df=None,
@@ -597,6 +679,11 @@ def plot_indicators(
     chart_ohlc_df=None,
     strategy_name=None,
     show_indicators=True,
+    trades_df=None,
+    strategy_df=None,
+    initial_budget=1.0,
+    benchmark_df=None,
+    benchmark_name=None,
 ):
     # If show plot is False, then we don't want to open the plot in the browser
     if not show_indicators:
@@ -604,6 +691,48 @@ def plot_indicators(
         return
 
     logger.info("\nCreating indicators plot...")
+
+    # When strategy emits no custom chart data, derive markers from trades so the plot isn't empty
+    has_custom_markers = (
+        (chart_markers_df is not None and not chart_markers_df.empty)
+        or (chart_lines_df is not None and not chart_lines_df.empty)
+        or (chart_ohlc_df is not None and not chart_ohlc_df.empty)
+    )
+    used_trade_derived_markers = False
+    if not has_custom_markers and trades_df is not None and strategy_df is not None:
+        derived = _trades_to_chart_markers(trades_df, strategy_df, initial_budget)
+        if derived is not None and not derived.empty:
+            chart_markers_df = derived
+            used_trade_derived_markers = True
+            logger.info("Using trade events as indicators (strategy did not add custom chart data)")
+
+    # Build baseline df (strategy curve, benchmark curve, cash) for context when using trade-derived markers
+    baseline_df = None
+    strategy_series_name = (strategy_name or "Strategy").replace(" Indicators", "").rstrip() or "Strategy"
+    if used_trade_derived_markers and strategy_df is not None and not strategy_df.empty and "return" in strategy_df.columns:
+        _strat = strategy_df.copy().sort_index()
+        _strat.index = pd.to_datetime(_strat.index)
+        pv = (1 + _strat["return"]).cumprod() * initial_budget
+        pv.iloc[0] = initial_budget
+        baseline_df = pd.DataFrame(index=pv.index)
+        baseline_df[strategy_series_name] = pv
+        if "cash" in _strat.columns:
+            baseline_df["cash"] = _strat["cash"].reindex(baseline_df.index).ffill().bfill()
+        else:
+            baseline_df["cash"] = np.nan
+        if benchmark_df is not None and not benchmark_df.empty and benchmark_name:
+            _bench = benchmark_df.copy().sort_index()
+            _bench.index = pd.to_datetime(_bench.index)
+            if "return" in _bench.columns:
+                bm_cum = (1 + _bench["return"]).cumprod() * initial_budget
+                bm_cum.iloc[0] = initial_budget
+            elif "symbol_cumprod" in _bench.columns:
+                bm_cum = _bench["symbol_cumprod"] * initial_budget
+            else:
+                bm_cum = pd.Series(initial_budget, index=_bench.index)
+            baseline_df = baseline_df.join(bm_cum.rename(benchmark_name), how="outer")
+        baseline_df = baseline_df.sort_index().ffill().bfill()
+        baseline_df.index = pd.to_datetime(baseline_df.index, utc=True).tz_convert(LUMIBOT_DEFAULT_TIMEZONE)
 
     # Assign "default_plot" as plot_name for markers and lines that don't have one
     if chart_markers_df is not None and not chart_markers_df.empty:
@@ -643,7 +772,13 @@ def plot_indicators(
     # even when the strategy emitted no chart data (empty indicators should still produce artifacts).
     plot_names = sorted(list(plot_names)) or ["default_plot"]
     num_subplots = len(plot_names)
-    subplot_titles = plot_names
+    # When using trade-derived markers with baseline, show "Strategy/Benchmark" instead of "default_plot" for axes/titles
+    if used_trade_derived_markers and baseline_df is not None and "default_plot" in plot_names:
+        subplot_titles = [
+            "Strategy/Benchmark" if name == "default_plot" else name for name in plot_names
+        ]
+    else:
+        subplot_titles = plot_names
 
     vertical_spacing = _safe_subplot_vertical_spacing(num_subplots)
     if vertical_spacing < 0.15:
@@ -652,6 +787,9 @@ def plot_indicators(
         )
 
     try:
+        # When we have baseline (strategy/benchmark/cash), first subplot needs secondary_y for cash
+        specs = [[{"secondary_y": bool(baseline_df is not None)}]] + [[{}] for _ in range(num_subplots - 1)] if num_subplots > 1 else [[{"secondary_y": bool(baseline_df is not None)}]]
+
         # Create subplots without shared x-axes
         fig = make_subplots(
             rows=num_subplots,
@@ -659,15 +797,77 @@ def plot_indicators(
             subplot_titles=subplot_titles,
             shared_xaxes=False,  # Do not use shared x-axes
             vertical_spacing=vertical_spacing,
+            specs=specs,
         )
 
         has_chart_data = False
+
+        # Add baseline traces (strategy, benchmark, cash) to first subplot when using trade-derived markers
+        if baseline_df is not None and not baseline_df.empty and "default_plot" in plot_names:
+            row1 = plot_names.index("default_plot") + 1
+            if strategy_series_name in baseline_df.columns:
+                fig.add_trace(
+                    go.Scatter(
+                        x=baseline_df.index,
+                        y=baseline_df[strategy_series_name],
+                        mode="lines",
+                        name=strategy_series_name,
+                        connectgaps=True,
+                        hovertemplate=f"{strategy_series_name}<br>Value: %{{y:$,.4f}}<br>%{{x|%b %d %Y %I:%M:%S %p}}<extra></extra>",
+                    ),
+                    row=row1,
+                    col=1,
+                    secondary_y=False,
+                )
+                has_chart_data = True
+            if benchmark_name and benchmark_name in baseline_df.columns:
+                fig.add_trace(
+                    go.Scatter(
+                        x=baseline_df.index,
+                        y=baseline_df[benchmark_name],
+                        mode="lines",
+                        name=benchmark_name,
+                        connectgaps=True,
+                        hovertemplate=f"{benchmark_name}<br>Value: %{{y:$,.4f}}<br>%{{x|%b %d %Y %I:%M:%S %p}}<extra></extra>",
+                    ),
+                    row=row1,
+                    col=1,
+                    secondary_y=False,
+                )
+                has_chart_data = True
+            if "cash" in baseline_df.columns and baseline_df["cash"].notna().any():
+                fig.add_trace(
+                    go.Scatter(
+                        x=baseline_df.index,
+                        y=baseline_df["cash"],
+                        mode="lines",
+                        name="cash",
+                        connectgaps=True,
+                        hovertemplate="Cash<br>Value: %{y:$,.4f}<br>%{x|%b %d %Y %I:%M:%S %p}<extra></extra>",
+                    ),
+                    row=row1,
+                    col=1,
+                    secondary_y=True,
+                )
+                has_chart_data = True
+            # Update y-axis titles for baseline subplot
+            fig.update_yaxes(title_text="Strategy/Benchmark", secondary_y=False, row=row1, col=1)
+            if "cash" in baseline_df.columns and baseline_df["cash"].notna().any():
+                fig.update_yaxes(title_text="Cash", secondary_y=True, row=row1, col=1)
 
         ###############################
         # Chart Markers
         ###############################
 
         def generate_marker_plotly_text(row):
+            if used_trade_derived_markers:
+                detail = row.get("detail_text")
+                if (
+                    detail is not None
+                    and not (isinstance(detail, float) and pd.isna(detail))
+                    and str(detail).strip()
+                ):
+                    return str(detail).strip()
             return _format_indicator_plotly_text(row.get("value"), row.get("detail_text"))
 
         # Plot the chart markers
@@ -838,10 +1038,23 @@ def plot_indicators(
         # Chart Titles and Layouts
         ###############################
 
+        # When no chart data, add placeholder trace so subplot renders instead of "Failed to display"
+        if not has_chart_data:
+            fig.add_trace(
+                go.Scatter(
+                    x=[0],
+                    y=[0],
+                    mode="markers",
+                    marker=dict(size=1, opacity=0),
+                    showlegend=False,
+                ),
+                row=1,
+                col=1,
+            )
+
         # Set title and layout
-        # Calculate height based on number of subplots
-        # 400px per subplot
-        height = max(800, num_subplots * 400)
+        # Calculate height based on number of subplots; use larger base so chart feels less squeezed
+        height = max(900, num_subplots * 450)
 
         title_text = f"Indicators for {strategy_name}" if strategy_name else "Indicators"
         if not has_chart_data:
@@ -851,8 +1064,9 @@ def plot_indicators(
             title_text=title_text,
             title_font_size=30,
             template="plotly_dark",
-            height=height,  # Dynamic height based on number of subplots
-            margin=dict(t=150),  # Add more space between title and first subplot
+            height=height,
+            autosize=True,  # Allow chart to resize with container / viewport
+            margin=dict(t=80, b=60, l=60, r=40),  # Balanced margins; less top squeeze
         )
 
         if has_chart_data:
@@ -867,8 +1081,8 @@ def plot_indicators(
 
             # Update axes for all subplots
             for i in range(1, num_subplots + 1):
-                # Get the plot name for this subplot
-                plot_title = plot_names[i - 1]
+                # Use subplot_titles (may show "Strategy/Benchmark" instead of "default_plot" for trade-derived baseline)
+                plot_title = subplot_titles[i - 1]
 
                 # Set y-axes titles for each subplot
                 fig.update_yaxes(
@@ -895,11 +1109,17 @@ def plot_indicators(
                 )
 
         disable_ui = _env_flag_enabled("LUMIBOT_DISABLE_UI", default=False) or bool(os.environ.get("PYTEST_CURRENT_TEST"))
-        write_indicators_html = _env_flag_enabled("LUMIBOT_WRITE_INDICATORS_HTML", default=True)
+        # Default False: *_indicators.html is redundant with trades plot; keep CSV/parquet for downstream.
+        write_indicators_html = _env_flag_enabled("LUMIBOT_WRITE_INDICATORS_HTML", default=False)
 
         if write_indicators_html:
             # Create graph (auto_open disabled for CI/tests).
-            fig.write_html(plot_file_html, auto_open=show_indicators and not disable_ui)
+            # responsive=True lets the chart fill/resize with the browser viewport
+            fig.write_html(
+                plot_file_html,
+                auto_open=show_indicators and not disable_ui,
+                config=dict(responsive=True),
+            )
         else:
             logger.info(
                 "Skipping indicators HTML generation because LUMIBOT_WRITE_INDICATORS_HTML is disabled."
@@ -2027,82 +2247,6 @@ def _inject_benchmark_into_summary_metrics(tearsheet_file, df_stats_final, risk_
             f.write(content)
     except Exception as e:
         logger.warning(f"Could not write tearsheet after benchmark summary injection: {e}")
-
-    # Add layout configurations to improve the chart appearance
-    fig.update_layout(
-        title=f"{strategy_name} Strategy Compared With {benchmark_name}",
-        xaxis=dict(
-            title="Date",
-            title_font=dict(size=12),  # Changed from titlefont to title_font
-            showgrid=True,
-            gridcolor='rgba(230, 230, 230, 0.3)',
-        ),
-        yaxis=dict(
-            title="Strategy/Benchmark",
-            title_font=dict(size=12),  # Changed from titlefont to title_font
-            showgrid=True,
-            gridcolor='rgba(230, 230, 230, 0.3)',
-            tickformat="$,.4f",  # Format y-axis ticks as currency
-            rangemode="tozero",  # Start y-axis at zero
-        ),
-        yaxis2=dict(
-            title="Cash",
-            title_font=dict(size=12),  # Changed from titlefont to title_font
-            showgrid=False,
-            tickformat="$,.4f",  # Format y-axis ticks as currency
-            rangemode="tozero",  # Start y-axis at zero
-        ),
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1
-        ),
-        margin=dict(l=50, r=50, t=80, b=50),
-        plot_bgcolor='rgba(250, 250, 250, 0.9)',
-        hovermode="closest",
-        height=600,
-    )
-
-    # Add a range slider for better navigation
-    fig.update_layout(
-        xaxis=dict(
-            rangeslider=dict(visible=True),
-            type="date"
-        )
-    )
-    
-    # Fix axis scaling issues by ensuring reasonable ranges
-    y_values = df_final[[strategy_name, benchmark_name]].values.flatten()
-    y_values = y_values[~np.isnan(y_values)]  # Remove NaN values
-    
-    if len(y_values) > 0:
-        y_min = min(y_values)
-        y_max = max(y_values)
-        y_range = y_max - y_min
-        
-        # Set y-axis range with padding
-        fig.update_layout(
-            yaxis=dict(
-                range=[max(0, y_min - 0.1 * y_range), y_max + 0.1 * y_range]
-            )
-        )
-        
-    # Fix cash axis scaling if needed
-    cash_values = df_final["cash"].values
-    cash_values = cash_values[~np.isnan(cash_values)]
-    
-    if len(cash_values) > 0:
-        cash_min = min(cash_values)
-        cash_max = max(cash_values)
-        cash_range = cash_max - cash_min
-        
-        fig.update_layout(
-            yaxis2=dict(
-                range=[max(0, cash_min - 0.1 * cash_range), cash_max + 0.1 * cash_range]
-            )
-        )
 
 
 def _enhance_tearsheet_parameters(tearsheet_file):
