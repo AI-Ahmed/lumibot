@@ -605,7 +605,7 @@ def print_progress_bar(
             eta = eta_override
         else:
             eta_seconds = elapsed.total_seconds() * (1/progress - 1)
-        eta = dt.timedelta(seconds=int(eta_seconds))
+            eta = dt.timedelta(seconds=int(eta_seconds))
         eta_str = str(eta).split('.')[0]
         time_info = f"[Elapsed: {elapsed_str} | ETA: {eta_str}]"
     else:
