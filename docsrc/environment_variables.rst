@@ -81,6 +81,14 @@ SHOW_PLOT / SHOW_INDICATORS / SHOW_TEARSHEET
 - Purpose: Enable/disable artifact generation.
 - Values: ``True`` / ``False`` (string).
 
+LUMIBOT_WRITE_INDICATORS_HTML
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: When truthy, write ``*_indicators.html`` chart files during backtests. The indicators HTML duplicates trade markers shown in the trades plot; by default it is not generated to avoid redundancy.
+- Values: truthy enables (``1``, ``true``, ``yes``); unset/``0`` disables.
+- Default: disabled. Set to enable if you need the indicators HTML chart.
+- Notes: ``*_indicators.csv`` and ``*_indicators.parquet`` are always emitted for downstream tools regardless of this flag.
+
 LUMIBOT_BACKTEST_PARQUET_MODE
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -333,6 +341,17 @@ ALPACA_IS_PAPER
 - Purpose: Toggle between paper and live trading.
 - Values: ``true`` (paper) / ``false`` (live).
 - Default: ``true`` (paper trading).
+
+LUMIBOT_ALPACA_TRADES_RATE_LIMIT
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: Override Alpaca historical trades API rate limit for HFT backtests.
+- Values: Integer (requests per minute). Use ``0`` or negative for unlimited (premium/custom Alpaca agreements).
+- Default: unset (uses 200 req/min per Alpaca standard plan).
+- Notes:
+  - When using ``AlpacaBacktesting`` with trades data (HFT strategies), parallel downloads share a global rate limiter.
+  - Users with premium/custom Alpaca agreements may set ``0`` to disable rate limiting.
+  - Reference: `Alpaca API rate limits <https://alpaca.markets/support/usage-limit-api-calls>`_.
 
 Tradier broker
 --------------

@@ -64,11 +64,24 @@ This page documents environment variables used by LumiBot, with an emphasis on *
   - CI uses this to enforce the “warm S3 cache invariant” for canonical acceptance windows.
   - Exit behavior: tripwire prints `[ACCEPTANCE][TRIPWIRE] …` and hard-exits the subprocess with code `86`.
 
+### `LUMIBOT_ALPACA_TRADES_RATE_LIMIT`
+- Purpose: Override Alpaca historical trades API rate limit for HFT backtests.
+- Values: Integer (requests per minute). Use `0` or negative for unlimited (premium/custom Alpaca agreements).
+- Default: unset (uses 200 req/min per Alpaca standard plan).
+- Where: `lumibot/credentials.py` → `AlpacaBacktesting` when `trades_rate_limit` is `None`.
+
 ## Backtest output + UX flags
 
 ### `SHOW_PLOT`, `SHOW_INDICATORS`, `SHOW_TEARSHEET`
 - Purpose: Enables/disables artifact generation.
 - Values: `True` / `False` (string).
+
+### `LUMIBOT_WRITE_INDICATORS_HTML`
+
+- Purpose: When truthy, write `*_indicators.html` chart files during backtests. The indicators HTML duplicates trade markers shown in the trades plot; by default it is not generated to avoid redundancy.
+- Values: truthy enables (`1`, `true`, `yes`); unset/`0` disables.
+- Default: disabled. Set to enable if you need the indicators HTML chart.
+- Notes: `*_indicators.csv` and `*_indicators.parquet` are always emitted for downstream tools regardless of this flag.
 
 ### `LUMIBOT_BACKTEST_PARQUET_MODE`
 - Purpose: Controls parquet export semantics for backtest artifacts (indicators/trades/stats/trade events).

@@ -91,3 +91,22 @@ The fastest options backtests are those that:
 In practice, the easiest way to get this right is to use :doc:`options_helper` for strike/expiry selection (for example ``OptionsHelper.find_strike_for_delta(...)``) instead of manually scanning chains and calling ``get_greeks()`` per strike.
 
 For ThetaData details, see :doc:`backtesting.thetadata`.
+
+Alpaca HFT trades backtesting
+-----------------------------
+
+When using ``AlpacaBacktesting`` with trades data (HFT strategies using ``get_historical_trades``), you can tune rate limiting and chunk size:
+
+- **trades_rate_limit** (passed to ``run_backtest()`` or ``backtest()``):
+
+  - ``None`` (default): 200 req/min (Alpaca standard/free plan)
+  - ``0`` or negative: unlimited (premium/custom Alpaca agreements)
+  - Positive integer: custom req/min (e.g. 400 if Alpaca granted higher limit)
+
+- **trades_chunk_size_minutes**: Override the chunk size for progressive loading (default: derived from strategy ``sleeptime``).
+
+- **trades_prefetch**: When ``True`` and backtest period is under 14 days, pre-download trades to warm the cache.
+
+- **LUMIBOT_ALPACA_TRADES_RATE_LIMIT**: Environment variable override (see :doc:`environment_variables`).
+
+For multi-symbol HFT, use ``get_historical_trades(asset=[...])`` with a list of symbols to trigger parallel batch fetching.

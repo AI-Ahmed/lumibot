@@ -182,6 +182,24 @@ DataSource (ABC)
 - `get_price_data()` - Main entry point (line 1248)
 - `_apply_corporate_actions_to_frame()` - Handles splits (line 1018)
 
+### 5. AlpacaBacktesting and HFT Trades (`alpaca_backtesting.py` → `sync_trades_downloader.py`)
+
+**Flow:**
+1. `AlpacaBacktesting` uses `SyncTradesDownloader` per symbol for progressive trades loading.
+2. A shared `GlobalRateLimiter` ensures all parallel downloads respect the Alpaca API limit (200 req/min standard).
+3. Strategy can pass `trades_rate_limit` to `run_backtest()` to match subscription tier:
+   - `None` (default): 200 req/min (standard/free plan)
+   - `0` or negative: unlimited (premium/custom agreement)
+   - Positive: custom req/min (e.g. 400 if Alpaca granted higher limit)
+4. For multi-symbol HFT, `get_historical_trades(asset=list)` triggers parallel batch fetch via `ThreadPoolExecutor`.
+
+**Key parameters:**
+- `trades_rate_limit`: Strategy → `AlpacaBacktesting` (subscription tier)
+- `trades_chunk_size_minutes`: Override chunk size (default: derived from strategy `sleeptime`)
+- `trades_prefetch`: When `True` and period < 14 days, pre-download trades to warm cache
+
+**Env override:** `LUMIBOT_ALPACA_TRADES_RATE_LIMIT` (optional)
+
 ### ThetaData Data Downloader (remote service)
 
 This is an **internal/proprietary** service that can proxy ThetaData requests and provide queuing/concurrency controls.

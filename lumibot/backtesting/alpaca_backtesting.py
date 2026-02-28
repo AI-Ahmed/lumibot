@@ -71,9 +71,15 @@ except ImportError:
 logger = get_logger(__name__)
 
 from lumibot.tools.alpaca_helpers import sanitize_base_and_quote_asset
-from lumibot.backtesting.sync_trades_downloader import SyncTradesDownloader, MultiAssetTradesDownloader
+from lumibot.backtesting.sync_trades_downloader import (
+    GlobalRateLimiter,
+    SyncTradesDownloader,
+    MultiAssetTradesDownloader,
+)
 from lumibot.credentials import (
     ALPACA_CONFIG,
+    ALPACA_HISTORICAL_RATE_LIMIT,
+    ALPACA_TRADES_RATE_LIMIT_ENV,
     DEFAULT_END_SHIFT_DAYS,
     DEFAULT_END_SHIFT_MINUTES,
     MIN_TRADING_DAYS_FOR_SHIFT,
@@ -432,11 +438,29 @@ class AlpacaBacktesting(DataSourceBacktesting):
         self._trades_lookahead_hours = kwargs.get('trades_lookahead_hours', DEFAULT_TRADES_LOOKAHEAD_HOURS)
         self._trades_memory_window_hours = kwargs.get('trades_memory_window_hours', DEFAULT_TRADES_MEMORY_WINDOW_HOURS)
         self._trades_chunk_size_hours = kwargs.get('trades_chunk_size_hours', DEFAULT_TRADES_CHUNK_SIZE_HOURS)
-        # chunk_size_minutes: Will be auto-configured from strategy's sleeptime
-        # Default 15 minutes matches common HFT sleeptime intervals until configured
-        self._trades_chunk_size_minutes = 15
-        self._sleeptime_configured = False  # Track if we've configured from sleeptime
-        
+        # chunk_size_minutes: Explicit override, or auto-configured from strategy's sleeptime
+        _chunk_min = kwargs.get("trades_chunk_size_minutes")
+        if _chunk_min is not None:
+            self._trades_chunk_size_minutes = int(_chunk_min)
+            self._sleeptime_configured = True  # Skip configure_from_sleeptime override
+        else:
+            self._trades_chunk_size_minutes = 15
+            self._sleeptime_configured = False
+
+        self._trades_prefetch = kwargs.get("trades_prefetch", False)
+        self._prefetch_symbols = kwargs.get("prefetch_symbols")  # Optional list for prefetch
+        self._prefetch_done = False
+
+        # Global rate limiter for trades API (shared across all SyncTradesDownloader instances)
+        _rl = kwargs.get("trades_rate_limit")
+        if _rl is None:
+            _rl = (
+                ALPACA_TRADES_RATE_LIMIT_ENV
+                if ALPACA_TRADES_RATE_LIMIT_ENV is not None
+                else ALPACA_HISTORICAL_RATE_LIMIT
+            )
+        self._trades_rate_limiter = GlobalRateLimiter(rate_limit=_rl)
+
         # Graceful interruption support
         self._interrupted = False
         self._setup_signal_handlers()
@@ -1616,6 +1640,7 @@ class AlpacaBacktesting(DataSourceBacktesting):
                     tzinfo=str(tzinfo) if tzinfo else "America/New_York",
                     memory_window_hours=self._trades_memory_window_hours,
                     chunk_size_minutes=self._trades_chunk_size_minutes,
+                    rate_limiter=self._trades_rate_limiter,
                 )
                 
                 self._trades_downloaders[downloader_key] = downloader
@@ -2170,6 +2195,30 @@ class AlpacaBacktesting(DataSourceBacktesting):
             
             logger.debug(f"Processing list of {len(base_asset)} assets in parallel")
             assets = [self._sanitize_base_and_quote_asset(asset, quote_asset) for asset in base_asset]
+
+            # Optional one-time prefetch for short backtest periods
+            if (
+                self._trades_prefetch
+                and not self._prefetch_done
+                and self._timestep == "minute"
+            ):
+                delta = (cache_end - cache_start).total_seconds() / 86400
+                if 0 < delta < 14:
+                    self._prefetch_done = True
+                    logger.info(f"Prefetching trades for {len(assets)} symbols (period={delta:.0f} days)")
+                    for asset, q in assets:
+                        self._check_interrupted()
+                        try:
+                            self.get_historical_trades_between_dates(
+                                base_asset=asset,
+                                quote_asset=q,
+                                market=market,
+                                tzinfo=tzinfo,
+                                data_datetime_start=cache_start,
+                                data_datetime_end=cache_end,
+                            )
+                        except Exception as e:
+                            logger.debug(f"Prefetch skipped for {asset.symbol}: {e}")
             
             # Define download function for each asset (returns tuple of symbol and df)
             def download_asset_trades(asset_quote_tuple):

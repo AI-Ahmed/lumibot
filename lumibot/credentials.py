@@ -716,3 +716,9 @@ DEFAULT_TRADES_LOOKAHEAD_HOURS = 24  # Download 24 hours ahead of current backte
 DEFAULT_TRADES_MEMORY_WINDOW_HOURS = 48  # Keep last 48 hours of trades in memory
 DEFAULT_TRADES_CHUNK_SIZE_HOURS = 1  # Download 1 hour of trades at a time (legacy, use MINUTES for HFT)
 ALPACA_HISTORICAL_RATE_LIMIT = 200  # 200 requests per minute for historical data
+# Optional override: LUMIBOT_ALPACA_TRADES_RATE_LIMIT (int; 0 or negative = unlimited)
+try:
+    _at = os.environ.get("LUMIBOT_ALPACA_TRADES_RATE_LIMIT")
+    ALPACA_TRADES_RATE_LIMIT_ENV = int(_at) if _at is not None and str(_at).strip() else None
+except (ValueError, TypeError):
+    ALPACA_TRADES_RATE_LIMIT_ENV = None
