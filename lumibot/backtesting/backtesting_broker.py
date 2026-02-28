@@ -3428,37 +3428,13 @@ class BacktestingBroker(Broker):
                     )
                     self._audit_merge(order, self._audit_underlying_quote_fields(order), overwrite=False)
 
-                self._execute_filled_order(
-                if order.dependent_order:
-                    order.dependent_order.dependent_order_filled = True
-                    strategy.broker.cancel_order(order.dependent_order)
-                    # self.cancel_order(order.dependent_order)
-
-                # Child orders of Bracket and OTO are not submitted until the parent order is filled
-                if order.order_class in [Order.OrderClass.BRACKET, Order.OrderClass.OTO]:
-                    for child_order in order.child_orders:
-                        logger.info(f"{child_order} was sent to broker {self.name} now that the parent Bracket/OTO "
-                                    f"order has been filled")
-                        self._new_orders.append(child_order)
-
-                trade_cost = self.calculate_trade_cost(order, strategy, price)
-
-                new_cash = strategy.cash - float(trade_cost)
-                strategy._set_cash_position(new_cash)
-                order.trade_cost = float(trade_cost)
-
-                # Generate a batch ID for this processing batch to group related orders
-                # This is especially important for HFT portfolio strategies
                 batch_id = str(uuid.uuid4())
-                
-                self.stream.dispatch(
-                    self.FILLED_ORDER,
-                    wait_until_complete=True,
+                self._execute_filled_order(
                     order=order,
                     price=price,
                     filled_quantity=filled_quantity,
                     strategy=strategy,
-                    batch_id=batch_id
+                    batch_id=batch_id,
                 )
             else:
                 if strategy is not None:
@@ -4656,8 +4632,7 @@ class BacktestingBroker(Broker):
                     order,
                     broker.FILLED_ORDER,
                     price=price,
-                    filled_quantity=filled_quantity,
-                    quantity=quantity,
+                    filled_quantity=filled_quantity or quantity,
                     multiplier=multiplier,
                     batch_id=batch_id,
                 )

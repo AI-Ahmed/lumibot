@@ -2349,7 +2349,7 @@ class Broker(ABC):
                 elif type_event == self.FILLED_ORDER:
                     self._processed_filled_orders.clear()
 
-        if self._hold_trade_events and not is_backtesting:
+        if self._hold_trade_events and not self.IS_BACKTESTING_BROKER:
             if self.logger.isEnabledFor(logging.INFO):
                 self.logger.info(
                     f"Trade event held for {stored_order.strategy} strategy: {type_event} {stored_order.symbol} "
@@ -2395,7 +2395,7 @@ class Broker(ABC):
 
         # PERF: Backtesting emits the canonical event types from Broker constants, so we can avoid
         # the expensive "equivalent status" normalization logic intended for live brokers.
-        if is_backtesting:
+        if self.IS_BACKTESTING_BROKER:
             if type_event == self.NEW_ORDER:
                 order = self._process_new_order(stored_order)
                 if order:
@@ -2490,7 +2490,7 @@ class Broker(ABC):
         # PERF: backtesting data sources often store the current dt on `_datetime`. Avoid the extra
         # method call overhead in the hot-path trade-event logger, but fall back to `get_datetime()`
         # for stubbed sources used in unit tests.
-        if is_backtesting:
+        if self.IS_BACKTESTING_BROKER:
             current_dt = getattr(self.data_source, "_datetime", None) or self.data_source.get_datetime()
         else:
             current_dt = self.data_source.get_datetime()
