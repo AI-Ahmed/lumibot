@@ -2375,20 +2375,22 @@ class Strategy(_Strategy):
             quote_asset = quote
 
         try:
-            # For daily-cadence backtests with ThetaData, prefer day bars to avoid exploding minute fetches.
-            # Only apply this optimization for ThetaData - other sources (Yahoo, Polygon) have their own
-            # efficient implementations and may return different price types (open vs close).
-            if (IS_BACKTESTING or getattr(self.broker, "IS_BACKTESTING_BROKER", False)) and self._should_use_daily_last_price(asset):
-                data_source = getattr(self.broker, "data_source", None)
-                is_thetadata = data_source is not None and "ThetaData" in type(data_source).__name__
-                if is_thetadata:
-                    try:
-                        bars = self.get_historical_prices(asset, length=2, timestep="day", timeshift=-1, quote=quote_asset, exchange=exchange)
-                        if bars is not None and getattr(bars, "df", None) is not None and not bars.df.empty:
-                            return float(bars.df["close"].iloc[-1])
-                    except Exception:
-                        # Fall through to the default path on any failure.
-                        pass
+            # For daily-cadence backtests, prefer day bars for sources where minute-level
+            # fetches are expensive (IBKR). Keep Yahoo/Alpaca on legacy behavior.
+            is_backtesting_run = bool(
+                IS_BACKTESTING
+                or getattr(self, "is_backtesting", False)
+                or getattr(getattr(self, "broker", None), "IS_BACKTESTING_BROKER", False)
+            )
+            should_use_daily = self._should_use_daily_last_price(asset)
+            if is_backtesting_run and should_use_daily and self._supports_daily_last_price_optimization():
+                try:
+                    bars = self.get_historical_prices(asset, length=2, timestep="day", timeshift=-1, quote=quote_asset, exchange=exchange)
+                    if bars is not None and getattr(bars, "df", None) is not None and not bars.df.empty:
+                        return float(bars.df["close"].iloc[-1])
+                except Exception:
+                    # Fall through to the default path on any failure.
+                    pass
             return self.broker.get_last_price(
                 asset,
                 quote=quote_asset,
@@ -2399,6 +2401,13 @@ class Strategy(_Strategy):
             self.log_message(f"Could not get last price for {asset}", color="red")
             self.log_message(f"{e}")
             return None
+
+    def _supports_daily_last_price_optimization(self) -> bool:
+        data_source = getattr(getattr(self, "broker", None), "data_source", None)
+        if data_source is None:
+            return False
+        source_name = type(data_source).__name__.lower()
+        return "ibkr" in source_name
 
     def _should_use_daily_last_price(self, asset: Asset) -> bool:
         if asset is None:
