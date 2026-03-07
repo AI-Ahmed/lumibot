@@ -2617,6 +2617,7 @@ class BacktestingBroker(Broker):
             # TODO: One day... I will purge all this crypto tuple stuff.
             asset = order.asset if order.asset.asset_type != "crypto" else (order.asset, order.quote)
 
+            batch_id = str(uuid.uuid4())
             price = None
             filled_quantity = order.quantity
             timeshift = None

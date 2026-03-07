@@ -34,11 +34,11 @@ else
 fi
 
 if [ "$USE_UV" = "1" ]; then
-  uv pip install requests ruff
+  uv pip install requests ruff pytest-mock
   uv pip install -r requirements.resolved.txt
 else
   python -m pip install --upgrade pip
-  pip install requests ruff
+  pip install requests ruff pytest-mock
   pip install -r requirements.resolved.txt
 fi
 

@@ -915,19 +915,8 @@ class Data:
                 f"The data object for {self.asset} does not have the necessary columns to get the quote. Please make sure that the data object has at least the following columns: open, high, low, close, and volume. This could be an issue with the data source or the data itself, consider changing the data source you are using or check that the data you are looking for exists in the data source."
             )
         
-        # Check if this data object has bid and ask
-        if not all(
-            [
-                "bid" in self.datalines,
-                "ask" in self.datalines,
-                "bid_size" in self.datalines,
-                "bid_condition" in self.datalines,
-                "bid_exchange" in self.datalines,
-                "ask_size" in self.datalines,
-                "ask_condition" in self.datalines,
-                "ask_exchange" in self.datalines,
-            ]
-        ):
+        # Require at least bid and ask for quote; other quote fields (bid_size, ask_size, etc.) are optional.
+        if "bid" not in self.datalines or "ask" not in self.datalines:
             raise ValueError(
                 f"The data object for {self.asset} does not have the necessary columns to get the quote. Please make sure that the data object has at least the following columns: bid and ask. This could be an issue with the data source or the data itself, consider changing the data source you are using or check that the data you are looking for exists in the data source. For example, Polygon does not provide bid and ask data."
             )
@@ -939,11 +928,16 @@ class Data:
                 return None
             value = self.datalines[column].dataline[iter_count]
             try:
+                if pd.isna(value):
+                    return None
+            except (TypeError, ValueError):
+                pass
+            try:
                 if round_digits is None:
                     return value
                 return round(value, round_digits)
             except TypeError:
-                return value
+                return None
 
         quote_dict = {name: _get_value(column, digits) for name, (column, digits) in _DATA_QUOTE_FIELDS.items()}
 
