@@ -56,7 +56,7 @@ jobs:
         run: |
           echo "Set AIOHTTP_NO_EXTENSIONS=$AIOHTTP_NO_EXTENSIONS so that aiohttp doesn't try to install C extensions"
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests ruff
           # Pip does not expand env vars in requirements.txt. Substitute GIT_TOKEN or omit private FPAP line.
           if [ -n "$GIT_TOKEN" ]; then
             sed 's/\$\${GIT_TOKEN}/'"$GIT_TOKEN"'/g' requirements.txt > requirements.resolved.txt
