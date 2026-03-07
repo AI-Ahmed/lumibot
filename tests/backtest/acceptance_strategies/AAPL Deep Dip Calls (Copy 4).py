@@ -1,24 +1,3 @@
-################################################################################
-# Must Be Imported First If Run Locally
-if True:
-    import os
-    import sys
-
-    myPath = os.path.dirname(os.path.abspath(__file__))
-    sys.path.insert(
-        0, 
-        "/Users/robertgrzesik/Documents/Development/lumivest_bot_server/strategies/lumibot"
-    )
-    sys.path.insert(
-        0,
-        "/Users/robertgrzesik/Development/lumiwealth_tradier/",
-    )
-    sys.path.insert(
-        0,
-        "/Users/robertgrzesik/Development/quantstats_lumi/"
-    )
-################################################################################
-
 from datetime import timedelta, date
 import math
 from decimal import Decimal
@@ -367,7 +346,7 @@ if __name__ == "__main__":
         # "recovery_exit_pct": 0.25,  # Removed per request
         "hold_duration_days": 365,     # exit after ~1 year hold
         "otm_pct": 0.20,
-        "target_exp_days": 680,  # ~22.5 months to target January LEAPS (2022-01-21 from March 2020)
+        "tar¬¬get_exp_days": 680,  # ~22.5 months to target January LEAPS (2022-01-21 from March 2020)
         "risk_per_trade": 0.95,
         "max_contracts": 50,
         "stop_loss_pct": 0.50,

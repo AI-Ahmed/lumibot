@@ -9,7 +9,13 @@ import pytest
 from lumibot.backtesting import PandasDataBacktesting
 from lumibot.strategies.strategy import Strategy
 from lumibot.entities import Asset
-from lumibot.tools.indicators import _build_trade_marker_tooltip, plot_indicators, plot_returns
+from lumibot.tools.indicators import (
+    _build_trade_marker_tooltip,
+    _format_grouped_trade_tooltip,
+    _format_positions_for_hover,
+    plot_indicators,
+    plot_returns,
+)
 
 from tests.fixtures import pandas_data_fixture
 
@@ -209,6 +215,197 @@ def test_cash_settled_tooltip_generated_without_trade_cost():
 
 def test_non_terminal_status_filtered_out():
     assert _build_trade_marker_tooltip(_make_trade_row_for_tooltip("new", trade_cost=pd.NA)) is None
+
+
+class TestFormatGroupedTradeTooltip:
+    """Unit tests for _format_grouped_trade_tooltip."""
+
+    def test_empty_list_returns_empty_string(self):
+        assert _format_grouped_trade_tooltip([], "Bought") == ""
+        assert _format_grouped_trade_tooltip([], "Sold") == ""
+
+    def test_single_item_returned_as_is(self):
+        text = "AAPL 100 shares @ $150.00"
+        assert _format_grouped_trade_tooltip([text], "Bought") == text
+        assert _format_grouped_trade_tooltip([text], "Sold") == text
+
+    def test_multi_item_prepends_header_and_wraps_each(self):
+        texts = ["Order 1 details", "Order 2 details", "Order 3 details"]
+        result = _format_grouped_trade_tooltip(texts, "Bought")
+        assert "Bought (3 orders)" in result
+        assert "─── Order 1 of 3 ───" in result
+        assert "─── Order 2 of 3 ───" in result
+        assert "─── Order 3 of 3 ───" in result
+        assert "Order 1 details" in result
+        assert "Order 2 details" in result
+        assert "Order 3 details" in result
+
+    def test_multi_item_sold_uses_sold_header(self):
+        texts = ["Sell 1", "Sell 2"]
+        result = _format_grouped_trade_tooltip(texts, "Sold")
+        assert "Sold (2 orders)" in result
+        assert "─── Order 1 of 2 ───" in result
+        assert "─── Order 2 of 2 ───" in result
+
+
+class TestFormatPositionsForHover:
+    """Unit tests for _format_positions_for_hover."""
+
+    def test_none_returns_no_positions(self):
+        assert _format_positions_for_hover(None) == "No positions"
+
+    def test_nan_returns_no_positions(self):
+        import numpy as np
+
+        assert _format_positions_for_hover(float("nan")) == "No positions"
+        assert _format_positions_for_hover(np.nan) == "No positions"
+
+    def test_pd_na_returns_no_positions(self):
+        assert _format_positions_for_hover(pd.NA) == "No positions"
+
+    def test_empty_list_returns_no_positions(self):
+        assert _format_positions_for_hover([]) == "No positions"
+
+    def test_single_position_dict(self):
+        result = _format_positions_for_hover([{"asset": "X", "quantity": 1}])
+        assert "X" in result
+        assert "1.00" in result
+
+    def test_multiple_positions(self):
+        result = _format_positions_for_hover(
+            [
+                {"asset": "AAPL", "quantity": 10},
+                {"asset": "GOOG", "quantity": 5.5},
+            ]
+        )
+        assert "AAPL" in result
+        assert "10.00" in result
+        assert "GOOG" in result
+        assert "5.50" in result
+
+
+def test_plot_returns_without_positions_column(tmp_path, monkeypatch):
+    """Regression: strategy_df without 'positions' column must not raise KeyError."""
+    plot_path = tmp_path / "plot_no_positions.html"
+    _orig_write_html = go.Figure.write_html
+
+    def _fake_write_html(self, file, auto_open=True, **kwargs):
+        return _orig_write_html(self, file, auto_open=False, **kwargs)
+
+    monkeypatch.setattr(go.Figure, "write_html", _fake_write_html, raising=False)
+
+    idx = pd.to_datetime(["2025-01-01", "2025-01-02"]).tz_localize("UTC")
+    strategy_df = pd.DataFrame(
+        {"return": [0.0, 0.01], "cash": [100000, 101000]},
+        index=idx,
+    )
+    benchmark_df = pd.DataFrame(
+        {
+            "return": [0.0, 0.005],
+            "open": [1.0, 1.0],
+            "high": [1.0, 1.0],
+            "low": [1.0, 1.0],
+            "close": [1.0, 1.005],
+        },
+        index=idx,
+    )
+
+    plot_returns(
+        strategy_df,
+        "Strategy",
+        benchmark_df,
+        "Benchmark",
+        plot_file_html=str(plot_path),
+        trades_df=None,
+        show_plot=True,
+        initial_budget=100000,
+    )
+
+    assert plot_path.with_suffix(".html").exists()
+    assert plot_path.with_suffix(".csv").exists()
+
+
+def test_plot_returns_multi_buy_same_timestamp(tmp_path, monkeypatch):
+    """Multiple buys at same datetime produce tooltip with 'Bought (N orders)' and '─── Order'."""
+    plot_path = tmp_path / "plot_multi_buy.html"
+    _orig_write_html = go.Figure.write_html
+
+    def _fake_write_html(self, file, auto_open=True, **kwargs):
+        return _orig_write_html(self, file, auto_open=False, **kwargs)
+
+    monkeypatch.setattr(go.Figure, "write_html", _fake_write_html, raising=False)
+
+    idx = pd.to_datetime(
+        ["2025-09-01 09:30:00-04:00", "2025-09-01 10:00:00-04:00", "2025-09-01 10:30:00-04:00"]
+    ).tz_convert("UTC")
+
+    strategy_df = pd.DataFrame(
+        {"return": [0.0, 0.0, 0.0], "cash": [100000, 99000, 98000], "positions": [[], [], []]},
+        index=idx,
+    )
+    benchmark_df = pd.DataFrame(
+        {
+            "return": [0.0, 0.0, 0.0],
+            "open": [1.0, 1.0, 1.0],
+            "high": [1.0, 1.0, 1.0],
+            "low": [1.0, 1.0, 1.0],
+            "close": [1.0, 1.0, 1.0],
+        },
+        index=idx,
+    )
+
+    # Two buys at same timestamp (10:00)
+    trades_df = pd.DataFrame(
+        [
+            {
+                "time": "2025-09-01 10:00:00-04:00",
+                "side": "buy",
+                "status": "filled",
+                "filled_quantity": 10,
+                "symbol": "AAPL",
+                "asset.asset_type": "stock",
+                "asset.right": pd.NA,
+                "asset.strike": pd.NA,
+                "asset.expiration": pd.NA,
+                "price": 150.0,
+                "type": "market",
+                "asset.multiplier": 1,
+                "trade_cost": 0,
+            },
+            {
+                "time": "2025-09-01 10:00:00-04:00",
+                "side": "buy",
+                "status": "filled",
+                "filled_quantity": 5,
+                "symbol": "GOOG",
+                "asset.asset_type": "stock",
+                "asset.right": pd.NA,
+                "asset.strike": pd.NA,
+                "asset.expiration": pd.NA,
+                "price": 140.0,
+                "type": "market",
+                "asset.multiplier": 1,
+                "trade_cost": 0,
+            },
+        ]
+    )
+
+    plot_returns(
+        strategy_df,
+        "Strategy",
+        benchmark_df,
+        "Benchmark",
+        plot_file_html=str(plot_path),
+        trades_df=trades_df,
+        show_plot=True,
+        initial_budget=100000,
+    )
+
+    assert plot_path.exists()
+    html = plot_path.read_text()
+    assert "Bought (2 orders)" in html
+    # Order labels (Unicode box-drawing may appear escaped in HTML/JSON)
+    assert "Order 1 of 2" in html
 
 
 def test_plot_returns_preserves_cash_settled_status(tmp_path, monkeypatch):

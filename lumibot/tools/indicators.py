@@ -217,6 +217,58 @@ def _build_trade_marker_tooltip(row: pd.Series):
     )
 
 
+def _format_grouped_trade_tooltip(texts, side):
+    """Format grouped trade tooltips for multiple orders at same timestamp.
+
+    Single text: return as-is. Multiple: prepend "Bought (N orders)" or "Sold (N orders)",
+    wrap each with "─── Order i of N ───".
+
+    Parameters
+    ----------
+    texts : list of str
+        Per-trade tooltip strings (from _build_trade_marker_tooltip).
+    side : str
+        "Bought" or "Sold".
+
+    Returns
+    -------
+    str
+        Formatted tooltip string.
+    """
+    if not texts:
+        return ""
+    if len(texts) == 1:
+        return texts[0]
+    n = len(texts)
+    header = f"{side} ({n} orders)<br>"
+    parts = []
+    for i, t in enumerate(texts, 1):
+        parts.append(f"─── Order {i} of {n} ───<br>{t}")
+    return header + "<br>".join(parts)
+
+
+def _format_positions_for_hover(positions):
+    """Format positions for strategy line hover tooltip.
+
+    Handles None, np.nan, pd.NA, list of dicts, and single dict.
+    """
+    if positions is None:
+        return "No positions"
+    if not isinstance(positions, (list, dict)) and pd.isna(positions):
+        return "No positions"
+    if isinstance(positions, list):
+        if len(positions) == 0:
+            return "No positions"
+        formatted_positions = [
+            f"{pos.get('asset', 'Unknown asset')}: {pos.get('quantity', 0):,.2f}"
+            for pos in positions
+        ]
+        return "<br>".join(formatted_positions)
+    if isinstance(positions, dict):
+        return f"{positions.get('asset', 'Unknown asset')}: {positions.get('quantity', 0):,.2f}"
+    return "No positions"
+
+
 def total_return(_df):
     """Calculate the cumulative return in a dataframe
     The dataframe _df must include a column "return" that
@@ -1340,19 +1392,13 @@ def plot_returns(
     # fig = go.Figure()
     fig = make_subplots(specs=[[{"secondary_y": True}]])
 
-    # Updated format_positions function to handle lists and dicts
-    def format_positions(positions):
-        if isinstance(positions, list):
-            formatted_positions = [
-                f"{pos.get('asset', 'Unknown asset')}: {pos.get('quantity', 0):,.2f}" for pos in positions
-            ]
-            return "<br>".join(formatted_positions)
-        elif isinstance(positions, dict):
-            return f"{positions.get('asset', 'Unknown asset')}: {positions.get('quantity', 0):,.2f}"
-        return "No positions"
-
     # Manually create a list of formatted positions
-    formatted_positions_list = [format_positions(pos) for pos in df_final["positions"]]
+    positions_col = (
+        df_final["positions"]
+        if "positions" in df_final.columns
+        else pd.Series([[]] * len(df_final), index=df_final.index)
+    )
+    formatted_positions_list = [_format_positions_for_hover(pos) for pos in positions_col]
 
     # Modify the strategy line to include positions
     fig.add_trace(
@@ -1364,7 +1410,7 @@ def plot_returns(
             connectgaps=True,
             hovertemplate=(
                 f"{strategy_name}<br>"
-                "Portfolio Value: %{y:$,.4f}<br>"
+                "Portfolio Value: %{y:$,.2f}<br>"
                 "%{x|%b %d %Y %I:%M:%S %p}<br>"
                 "Positions:<br>"
                 "%{text}<extra></extra>"
@@ -1452,24 +1498,36 @@ def plot_returns(
 
         # Remove any rows that have a None value for plotly_text_buys
         buys = buys.loc[buys["plotly_text_buys"].notnull()]
+        n_buys = len(buys)
 
         buys.index.name = "datetime"
-        buys = (
-            buys.groupby(["datetime", strategy_name])["plotly_text_buys"].apply(lambda x: "<br>".join(x)).reset_index()
+        text_agg = (
+            buys.groupby(["datetime", strategy_name])["plotly_text_buys"]
+            .apply(lambda x: _format_grouped_trade_tooltip(list(x), "Bought"))
+            .reset_index()
         )
-        buys = buys.set_index("datetime")
+        count_agg = (
+            buys.groupby(["datetime", strategy_name])["plotly_text_buys"]
+            .agg(len)
+            .reset_index()
+            .rename(columns={"plotly_text_buys": "_count"})
+        )
+        buys = text_agg.merge(count_agg, on=["datetime", strategy_name])
+        buys["marker_size"] = 15 + np.minimum(4 * (buys["_count"] - 1), 15).astype(int)
+        buys = buys.drop(columns=["_count"]).set_index("datetime")
         buys["buy_shift"] = buys[strategy_name] - vshift
+        buy_trace_name = f"buy ({n_buys} trades)" if n_buys else "buy"
         fig.add_trace(
             go.Scatter(
                 x=buys.index,
                 y=buys["buy_shift"],
                 mode="markers",
-                name="buy",
+                name=buy_trace_name,
                 marker_symbol="triangle-up",
                 marker_color="green",
-                marker_size=15,
+                marker_size=buys["marker_size"].tolist(),
                 hovertemplate="Bought<br>%{text}<br>%{x|%b %d %Y %I:%M:%S %p}<extra></extra>",
-                text=buys["plotly_text_buys"],
+                text=buys["plotly_text_buys"].tolist(),
             )
         )
 
@@ -1491,26 +1549,37 @@ def plot_returns(
 
         # Remove any rows that have a None value for plotly_text_sells
         sells = sells.loc[sells["plotly_text_sells"].notnull()]
+        n_sells = len(sells)
 
         sells.index.name = "datetime"
-        sells = (
+        text_agg = (
             sells.groupby(["datetime", strategy_name], group_keys=True)["plotly_text_sells"]
-            .apply(lambda x: "<br>".join(x))
+            .apply(lambda x: _format_grouped_trade_tooltip(list(x), "Sold"))
             .reset_index()
         )
+        count_agg = (
+            sells.groupby(["datetime", strategy_name], group_keys=True)["plotly_text_sells"]
+            .agg(len)
+            .reset_index()
+            .rename(columns={"plotly_text_sells": "_count"})
+        )
+        sells = text_agg.merge(count_agg, on=["datetime", strategy_name])
+        sells["marker_size"] = 15 + np.minimum(4 * (sells["_count"] - 1), 15).astype(int)
+        sells = sells.drop(columns=["_count"])
         sells = sells.set_index("datetime")
         sells["sell_shift"] = sells[strategy_name] + vshift
+        sell_trace_name = f"sell ({n_sells} trades)" if n_sells else "sell"
         fig.add_trace(
             go.Scatter(
                 x=sells.index,
                 y=sells["sell_shift"],
                 mode="markers",
-                name="sell",
+                name=sell_trace_name,
                 marker_color="red",
-                marker_size=15,
+                marker_size=sells["marker_size"].tolist(),
                 marker_symbol="triangle-down",
                 hovertemplate="Sold<br>%{text}<br>%{x|%b %d %Y %I:%M:%S %p}<extra></extra>",
-                text=sells["plotly_text_sells"],
+                text=sells["plotly_text_sells"].tolist(),
             )
         )
 
