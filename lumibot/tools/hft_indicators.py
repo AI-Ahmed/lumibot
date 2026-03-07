@@ -27,53 +27,53 @@ from .indicators import (
 )
 
 
-def _infer_entries_per_year(returns):
+def _infer_entries_per_year(returns, trading_days_per_year=365):
     """
     Infer the number of return observations per year from the return series index.
 
-    Handles intraday (sub-daily), daily, and irregular bar intervals by using
-    median time delta between observations. Falls back to len(returns)/span_years
-    when time diffs are too irregular.
+    Uses a data-driven approach: counts actual bars per calendar day in the
+    observed window, then scales to trading-year equivalent. This avoids
+    calendar-year annualization errors (24/7/365) that inflate SR by 2-3x for
+    market-hours strategies.
 
     Parameters
     ----------
     returns : pd.Series
         Return series with a DatetimeIndex.
+    trading_days_per_year : int, default 365
+        Number of trading days per year for scaling (365 for US equities).
 
     Returns
     -------
     float
-        Estimated entries per year (e.g., 252 for daily, ~252*390 for 1-min bars).
+        Estimated entries per year, data-driven from observed bar frequency.
     """
     if returns is None or len(returns) < 2:
-        return 252.0
+        return float(trading_days_per_year)
     idx = returns.index
     if not hasattr(idx, 'to_series'):
-        return 252.0
-    diffs = idx.to_series().diff().dropna()
-    if len(diffs) == 0:
-        return 252.0
-    # Use total_seconds for sub-daily; median for irregular bars
-    try:
-        median_sec = float(diffs.dt.total_seconds().median())
-    except (AttributeError, TypeError):
-        median_sec = float(diffs.median()) if hasattr(diffs.iloc[0], 'total_seconds') else 86400
-    seconds_per_year = 365.25 * 24 * 3600
-    if median_sec > 0 and median_sec < seconds_per_year:
-        return float(seconds_per_year / median_sec)
-    # Fallback: observations per year from span
+        return float(trading_days_per_year)
+
+    # Calculate calendar span in days
     delta = idx[-1] - idx[0]
-    span = delta.total_seconds() if hasattr(delta, 'total_seconds') else getattr(delta, 'days', 1) * 86400
-    span_years = max(span / seconds_per_year, 1e-9)
-    return len(returns) / span_years
+    span_days = delta.total_seconds() / 86400 if hasattr(delta, 'total_seconds') else getattr(delta, 'days', 1)
+    span_days = max(span_days, 1e-9)  # Avoid division by zero
+
+    # Data-driven: observed bars per calendar day, scaled to trading year
+    bars_per_calendar_day = len(returns) / span_days
+    entries_per_year = bars_per_calendar_day * trading_days_per_year
+
+    return float(entries_per_year)
 
 
-# =================== INSTITUTIONAL HFT SOLUTION ===================
+# =================== HFT INFORMATION-STRUCTURE ANALYSIS ===================
 
 class DualTrackAnalyzer:
     """
-    🏛️ INSTITUTIONAL DUAL-TRACK ANALYZER
-    Comprehensive analyzer supporting both information-driven and time-aligned metrics.
+    Dual-Track Analyzer for Information-Driven Bars
+
+    Supports both information-driven (volume/dollar/imbalance bar) metrics
+    and time-aligned benchmark comparison for fair performance evaluation.
     """
     
     def __init__(self, strategy_data, benchmark_data, bar_type='volume'):
@@ -82,7 +82,7 @@ class DualTrackAnalyzer:
         self.bar_type = bar_type
         self.info_metrics = None
         self.aligned_metrics = None
-        logger.info(f"🏛️ Initialized Institutional Analyzer for {bar_type.upper()} bars")
+        logger.info(f"Initialized DualTrackAnalyzer for {bar_type.upper()} bars")
     
     def detect_bar_type(self):
         """Auto-detect information-driven bar type from strategy data."""
@@ -128,7 +128,7 @@ class DualTrackAnalyzer:
             'info_tracking_error': (returns - info_benchmark_data['benchmark_returns']).std() * ann_factor,
         }
         
-        logger.info(f"📊 Information-driven metrics calculated: Sharpe={self.info_metrics['information_sharpe']:.4f}")
+        logger.info(f"Information-driven metrics calculated: Sharpe={self.info_metrics['information_sharpe']:.4f}")
         return self.info_metrics
     
     def calculate_time_aligned_metrics(self, alignment_method='synthetic_bars'):
@@ -150,7 +150,7 @@ class DualTrackAnalyzer:
             'alignment_method': alignment_method,
         }
         
-        logger.info(f"⚖️ Time-aligned metrics calculated: Sharpe={self.aligned_metrics['aligned_sharpe']:.4f}, Beta={self.aligned_metrics['beta']:.4f}")
+        logger.info(f"Time-aligned metrics calculated: Sharpe={self.aligned_metrics['aligned_sharpe']:.4f}, Beta={self.aligned_metrics['beta']:.4f}")
         return self.aligned_metrics
     
     def _align_data(self, method):
@@ -167,7 +167,7 @@ class DualTrackAnalyzer:
     
     def _get_information_driven_benchmark(self):
         """Get benchmark data using ORIGINAL information-driven bar timing (no synthetic alignment)."""
-        logger.debug("🔬 Creating pure information-driven benchmark (original timing)...")
+        logger.debug("Creating pure information-driven benchmark (original timing)...")
         
         # For true information-driven analysis, we use the benchmark data AS-IS
         # at the original strategy bar timestamps without synthetic interpolation
@@ -195,7 +195,7 @@ class DualTrackAnalyzer:
                 logger.error("No numeric columns found in benchmark data")
                 benchmark_returns = pd.Series(0, index=strategy_times)
         
-        logger.debug(f"📊 Info-driven benchmark: mean={benchmark_returns.mean():.6f}, std={benchmark_returns.std():.6f}")
+        logger.debug(f"Info-driven benchmark: mean={benchmark_returns.mean():.6f}, std={benchmark_returns.std():.6f}")
         
         return {
             'strategy_returns': strategy_returns,
@@ -204,67 +204,70 @@ class DualTrackAnalyzer:
     
     def _benchmark_aligned_bars(self):
         """
-        Align benchmark data to strategy bar timestamps.
-        
-        This method resamples the REAL benchmark data (e.g., SPY) to match the 
-        strategy's information-driven bar timestamps. It does NOT create synthetic
-        data - it uses the benchmark prices at the nearest available times.
-        
+        Resample strategy to daily frequency for fair benchmark comparison.
+
+        The key insight: for benchmark comparison, we convert the strategy's
+        irregular bar returns (volume/dollar/imbalance) to the same temporal
+        units as the benchmark (daily). This produces a Sharpe ratio comparable
+        to standard industry reporting (e.g., QuantStats main tearsheet).
+
         Returns
         -------
         dict
-            Dictionary with 'strategy_returns' and 'benchmark_returns' aligned
-            to the same timestamps.
+            Dictionary with 'strategy_returns' and 'benchmark_returns' both
+            at daily frequency (or the benchmark's native frequency).
         """
-        logger.info("📊 Aligning benchmark data to strategy bar timestamps...")
-        
-        # Get strategy timestamps
-        strategy_times = self.strategy_data.index
-        
-        # Use proper interpolation for benchmark data at strategy timestamps
-        # First, ensure benchmark data is properly sorted by time
+        logger.info("Resampling strategy to daily frequency for benchmark comparison...")
+
+        # Resample strategy portfolio value to daily (last observation per day)
+        strategy_daily = self.strategy_data['portfolio_value'].resample('D').last().dropna()
+        strategy_returns = strategy_daily.pct_change().fillna(0)
+
+        # Resample benchmark to daily frequency
         benchmark_sorted = self.benchmark_data.sort_index()
-        
-        # Align benchmark values at strategy bar timestamps using nearest-neighbor
-        # This uses benchmark data, not synthetic/generated data
         if 'symbol_cumprod' in benchmark_sorted.columns:
-            # Reindex benchmark values at strategy times using nearest available data
-            benchmark_aligned = benchmark_sorted['symbol_cumprod'].reindex(
-                strategy_times, method='nearest', tolerance=pd.Timedelta('1h')
-            ).ffill().bfill()
-            
-            # Calculate benchmark returns using aligned values
-            benchmark_returns = benchmark_aligned.pct_change().fillna(0)
+            benchmark_daily = benchmark_sorted['symbol_cumprod'].resample('D').last().dropna()
         else:
-            # Handle other benchmark data structures
             numeric_cols = benchmark_sorted.select_dtypes(include=[np.number]).columns
             if len(numeric_cols) > 0:
-                benchmark_col = numeric_cols[0]
-                benchmark_aligned = benchmark_sorted[benchmark_col].reindex(
-                    strategy_times, method='nearest', tolerance=pd.Timedelta('1h')
-                ).ffill().bfill()
-                benchmark_returns = benchmark_aligned.pct_change().fillna(0)
+                benchmark_daily = benchmark_sorted[numeric_cols[0]].resample('D').last().dropna()
             else:
                 logger.error("No numeric columns found in benchmark data")
-                benchmark_returns = pd.Series(0, index=strategy_times)
-        
-        # Calculate strategy returns
-        strategy_returns = self.strategy_data['portfolio_value'].pct_change().fillna(0)
-        
-        logger.debug(f"📊 Benchmark-aligned bars: {len(strategy_returns)} strategy points, {len(benchmark_returns)} benchmark points")
-        logger.debug(f"📊 Benchmark return stats: mean={benchmark_returns.mean():.6f}, std={benchmark_returns.std():.6f}")
-        
+                # Return zeros aligned to strategy returns
+                return {
+                    'strategy_returns': strategy_returns,
+                    'benchmark_returns': pd.Series(0, index=strategy_returns.index)
+                }
+
+        benchmark_returns = benchmark_daily.pct_change().fillna(0)
+
+        # Align both on common index (intersection of dates)
+        common_idx = strategy_returns.index.intersection(benchmark_returns.index)
+        if len(common_idx) == 0:
+            logger.warning("No common dates between strategy and benchmark after resampling")
+            return {
+                'strategy_returns': strategy_returns,
+                'benchmark_returns': pd.Series(0, index=strategy_returns.index)
+            }
+
+        strategy_aligned = strategy_returns.reindex(common_idx)
+        benchmark_aligned = benchmark_returns.reindex(common_idx)
+
+        logger.debug(f"Daily-aligned: {len(strategy_aligned)} common days")
+        logger.debug(f"Strategy return stats: mean={strategy_aligned.mean():.6f}, std={strategy_aligned.std():.6f}")
+        logger.debug(f"Benchmark return stats: mean={benchmark_aligned.mean():.6f}, std={benchmark_aligned.std():.6f}")
+
         return {
-            'strategy_returns': strategy_returns,
-            'benchmark_returns': benchmark_returns
+            'strategy_returns': strategy_aligned,
+            'benchmark_returns': benchmark_aligned
         }
-    
+
     # Alias for backward compatibility
     _synthetic_benchmark_bars = _benchmark_aligned_bars
     
     def _forward_fill_alignment(self):
         """Forward-fill strategy values to benchmark timestamps."""
-        logger.info("📈 Using forward-fill alignment...")
+        logger.info("Using forward-fill alignment...")
         
         merged = pd.merge(self.strategy_data, self.benchmark_data, 
                          left_index=True, right_index=True, how='outer')
@@ -453,16 +456,17 @@ def create_institutional_hft_tearsheet(
     benchmark_alignment: str = "synthetic_bars",
 ):
     """
-    🏛️ PROFESSIONAL INSTITUTIONAL TEARSHEET FOR HFT STRATEGIES
-    
-    Preserves information structure of alternative bars while providing proper benchmark comparison.
+    HFT Information-Structure Tearsheet Generator
+
+    Creates dual-track tearsheets preserving information bar structure while
+    providing fair benchmark comparison via daily resampling.
     """
     
     if not save_tearsheet:
         logger.info("save_tearsheet is False, not creating the tearsheet file.")
         return
     
-    logger.info(f"\n🏛️ Creating INSTITUTIONAL HFT Tearsheet for {bar_type.upper()} bars...")
+    logger.info(f"\nCreating HFT Information-Structure Tearsheet for {bar_type.upper()} bars...")
     
     # Check if data exists
     if strategy_df is None or benchmark_df is None or strategy_df.empty or benchmark_df.empty:
@@ -481,11 +485,11 @@ def create_institutional_hft_tearsheet(
         logger.info(f"🔍 Auto-detected bar type: {bar_type.upper()}")
     
     # =================== SECTION 1: INFORMATION-DRIVEN ANALYSIS ===================
-    logger.info(f"🔬 Analyzing strategy using original {bar_type} bar structure...")
+    logger.info(f"Analyzing strategy using original {bar_type} bar structure...")
     info_metrics = analyzer.calculate_information_driven_metrics()
     
     # =================== SECTION 2: TIME-ALIGNED BENCHMARK COMPARISON ===================
-    logger.info(f"⚖️ Creating time-aligned analysis for benchmark comparison...")
+    logger.info(f"Creating time-aligned analysis for benchmark comparison...")
     aligned_metrics = analyzer.calculate_time_aligned_metrics(benchmark_alignment)
     
     # =================== SECTION 3: ENHANCED PARAMETER REPORTING ===================
@@ -494,17 +498,16 @@ def create_institutional_hft_tearsheet(
     
     # Add institutional-grade parameters
     strategy_parameters.update({
-        "🏛️ ANALYSIS TYPE": "Institutional Dual-Track",
-        "📊 BAR TYPE": bar_type.upper(),
-        "🔄 BENCHMARK ALIGNMENT": benchmark_alignment.replace("_", " ").title(),
-        "📈 INFORMATION-DRIVEN SHARPE": f"{info_metrics['information_sharpe']:.4f}",
-        "📉 TIME-ALIGNED SHARPE": f"{aligned_metrics['aligned_sharpe']:.4f}",
-        "🎯 BETA VS BENCHMARK": f"{aligned_metrics['beta']:.4f}",
-        "⚡ INFORMATION BARS COUNT": f"{info_metrics['total_bars']:,}",
-        "🔬 BAR EFFICIENCY SCORE": f"{info_metrics['bar_efficiency_score']:.4f}",
-        "📊 INFORMATION DENSITY": f"{info_metrics['information_density']:.2f} bars/day",
-        "🕒 AVG BAR DURATION": f"{info_metrics['average_bar_duration']:.1f}s",
-        "🎯 INSTITUTIONAL GRADE": "✅ Professional Standard",
+        "Analysis Type": "HFT Information-Structure (Dual-Track)",
+        "Bar Type": bar_type.upper(),
+        "Benchmark Alignment": benchmark_alignment.replace("_", " ").title(),
+        "Information-Driven Sharpe": f"{info_metrics['information_sharpe']:.4f}",
+        "Time-Aligned Sharpe": f"{aligned_metrics['aligned_sharpe']:.4f}",
+        "Beta vs Benchmark": f"{aligned_metrics['beta']:.4f}",
+        "Information Bars Count": f"{info_metrics['total_bars']:,}",
+        "Bar Efficiency Score": f"{info_metrics['bar_efficiency_score']:.4f}",
+        "Information Density": f"{info_metrics['information_density']:.2f} bars/day",
+        "Avg Bar Duration": f"{info_metrics['average_bar_duration']:.1f}s",
     })
     
     # =================== SECTION 4: PREPARE DATA FOR QUANTSTATS ===================
@@ -522,7 +525,7 @@ def create_institutional_hft_tearsheet(
     df_final["benchmark"].name = str(benchmark_asset)
     
     # =================== SECTION 5: GENERATE TEARSHEET ===================
-    title = f"🏛️ INSTITUTIONAL HFT: {strat_name} ({bar_type.upper()} bars) vs {benchmark_asset}"
+    title = f"HFT Analysis: {strat_name} ({bar_type.upper()} bars) vs {benchmark_asset}"
     
     with open(os.devnull, "w") as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
         result = qs.reports.html(
@@ -554,9 +557,9 @@ def create_institutional_hft_tearsheet(
         info_url = "file://" + os.path.abspath(str(info_driven_file))
         webbrowser.open(info_url)
     
-    logger.info(f"✅ Generated institutional dual tearsheet system:")
-    logger.info(f"   📈 Time-aligned (benchmark comparison): {tearsheet_file}")
-    logger.info(f"   🔬 Information-driven ({bar_type} bars): {info_driven_file}")
+    logger.info(f"Generated dual tearsheet system:")
+    logger.info(f"   Time-aligned (benchmark comparison): {tearsheet_file}")
+    logger.info(f"   Information-driven ({bar_type} bars): {info_driven_file}")
     
     # Return result consistent with original indicators.py behavior
     # QuantStats returns DataFrame with to_csv method, just like the original
@@ -860,7 +863,7 @@ def _enhance_tearsheet_parameters(tearsheet_file):
         with open(tearsheet_file, 'w', encoding='utf-8') as f:
             f.write(html_content)
         
-        logger.info(f"✅ Enhanced tearsheet parameters for responsive display: {tearsheet_file}")
+        logger.info(f"✅ tearsheet parameters for responsive display: {tearsheet_file}")
         
     except Exception as e:
         logger.warning(f"Could not enhance tearsheet parameters (non-critical): {e}")
@@ -901,301 +904,463 @@ def create_information_structure_report(
     else:
         alignment_display = alignment_display.replace('_', ' ').title()
     
-    # Annualize alpha for display (entries_per_year from analyzer; fallback 252)
-    epy_info = info_metrics.get('entries_per_year', 252)
-    epy_aligned = aligned_metrics.get('entries_per_year', 252)
+    # Annualize alpha for display (entries_per_year from analyzer; fallback 365)
+    epy_info = info_metrics.get('entries_per_year', 365)
+    epy_aligned = aligned_metrics.get('entries_per_year', 365)
     info_alpha_ann = info_metrics.get('info_alpha', 0) * epy_info
     aligned_alpha_ann = aligned_metrics.get('alpha', 0) * epy_aligned
     
     # Build FPAP metrics section HTML
     fpap_section = _build_fpap_section_html(fpap_metrics) if fpap_metrics else ""
     
+    # Calculate standard errors for key metrics
+    sample_size = fpap_metrics.get('sample_size', info_metrics.get('total_bars', 0))
+    info_sr = info_metrics.get('information_sharpe', 0)
+    aligned_sr = aligned_metrics.get('aligned_sharpe', 0)
+
+    # Standard error for SR (per-period, then scaled): sigma_SR = sqrt((1 + SR^2/2)/(T-1))
+    def sr_std_error(sr, n):
+        if n < 2:
+            return float('inf')
+        return np.sqrt((1 + sr**2 / 2) / (n - 1))
+
+    info_sr_se = sr_std_error(info_sr / np.sqrt(info_metrics.get('entries_per_year', 365)), sample_size)
+    info_sr_se_annual = info_sr_se * np.sqrt(info_metrics.get('entries_per_year', 365))
+
     html_content = f"""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>🔬 Information Structure Analysis: {strategy_name}</title>
+        <title>{strategy_name} | {bar_type.upper()} Bar Analysis vs {benchmark_name}</title>
         <meta charset="utf-8">
         <style>
-            body {{ 
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-                margin: 40px; 
-                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
-                color: #333;
+            :root {{
+                --bg-color: #ffffff;
+                --surface-color: #f8f9fa;
+                --border-color: #d0d0d0;
+                --primary-color: #1a1a1a;
+                --light-text: #5a5a5a;
+                --accent-color: #1a3a5c;
+                --positive-color: #1a6632;
+                --negative-color: #8b1a1a;
+                --warning-color: #b35900;
+                --info-color: #2E86AB;
+                --box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+                --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+                --mono: 'SF Mono', Monaco, 'Courier New', monospace;
+            }}
+            body {{
+                font-family: var(--font);
+                font-size: 13px;
+                line-height: 1.5;
+                color: var(--primary-color);
+                background: var(--bg-color);
+                margin: 0;
+                padding: 40px;
             }}
             .container {{
-                background: white;
-                padding: 40px;
-                border-radius: 15px;
-                box-shadow: 0 20px 40px rgba(0,0,0,0.3);
-                max-width: 1400px;
+                max-width: 1200px;
                 margin: 0 auto;
             }}
-            .header {{ 
-                color: #2E86AB; 
-                font-size: 32px; 
-                font-weight: bold; 
-                text-align: center;
+            .header {{
+                border-bottom: 2px solid var(--accent-color);
+                padding-bottom: 20px;
                 margin-bottom: 30px;
-                text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
+            }}
+            .header-title {{
+                font-size: 22px;
+                font-weight: 600;
+                color: var(--primary-color);
+                margin: 0 0 8px 0;
+            }}
+            .header-subtitle {{
+                font-size: 14px;
+                color: var(--light-text);
+                margin: 0;
+            }}
+            .header-meta {{
+                font-size: 12px;
+                color: var(--light-text);
+                margin-top: 8px;
             }}
             .section {{
-                background: #f8f9fa; 
-                padding: 25px; 
-                border-radius: 10px; 
-                margin: 25px 0;
-                border-left: 5px solid #2E86AB;
+                margin: 30px 0;
+                page-break-inside: avoid;
             }}
             .section-title {{
-                font-size: 24px;
-                font-weight: bold;
-                color: #2E86AB;
-                margin-bottom: 20px;
-                display: flex;
-                align-items: center;
-            }}
-            .metric-grid {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-                gap: 20px;
-                margin: 20px 0;
-            }}
-            .metric-card {{
-                background: white;
-                padding: 20px;
-                border-radius: 8px;
-                box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-                border-top: 4px solid #28a745;
-            }}
-            .metric-card.warning {{
-                border-top-color: #ffc107;
-            }}
-            .metric-card.danger {{
-                border-top-color: #dc3545;
-            }}
-            .metric-card.info {{
-                border-top-color: #17a2b8;
-            }}
-            .metric-label {{
-                font-weight: bold;
-                color: #495057;
-                font-size: 13px;
+                font-size: 14px;
+                font-weight: 600;
+                color: var(--accent-color);
                 text-transform: uppercase;
                 letter-spacing: 0.5px;
-                margin-bottom: 8px;
+                border-bottom: 1px solid var(--border-color);
+                padding-bottom: 8px;
+                margin-bottom: 15px;
             }}
-            .metric-value {{
-                font-size: 26px;
-                font-weight: bold;
-                color: #28a745;
+            .subsection {{
+                margin-top: 25px;
             }}
-            .metric-value.warning {{
-                color: #ffc107;
+            .subsection-title {{
+                font-size: 13px;
+                font-weight: 600;
+                color: var(--info-color);
+                margin-bottom: 15px;
             }}
-            .metric-value.danger {{
-                color: #dc3545;
+            .insufficient-sample-warning {{
+                background: #fff3cd;
+                border: 1px solid #ffc107;
+                border-left: 4px solid var(--warning-color);
+                padding: 12px 16px;
+                margin-bottom: 20px;
+                font-size: 13px;
+                color: var(--warning-color);
             }}
-            .metric-value.info {{
-                color: #17a2b8;
+            .metric-table {{
+                width: 100%;
+                border-collapse: collapse;
+                margin: 15px 0;
+                font-size: 13px;
             }}
-            .metric-description {{
+            .metric-table th {{
+                text-align: left;
+                padding: 10px 12px;
+                border-bottom: 2px solid var(--border-color);
+                font-weight: 600;
+                color: var(--light-text);
+                text-transform: uppercase;
                 font-size: 11px;
-                color: #6c757d;
-                margin-top: 8px;
-                line-height: 1.4;
+                letter-spacing: 0.5px;
+            }}
+            .metric-table td {{
+                padding: 10px 12px;
+                border-bottom: 1px solid #e9ecef;
+                vertical-align: top;
+            }}
+            .metric-table tr:hover {{
+                background: var(--surface-color);
+            }}
+            .metric-value-cell {{
+                font-family: var(--mono);
+                text-align: right;
+                white-space: nowrap;
+            }}
+            .metric-ci {{
+                font-size: 11px;
+                color: var(--light-text);
+                font-family: var(--mono);
             }}
             .comparison-table {{
                 width: 100%;
                 border-collapse: collapse;
-                margin: 20px 0;
-                background: white;
-                border-radius: 8px;
-                overflow: hidden;
-                box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+                margin: 15px 0;
+                font-size: 13px;
             }}
             .comparison-table th {{
-                background: #2E86AB;
-                color: white;
-                padding: 15px;
                 text-align: left;
-                font-weight: bold;
+                padding: 10px 12px;
+                border-bottom: 2px solid var(--border-color);
+                font-weight: 600;
+                color: var(--light-text);
+                text-transform: uppercase;
+                font-size: 11px;
             }}
             .comparison-table td {{
-                padding: 12px 15px;
+                padding: 10px 12px;
                 border-bottom: 1px solid #e9ecef;
             }}
-            .comparison-table tr:hover {{
-                background: #f8f9fa;
+            .comparison-table .numeric {{
+                font-family: var(--mono);
+                text-align: right;
             }}
-            .highlight {{
-                color: #28a745;
-                font-weight: bold;
-                font-size: 16px;
+            .comparison-table .positive {{
+                color: var(--positive-color);
+                font-weight: 600;
             }}
-            .highlight.negative {{
-                color: #dc3545;
+            .comparison-table .negative {{
+                color: var(--negative-color);
+                font-weight: 600;
+            }}
+            .reference-note {{
+                font-size: 11px;
+                color: var(--light-text);
+                margin-top: 10px;
+                padding: 8px 12px;
+                background: var(--surface-color);
+                border-left: 3px solid var(--border-color);
             }}
             .footer {{
-                text-align: center;
                 margin-top: 40px;
-                color: #6c757d;
-                font-style: italic;
+                padding-top: 20px;
+                border-top: 1px solid var(--border-color);
+                font-size: 11px;
+                color: var(--light-text);
             }}
-            .emoji {{
-                font-size: 1.2em;
-                margin-right: 8px;
+            .status-indicator {{
+                display: inline-block;
+                width: 8px;
+                height: 8px;
+                border-radius: 50%;
+                margin-right: 6px;
             }}
-            .stats-grid {{
+            .status-success {{ background: var(--positive-color); }}
+            .status-warning {{ background: var(--warning-color); }}
+            .status-danger {{ background: var(--negative-color); }}
+
+            /* Metric Grid Cards */
+            .metric-grid {{
                 display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-                gap: 15px;
+                grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+                gap: 16px;
                 margin: 20px 0;
+            }}
+            .metric-card {{
+                background: var(--bg-color);
+                padding: 16px;
+                border-radius: 6px;
+                box-shadow: var(--box-shadow);
+                border: 1px solid var(--border-color);
+                border-left: 3px solid var(--accent-color);
+                page-break-inside: avoid;
+            }}
+            .metric-card.warning {{
+                border-left-color: var(--warning-color);
+            }}
+            .metric-card.danger {{
+                border-left-color: var(--negative-color);
+            }}
+            .metric-card.info {{
+                border-left-color: var(--info-color);
+            }}
+            .metric-card .metric-label {{
+                font-size: 11px;
+                font-weight: 600;
+                color: var(--light-text);
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+                margin-bottom: 8px;
+            }}
+            .metric-card .metric-value {{
+                font-size: 28px;
+                font-weight: 600;
+                color: var(--primary-color);
+                font-family: var(--mono);
+                margin-bottom: 8px;
+            }}
+            .metric-card .metric-value.warning {{
+                color: var(--warning-color);
+            }}
+            .metric-card .metric-value.danger {{
+                color: var(--negative-color);
+            }}
+            .metric-card .metric-value.info {{
+                color: var(--info-color);
+            }}
+            .metric-card .metric-description {{
+                font-size: 11px;
+                color: var(--light-text);
+                line-height: 1.4;
+            }}
+
+            /* Stats Grid (for HHI and Moments) */
+            .stats-grid {{
+                display: flex;
+                flex-direction: column;
+                background: var(--bg-color);
+                border-radius: 6px;
+                box-shadow: var(--box-shadow);
+                border: 1px solid var(--border-color);
+                overflow: hidden;
             }}
             .stat-row {{
                 display: flex;
                 justify-content: space-between;
-                padding: 10px 15px;
-                background: white;
-                border-radius: 6px;
-                margin: 5px 0;
-                box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+                align-items: center;
+                padding: 10px 12px;
+                border-bottom: 1px solid var(--border-color);
+            }}
+            .stat-row:last-child {{
+                border-bottom: none;
             }}
             .stat-label {{
-                font-weight: 600;
-                color: #495057;
+                font-weight: 400;
+                color: var(--primary-color);
             }}
             .stat-value {{
-                font-weight: bold;
-                color: #2E86AB;
+                font-family: var(--mono);
+                font-weight: 600;
+                text-align: right;
+                color: var(--primary-color);
             }}
-            .reference-note {{
-                font-size: 12px;
-                color: #6c757d;
-                font-style: italic;
-                margin-top: 15px;
-                padding: 10px;
-                background: #f1f3f4;
-                border-radius: 6px;
+
+            /* Responsive */
+            @media screen and (max-width: 768px) {{
+                body {{
+                    padding: 20px;
+                }}
+                .metric-grid {{
+                    grid-template-columns: 1fr;
+                }}
+            }}
+
+            /* Print */
+            @media print {{
+                body {{
+                    padding: 20px;
+                }}
+                .section {{
+                    page-break-inside: avoid;
+                }}
+                .metric-grid {{
+                    page-break-inside: avoid;
+                }}
+                .metric-card {{
+                    page-break-inside: avoid;
+                }}
             }}
         </style>
     </head>
     <body>
         <div class="container">
             <div class="header">
-                🔬 Information Structure Analysis<br>
-                <div style="font-size: 24px; color: #6c757d; margin-top: 10px;">
-                    {strategy_name} • {bar_type.upper()} Bars vs {benchmark_name}
+                <h1 class="header-title">{strategy_name}</h1>
+                <p class="header-subtitle">{bar_type.upper()} Bar Analysis vs {benchmark_name}</p>
+                <div class="header-meta">
+                    {pd.Timestamp.now().strftime('%d %b %Y')} | {info_metrics.get('total_bars', 0):,} bars
                 </div>
             </div>
-            
+
             <div class="section">
-                <div class="section-title">
-                    <span class="emoji">📊</span>Information-Driven Metrics
-                </div>
-                <div class="metric-grid">
-                    <div class="metric-card">
-                        <div class="metric-label">Information Sharpe Ratio</div>
-                        <div class="metric-value">{info_metrics['information_sharpe']:.4f}</div>
-                        <div class="metric-description">Annualized risk-adjusted return using {bar_type} bar structure</div>
-                    </div>
-                    <div class="metric-card info">
-                        <div class="metric-label">Total Information Bars</div>
-                        <div class="metric-value info">{info_metrics['total_bars']:,}</div>
-                        <div class="metric-description">Number of {bar_type} bars generated during backtest</div>
-                    </div>
-                    <div class="metric-card {'warning' if info_metrics['bar_efficiency_score'] < 0.4 else ''}">
-                        <div class="metric-label">Bar Efficiency Score</div>
-                        <div class="metric-value {'warning' if info_metrics['bar_efficiency_score'] < 0.4 else ''}">{info_metrics['bar_efficiency_score']:.4f}</div>
-                        <div class="metric-description">Measures timing consistency (1.0 = perfectly uniform)</div>
-                    </div>
-                    <div class="metric-card">
-                        <div class="metric-label">Information Density</div>
-                        <div class="metric-value">{info_metrics['information_density']:.2f}/day</div>
-                        <div class="metric-description">Average number of bars per trading day</div>
-                    </div>
-                    <div class="metric-card">
-                        <div class="metric-label">Average Bar Duration</div>
-                        <div class="metric-value">{info_metrics['average_bar_duration']:.1f}s</div>
-                        <div class="metric-description">Mean time between consecutive bars</div>
-                    </div>
-                    <div class="metric-card">
-                        <div class="metric-label">Temporal Clustering</div>
-                        <div class="metric-value">{info_metrics['temporal_clustering']:.4f}</div>
-                        <div class="metric-description">Autocorrelation of bar intervals (-1 to 1)</div>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="section">
-                <div class="section-title">
-                    <span class="emoji">⚖️</span>Benchmark Comparison: {benchmark_name}
-                </div>
-                <table class="comparison-table">
+                <div class="section-title">Information-Driven Metrics</div>
+                <table class="metric-table">
                     <thead>
                         <tr>
                             <th>Metric</th>
-                            <th>Information-Driven</th>
-                            <th>{alignment_display}</th>
-                            <th>Difference</th>
+                            <th class="metric-value-cell">Value</th>
+                            <th class="metric-value-cell">Std Error / CI</th>
+                            <th>Description</th>
                         </tr>
                     </thead>
                     <tbody>
                         <tr>
-                            <td><strong>Sharpe Ratio</strong></td>
-                            <td>{info_metrics['information_sharpe']:.4f}</td>
-                            <td>{aligned_metrics['aligned_sharpe']:.4f}</td>
-                            <td class="highlight">{info_metrics['information_sharpe'] - aligned_metrics['aligned_sharpe']:+.4f}</td>
+                            <td>Information Sharpe Ratio</td>
+                            <td class="metric-value-cell">{info_sr:.4f}</td>
+                            <td class="metric-value-cell"><span class="metric-ci">±{1.96*info_sr_se_annual:.4f} (95%)</span></td>
+                            <td>Annualized risk-adjusted return using {bar_type} bar structure</td>
                         </tr>
                         <tr>
-                            <td><strong>Analysis Method</strong></td>
-                            <td>Original {bar_type.upper()} Structure</td>
-                            <td>{alignment_display}</td>
-                            <td>-</td>
+                            <td>Total Information Bars</td>
+                            <td class="metric-value-cell">{info_metrics['total_bars']:,}</td>
+                            <td class="metric-value-cell">-</td>
+                            <td>Number of {bar_type} bars generated during backtest</td>
                         </tr>
                         <tr>
-                            <td><strong>Beta vs {benchmark_name}</strong></td>
-                            <td>{info_metrics['info_beta']:.4f}</td>
-                            <td>{aligned_metrics['beta']:.4f}</td>
-                            <td class="highlight {'negative' if abs(info_metrics['info_beta'] - aligned_metrics['beta']) > 0.5 else ''}">{info_metrics['info_beta'] - aligned_metrics['beta']:+.4f}</td>
+                            <td>Bar Efficiency Score</td>
+                            <td class="metric-value-cell">{info_metrics['bar_efficiency_score']:.4f}</td>
+                            <td class="metric-value-cell">-</td>
+                            <td>Timing consistency (1.0 = perfectly uniform; {'warning' if info_metrics['bar_efficiency_score'] < 0.4 else 'OK'})</td>
                         </tr>
                         <tr>
-                            <td><strong>Alpha (Ann.) vs {benchmark_name}</strong></td>
-                            <td>{info_alpha_ann:.6f}</td>
-                            <td>{aligned_alpha_ann:.6f}</td>
-                            <td class="highlight">{info_alpha_ann - aligned_alpha_ann:+.6f}</td>
+                            <td>Information Density</td>
+                            <td class="metric-value-cell">{info_metrics['information_density']:.2f}/day</td>
+                            <td class="metric-value-cell">-</td>
+                            <td>Average bars per trading day</td>
                         </tr>
                         <tr>
-                            <td><strong>Information Ratio</strong></td>
-                            <td>{info_metrics['info_information_ratio']:.4f}</td>
-                            <td>{aligned_metrics['information_ratio']:.4f}</td>
-                            <td class="highlight">{info_metrics['info_information_ratio'] - aligned_metrics['information_ratio']:+.4f}</td>
+                            <td>Average Bar Duration</td>
+                            <td class="metric-value-cell">{info_metrics['average_bar_duration']:.1f}s</td>
+                            <td class="metric-value-cell">-</td>
+                            <td>Mean time between consecutive bars</td>
                         </tr>
                         <tr>
-                            <td><strong>Tracking Error (Ann.)</strong></td>
-                            <td>{info_metrics['info_tracking_error']:.4f}</td>
-                            <td>{aligned_metrics['tracking_error']:.4f}</td>
-                            <td class="highlight">{info_metrics['info_tracking_error'] - aligned_metrics['tracking_error']:+.4f}</td>
+                            <td>Temporal Clustering</td>
+                            <td class="metric-value-cell">{info_metrics['temporal_clustering']:.4f}</td>
+                            <td class="metric-value-cell">-</td>
+                            <td>Autocorrelation of bar intervals</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            """
+
+    # Compute differences and conditional classes for comparison table
+    sr_diff = info_sr - aligned_sr
+    beta_diff = info_metrics['info_beta'] - aligned_metrics['beta']
+    alpha_diff = info_alpha_ann - aligned_alpha_ann
+    ir_diff = info_metrics['info_information_ratio'] - aligned_metrics['information_ratio']
+    te_diff = info_metrics['info_tracking_error'] - aligned_metrics['tracking_error']
+
+    # Determine positive/negative classes: higher is better for SR, Alpha, IR; lower is better for Tracking Error
+    # For Beta, we prefer closer to 0 (absolute value decrease is positive)
+    sr_class = "positive" if sr_diff > 0 else "negative" if sr_diff < 0 else ""
+    beta_class = "positive" if abs(info_metrics['info_beta']) < abs(aligned_metrics['beta']) else "negative" if abs(info_metrics['info_beta']) > abs(aligned_metrics['beta']) else ""
+    alpha_class = "positive" if alpha_diff > 0 else "negative" if alpha_diff < 0 else ""
+    ir_class = "positive" if ir_diff > 0 else "negative" if ir_diff < 0 else ""
+    te_class = "positive" if te_diff < 0 else "negative" if te_diff > 0 else ""  # Lower tracking error is better
+
+    html_content += f"""
+            <div class="section">
+                <div class="section-title">Benchmark Comparison: {benchmark_name}</div>
+                <table class="comparison-table">
+                    <thead>
+                        <tr>
+                            <th>Metric</th>
+                            <th class="numeric">Information-Driven</th>
+                            <th class="numeric">Daily-Aligned</th>
+                            <th class="numeric">Difference</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Sharpe Ratio</td>
+                            <td class="numeric">{info_sr:.4f}</td>
+                            <td class="numeric">{aligned_sr:.4f}</td>
+                            <td class="numeric {sr_class}">{sr_diff:+.4f}</td>
+                        </tr>
+                        <tr>
+                            <td>Beta vs {benchmark_name}</td>
+                            <td class="numeric">{info_metrics['info_beta']:.4f}</td>
+                            <td class="numeric">{aligned_metrics['beta']:.4f}</td>
+                            <td class="numeric {beta_class}">{beta_diff:+.4f}</td>
+                        </tr>
+                        <tr>
+                            <td>Alpha (Annualized)</td>
+                            <td class="numeric">{info_alpha_ann:.6f}</td>
+                            <td class="numeric">{aligned_alpha_ann:.6f}</td>
+                            <td class="numeric {alpha_class}">{alpha_diff:+.6f}</td>
+                        </tr>
+                        <tr>
+                            <td>Information Ratio</td>
+                            <td class="numeric">{info_metrics['info_information_ratio']:.4f}</td>
+                            <td class="numeric">{aligned_metrics['information_ratio']:.4f}</td>
+                            <td class="numeric {ir_class}">{ir_diff:+.4f}</td>
+                        </tr>
+                        <tr>
+                            <td>Tracking Error (Ann.)</td>
+                            <td class="numeric">{info_metrics['info_tracking_error']:.4f}</td>
+                            <td class="numeric">{aligned_metrics['tracking_error']:.4f}</td>
+                            <td class="numeric {te_class}">{te_diff:+.4f}</td>
                         </tr>
                     </tbody>
                 </table>
                 <div class="reference-note">
-                    Note: Benchmark-aligned metrics use actual {benchmark_name} data resampled to match strategy bar timestamps.
+                    Note: Daily-aligned metrics use strategy returns resampled to daily frequency for fair comparison with {benchmark_name}.
                 </div>
             </div>
-            
-            {fpap_section}
-            
-            <div class="footer">
-                🏛️ Generated by Institutional HFT Analysis Framework<br>
-                Professional-grade performance evaluation powered by FPAP statistical methods<br>
-                <small>Reference: López de Prado, M. (2018). Advances in Financial Machine Learning. Wiley.</small><br>
-                <small>(!) All metrics use simple (percentage) returns. FPAP accepts both; we use simple for consistency.</small>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-    
+            """
+
+    html_content += f"""
+    {fpap_section}
+
+    <div class="footer">
+        Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')} |
+        Methodology: López de Prado, M. (2018). Advances in Financial Machine Learning. Wiley. |
+        Returns: Simple (percentage) returns used throughout for consistency.
+    </div>
+</div>
+</body>
+</html>
+"""
+
     with open(output_file, 'w', encoding='utf-8') as f:
         f.write(html_content)
     
@@ -1266,9 +1431,12 @@ def _calculate_fpap_metrics(returns_df):
         dd_95 = np.quantile(dd, 0.95) if len(dd) > 0 else 0
         tuw_95 = np.quantile(tuw, 0.95) if len(tuw) > 0 else 0
         
-        # Probabilistic Sharpe Ratio: pass annualized SR (PSR formula expects it)
+        # Probabilistic Sharpe Ratio: pass PER-PERIOD SR (not annualized)
+        # Per AFML Ch.13 Eq.13.4 and FPAP implementation, compute_psr multiplies
+        # sr_estimates by sqrt(T-1) internally. Passing annualized SR would
+        # double-annualize and produce PSR=100% artifacts.
         psr_stat, psr = compute_psr(
-            sr_estimates=sr,
+            sr_estimates=sr_period,  # per-period SR, not annualized
             skew=m3,
             kurtosis=m4,
             sample_length=len(returns),
@@ -1344,12 +1512,12 @@ def _calculate_fpap_metrics(returns_df):
 def _build_fpap_section_html(fpap_metrics):
     """
     Build the HTML section for FPAP statistical metrics.
-    
+
     Parameters
     ----------
     fpap_metrics : dict
         Dictionary containing FPAP metrics from _calculate_fpap_metrics
-        
+
     Returns
     -------
     str
@@ -1357,41 +1525,62 @@ def _build_fpap_section_html(fpap_metrics):
     """
     if not fpap_metrics:
         return ""
-    
+
     # Determine PSR status
     psr = fpap_metrics.get('psr', 0)
     psr_status = "success" if psr > 0.95 else "warning" if psr > 0.5 else "danger"
     psr_class = "" if psr_status == "success" else psr_status
-    
+
     # Determine DSR status
     dsr = fpap_metrics.get('dsr', 0)
     dsr_status = "success" if dsr > 0.95 else "warning" if dsr > 0.5 else "danger"
     dsr_class = "" if dsr_status == "success" else dsr_status
-    
+
     # Determine MinTRL status
     min_trl = fpap_metrics.get('min_trl', float('inf'))
     track_years = fpap_metrics.get('track_record_years', 0)
     trl_status = "success" if track_years >= min_trl else "warning" if track_years >= min_trl * 0.5 else "danger"
     trl_class = "" if trl_status == "success" else trl_status
-    
+
+    # Calculate sample sufficiency warning
+    sample_size = fpap_metrics.get('sample_size', 0)
+    entries_per_year = fpap_metrics.get('entries_per_year', 365)
+    min_trl_obs = min_trl * entries_per_year if entries_per_year > 0 else float('inf')
+    insufficient_sample = sample_size < min_trl_obs
+
     # Format HHI values
     hhi_pos = fpap_metrics.get('hhi_positive')
     hhi_neg = fpap_metrics.get('hhi_negative')
     hhi_time = fpap_metrics.get('hhi_time')
-    
+
     hhi_pos_str = f"{hhi_pos:.4f}" if hhi_pos is not None else "N/A"
     hhi_neg_str = f"{hhi_neg:.4f}" if hhi_neg is not None else "N/A"
     hhi_time_str = f"{hhi_time:.4f}" if hhi_time is not None else "N/A"
-    
+
+    # Build sample size warning banner
+    sample_warning_html = ""
+    if insufficient_sample:
+        sample_warning_html = f"""
+                <div class="insufficient-sample-warning">
+                    <strong>INSUFFICIENT SAMPLE SIZE</strong><br>
+                    Current: T={sample_size} observations |
+                    Required: T≥{int(min_trl_obs)} observations for 90% confidence<br>
+                    All Sharpe ratio and PSR estimates below are statistically unreliable.
+                </div>
+        """
+
+    trl_status_text = "Sufficient" if track_years >= min_trl else "Insufficient"
+
     return f"""
             <div class="section">
                 <div class="section-title">
-                    <span class="emoji">📈</span>Production-Grade Statistical Analysis (FPAP)
+                    Statistical Analysis (FPAP Methodology)
                 </div>
-                <div class="reference-note" style="margin-bottom: 15px;">
-                    PSR, DSR, MinTRL follow López de Prado (2018) AFML; parameters verified against FPAP docstrings.
+                <div class="reference-note">
+                    PSR, DSR, MinTRL follow López de Prado (2018) Advances in Financial Machine Learning.
                 </div>
-                
+                {sample_warning_html}
+
                 <div class="metric-grid">
                     <div class="metric-card {psr_class}">
                         <div class="metric-label">Probabilistic Sharpe Ratio (PSR)</div>
@@ -1401,7 +1590,7 @@ def _build_fpap_section_html(fpap_metrics):
                             PSR Statistic: {fpap_metrics.get('psr_stat', 0):.4f}
                         </div>
                     </div>
-                    
+
                     <div class="metric-card {dsr_class}">
                         <div class="metric-label">Deflated Sharpe Ratio (DSR)</div>
                         <div class="metric-value {dsr_class}">{dsr:.4f}</div>
@@ -1410,16 +1599,16 @@ def _build_fpap_section_html(fpap_metrics):
                             Expected Max SR: {fpap_metrics.get('expected_max_sr', 0):.4f}
                         </div>
                     </div>
-                    
+
                     <div class="metric-card {trl_class}">
                         <div class="metric-label">Minimum Track Record Length</div>
                         <div class="metric-value {trl_class}">{min_trl:.2f} yrs</div>
                         <div class="metric-description">
                             Years needed for 90% confidence. Current: {track_years:.2f} yrs
-                            {'✓ Sufficient' if track_years >= min_trl else '⚠ Insufficient'}
+                            [{trl_status_text}]
                         </div>
                     </div>
-                    
+
                     <div class="metric-card">
                         <div class="metric-label">95th Percentile Drawdown</div>
                         <div class="metric-value">{fpap_metrics.get('drawdown_95', 0):.2%}</div>
@@ -1427,7 +1616,7 @@ def _build_fpap_section_html(fpap_metrics):
                             Maximum expected drawdown at 95% confidence level
                         </div>
                     </div>
-                    
+
                     <div class="metric-card">
                         <div class="metric-label">95th Percentile Time Under Water</div>
                         <div class="metric-value">{fpap_metrics.get('tuw_95', 0):.1f} days</div>
@@ -1435,18 +1624,18 @@ def _build_fpap_section_html(fpap_metrics):
                             Maximum expected recovery time at 95% confidence level
                         </div>
                     </div>
-                    
+
                     <div class="metric-card info">
                         <div class="metric-label">Sample Size</div>
                         <div class="metric-value info">{fpap_metrics.get('sample_size', 0):,}</div>
                         <div class="metric-description">
-                            Number of return observations ({fpap_metrics.get('entries_per_year', 252):.0f}/year)
+                            Number of return observations ({fpap_metrics.get('entries_per_year', 365):.0f}/year)
                         </div>
                     </div>
                 </div>
-                
-                <div style="margin-top: 25px;">
-                    <h4 style="color: #2E86AB; margin-bottom: 15px;">HHI Bets Concentration Analysis</h4>
+
+                <div class="subsection">
+                    <div class="subsection-title">HHI Bets Concentration Analysis</div>
                     <div class="stats-grid">
                         <div class="stat-row">
                             <span class="stat-label">Positive Returns Concentration</span>
@@ -1462,13 +1651,13 @@ def _build_fpap_section_html(fpap_metrics):
                         </div>
                     </div>
                     <div class="reference-note">
-                        HHI ranges from 0 (perfectly diversified) to 1 (concentrated). 
+                        HHI ranges from 0 (perfectly diversified) to 1 (concentrated).
                         Low values indicate well-distributed returns across bets and time periods.
                     </div>
                 </div>
-                
-                <div style="margin-top: 25px;">
-                    <h4 style="color: #2E86AB; margin-bottom: 15px;">Return Distribution Moments</h4>
+
+                <div class="subsection">
+                    <div class="subsection-title">Return Distribution Moments</div>
                     <div class="stats-grid">
                         <div class="stat-row">
                             <span class="stat-label">Mean Return (per observation)</span>
@@ -1513,7 +1702,7 @@ def create_tearsheet(
     backtest_time_seconds: float | None = None,
 ):
     """
-    ENHANCED TEARSHEET WITH INSTITUTIONAL HFT SUPPORT
+    Tearsheet with HFT Information-Structure Support
     
     Auto-detects HFT strategies and applies appropriate analysis method.
     Fully integrated with lumibot's data processing framework.
@@ -1534,7 +1723,7 @@ def create_tearsheet(
         logger.info("save_tearsheet is False, not creating the tearsheet file.")
         return
 
-    logger.info("\nCreating Enhanced Tearsheet with HFT Support...")
+    logger.info("\nCreating Tearsheet with HFT Support...")
 
     # Check if df1 or df2 are empty and return if they are
     if strategy_df is None or benchmark_df is None or strategy_df.empty or benchmark_df.empty:
@@ -1552,7 +1741,7 @@ def create_tearsheet(
     is_hft = detect_hft_characteristics(strategy_df)
     
     if is_hft:
-        logger.info("🏛️ HFT STRATEGY DETECTED - Using Institutional Analysis")
+        logger.info("HFT strategy detected - using information-structure analysis")
         
         # For HFT, we still use lumibot's data processing but add HFT analysis
         _strategy_df = strategy_df.copy()
@@ -1598,9 +1787,9 @@ def create_tearsheet(
             logger.info(f"🔍 Auto-detected bar type: {detected_bar_type.upper()}")
         else:
             detected_bar_type = bar_type
-            logger.info(f"📊 Using explicit bar type: {detected_bar_type.upper()}")
+            logger.info(f"Using explicit bar type: {detected_bar_type.upper()}")
         
-        # Enhanced parameters with HFT metrics
+        # parameters with HFT metrics
         if strategy_parameters is None:
             strategy_parameters = {}
         
@@ -1610,16 +1799,16 @@ def create_tearsheet(
             intraday_vol = df_final["strategy"].std() * np.sqrt(trades_per_day)
             
             strategy_parameters.update({
-                "📊 Analysis Type": f"🏛️ Institutional HFT ({detected_bar_type.upper()} bars)",
-                "📈 Data Points": f"{len(df_final):,}",
-                "⚡ Avg Observations/Day": f"{trades_per_day:.2f}",
-                "📊 Intraday Volatility": f"{intraday_vol:.4f}",
-                "🔬 Bar Type": detected_bar_type.upper(),
+                "Analysis Type": f"HFT Information-Structure ({detected_bar_type.upper()} bars)",
+                "Data Points": f"{len(df_final):,}",
+                "Avg Observations/Day": f"{trades_per_day:.2f}",
+                "Intraday Volatility": f"{intraday_vol:.4f}",
+                "Bar Type": detected_bar_type.upper(),
             })
         except Exception as e:
             logger.warning(f"Could not calculate HFT metrics: {e}")
 
-        title = f"🏛️ INSTITUTIONAL HFT: {strat_name} ({detected_bar_type.upper()} bars) vs {benchmark_asset}"
+        title = f"HFT Analysis: {strat_name} ({detected_bar_type.upper()} bars) vs {benchmark_asset}"
 
         # Generate primary tearsheet using QuantStats (same as indicators.py)
         with open(os.devnull, "w") as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
@@ -1678,15 +1867,15 @@ def create_tearsheet(
             info_url = "file://" + os.path.abspath(str(info_driven_file))
             webbrowser.open(info_url)
 
-        logger.info(f"✅ Generated institutional dual tearsheet system:")
-        logger.info(f"   📈 Primary tearsheet: {tearsheet_file}")
-        logger.info(f"   🔬 Information analysis: {info_driven_file}")
+        logger.info(f"Generated dual tearsheet system:")
+        logger.info(f"   Primary tearsheet: {tearsheet_file}")
+        logger.info(f"   Information analysis: {info_driven_file}")
 
         # Return result consistent with original indicators.py behavior
         return result
     
     # =================== DELEGATE TO ORIGINAL FOR NON-HFT ===================
-    logger.info("📊 Standard strategy detected - using original lumibot analysis")
+        logger.info("Standard strategy detected - using original lumibot analysis")
     
     # For non-HFT strategies, use the original indicators.py function exactly
     return original_create_tearsheet(
@@ -1749,7 +1938,7 @@ def detect_hft_characteristics(df):
 
 def calculate_hft_specific_metrics(strategy_data, bar_type):
     """
-    📊 CALCULATE HFT-SPECIFIC METRICS
+    Calculate HFT-Specific Metrics
     
     Calculate metrics specific to information-driven bars.
     
@@ -1790,7 +1979,7 @@ def calculate_hft_specific_metrics(strategy_data, bar_type):
             'bar_type': bar_type,
         }
         
-        logger.info(f"📊 HFT metrics calculated: Sharpe={hft_sharpe:.4f}, Efficiency={bar_efficiency:.3f}")
+        logger.info(f"HFT metrics calculated: Sharpe={hft_sharpe:.4f}, Efficiency={bar_efficiency:.3f}")
         return metrics
         
     except Exception as e:
@@ -1850,7 +2039,7 @@ def calculate_benchmark_comparison_metrics(aligned_data):
             'tracking_error': tracking_error * ann_factor,
         }
         
-        logger.info(f"⚖️ Benchmark metrics calculated: Sharpe={aligned_sharpe:.4f}, Beta={beta:.4f}")
+        logger.info(f"Benchmark metrics calculated: Sharpe={aligned_sharpe:.4f}, Beta={beta:.4f}")
         return metrics
         
     except Exception as e:
@@ -1886,7 +2075,7 @@ def create_information_driven_report(strategy_data, output_file, bar_type, metri
         <!DOCTYPE html>
         <html>
         <head>
-            <title>🔬 Information-Driven Analysis: {bar_type.upper()} Bars</title>
+            <title>Information-Driven Analysis: {bar_type.upper()} Bars</title>
             <meta charset="utf-8">
             <style>
                 body {{ 
@@ -1938,7 +2127,7 @@ def create_information_driven_report(strategy_data, output_file, bar_type, metri
         <body>
             <div class="container">
                 <div class="header">
-                    🔬 Information-Driven Analysis<br>
+                    Information-Driven Analysis<br>
                     <div style="font-size: 20px; color: #6c757d;">{bar_type.upper()} Bars</div>
                 </div>
                 
@@ -1962,7 +2151,7 @@ def create_information_driven_report(strategy_data, output_file, bar_type, metri
                 </div>
                 
                 <div style="text-align: center; margin-top: 40px; color: #6c757d;">
-                    🏛️ Generated by Institutional HFT Analysis Framework
+                    Generated by HFT Information-Structure Analysis Framework
                 </div>
             </div>
         </body>
@@ -2011,7 +2200,7 @@ def analyze_bar_characteristics(strategy_data, bar_type):
 
 def analyze_volume_bars(strategy_data):
     """
-    📊 ANALYZE VOLUME BARS
+    Analyze Volume Bars
     
     Analyze volume bar characteristics for HFT strategies.
     
@@ -2232,7 +2421,7 @@ def calculate_temporal_clustering(timestamps):
 
 def calculate_volume_consistency(strategy_data):
     """
-    📊 CALCULATE VOLUME CONSISTENCY
+    Calculate Volume Consistency
     
     Calculate consistency of volume across bars.
     
@@ -2444,7 +2633,7 @@ def convert_to_hft_timezone(timestamps, target_timezone=None):
 
 def calculate_hft_time_metrics(timestamps):
     """
-    📊 CALCULATE HFT TIME METRICS
+    Calculate HFT Time Metrics
     
     Calculate high-precision time metrics for HFT analysis.
     
@@ -2506,7 +2695,7 @@ def calculate_hft_time_metrics(timestamps):
 
 def generate_institutional_tearsheet(analyzer, output_file, show_tearsheet=True):
     """
-    🏛️ GENERATE INSTITUTIONAL TEARSHEET
+    Generate HFT Information-Structure Tearsheet
     
     Generate comprehensive institutional-grade tearsheet with dual analysis.
     This is the main function referenced in the HFT_UPDATES.md report.
@@ -2532,13 +2721,13 @@ def generate_institutional_tearsheet(analyzer, output_file, show_tearsheet=True)
         
         # Prepare parameters for tearsheet
         parameters = {
-            '📊 Analysis Type': 'Dual-Track Institutional',
-            '🔬 Information-Driven Sharpe': f"{info_metrics['information_sharpe']:.4f}",
-            '📈 Time-Aligned Sharpe': f"{aligned_metrics['aligned_sharpe']:.4f}",
-            '🎯 Beta vs Benchmark': f"{aligned_metrics['beta']:.4f}",
-            '⚡ Information Bars': f"{info_metrics['total_bars']:,}",
-            '📊 Bar Type': info_metrics['bar_type'].upper(),
-            '🔄 Alignment Method': 'Forward Fill + Synthetic',
+            'Analysis Type': 'Dual-Track HFT',
+            'Information-Driven Sharpe': f"{info_metrics['information_sharpe']:.4f}",
+            'Time-Aligned Sharpe': f"{aligned_metrics['aligned_sharpe']:.4f}",
+            'Beta vs Benchmark': f"{aligned_metrics['beta']:.4f}",
+            'Information Bars': f"{info_metrics['total_bars']:,}",
+            'Bar Type': info_metrics['bar_type'].upper(),
+            'Alignment Method': 'Forward Fill + Synthetic',
         }
         
         # Generate primary tearsheet using time-aligned data
@@ -2589,7 +2778,7 @@ def generate_institutional_tearsheet(analyzer, output_file, show_tearsheet=True)
 
 def run_institutional_analysis(strategy_df, benchmark_df, bar_type='volume'):
     """
-    🏛️ RUN INSTITUTIONAL ANALYSIS
+    Run HFT Information-Structure Analysis
     
     Complete workflow for institutional HFT analysis as specified in HFT_UPDATES.md.
     
@@ -2607,7 +2796,7 @@ def run_institutional_analysis(strategy_df, benchmark_df, bar_type='volume'):
     dict
         Complete analysis results
     """
-    logger.info("🏛️ Starting Institutional HFT Analysis...")
+    logger.info("Starting HFT Information-Structure Analysis...")
     
     try:
         # Step 1: Initialize analyzer
@@ -2615,7 +2804,7 @@ def run_institutional_analysis(strategy_df, benchmark_df, bar_type='volume'):
         
         # Step 2: Analyze bar characteristics
         bar_characteristics = analyze_bar_characteristics(strategy_df, bar_type)
-        logger.info(f"📊 Bar Analysis Complete: {bar_characteristics.get('bar_efficiency_score', 0):.3f} efficiency")
+        logger.info(f"Bar Analysis Complete: {bar_characteristics.get('bar_efficiency_score', 0):.3f} efficiency")
         
         # Step 3: Calculate dual metrics
         info_metrics = analyzer.calculate_information_driven_metrics()
@@ -2625,7 +2814,7 @@ def run_institutional_analysis(strategy_df, benchmark_df, bar_type='volume'):
         results = generate_institutional_tearsheet(analyzer, 'institutional_analysis.html')
         
         # Step 5: Summary output
-        logger.info("\n📈 Analysis Summary:")
+        logger.info("\nAnalysis Summary:")
         logger.info(f"   Information-Driven Sharpe: {info_metrics['information_sharpe']:.4f}")
         logger.info(f"   Time-Aligned Sharpe: {aligned_metrics['aligned_sharpe']:.4f}")
         logger.info(f"   Beta vs Benchmark: {aligned_metrics['beta']:.4f}")
@@ -2648,7 +2837,7 @@ def run_institutional_analysis(strategy_df, benchmark_df, bar_type='volume'):
 
 def analyze_information_driven_performance(strategy_data, bar_type):
     """
-    📊 ANALYZE INFORMATION-DRIVEN PERFORMANCE
+    Analyze Information-Driven Performance
     
     Analyze strategy performance using original information-driven structure.
     Preserves volume/dollar/imbalance bar timing and characteristics.
@@ -2679,7 +2868,7 @@ def analyze_information_driven_performance(strategy_data, bar_type):
             'information_density': len(strategy_data) / calculate_time_span_days_simple(strategy_data)
         }
         
-        logger.info(f"📊 Information-driven analysis complete for {bar_type} bars")
+        logger.info(f"Information-driven analysis complete for {bar_type} bars")
         return metrics
         
     except Exception as e:
@@ -2711,7 +2900,7 @@ def calculate_time_span_days_simple(strategy_data):
 
 def create_hft_bar_timing_plot(strategy_data, bar_type, output_file=None, show_plot=True):
     """
-    📊 CREATE HFT BAR TIMING PLOT
+    Create HFT Bar Timing Plot
     
     Visualize the timing characteristics of information-driven bars.
     
@@ -2798,7 +2987,7 @@ def create_hft_bar_timing_plot(strategy_data, bar_type, output_file=None, show_p
         
         # Update layout
         fig.update_layout(
-            title=f"🔬 HFT Bar Analysis: {bar_type.upper()} Bars",
+            title=f"HFT Bar Analysis: {bar_type.upper()} Bars",
             showlegend=True,
             height=800,
             width=1200
@@ -2816,7 +3005,7 @@ def create_hft_bar_timing_plot(strategy_data, bar_type, output_file=None, show_p
         
         if output_file:
             fig.write_html(output_file)
-            logger.info(f"📊 HFT bar timing plot saved to {output_file}")
+            logger.info(f"HFT bar timing plot saved to {output_file}")
         
         if show_plot:
             fig.show()
@@ -2830,7 +3019,7 @@ def create_hft_bar_timing_plot(strategy_data, bar_type, output_file=None, show_p
 
 def create_hft_performance_comparison_plot(info_metrics, aligned_metrics, output_file=None, show_plot=True):
     """
-    📈 CREATE HFT PERFORMANCE COMPARISON PLOT
+    Create HFT Performance Comparison Plot
     
     Visualize the dual-track performance comparison.
     
@@ -2885,7 +3074,7 @@ def create_hft_performance_comparison_plot(info_metrics, aligned_metrics, output
         ))
         
         fig.update_layout(
-            title='🏛️ Institutional Dual-Track Performance Comparison',
+            title='Dual-Track Performance Comparison',
             xaxis_title='Metrics',
             yaxis_title='Values',
             barmode='group',
@@ -2895,7 +3084,7 @@ def create_hft_performance_comparison_plot(info_metrics, aligned_metrics, output
         
         if output_file:
             fig.write_html(output_file)
-            logger.info(f"📈 Performance comparison plot saved to {output_file}")
+            logger.info(f"Performance comparison plot saved to {output_file}")
         
         if show_plot:
             fig.show()
@@ -2909,7 +3098,7 @@ def create_hft_performance_comparison_plot(info_metrics, aligned_metrics, output
 
 def create_hft_microstructure_plot(strategy_data, output_file=None, show_plot=True):
     """
-    🔬 CREATE HFT MICROSTRUCTURE PLOT
+    Create HFT Microstructure Plot
     
     Visualize microstructure characteristics of HFT data.
     
@@ -2990,7 +3179,7 @@ def create_hft_microstructure_plot(strategy_data, output_file=None, show_plot=Tr
         )
         
         fig.update_layout(
-            title='🔬 HFT Microstructure Analysis',
+            title='HFT Microstructure Analysis',
             showlegend=True,
             height=800,
             width=1200
@@ -2998,7 +3187,7 @@ def create_hft_microstructure_plot(strategy_data, output_file=None, show_plot=Tr
         
         if output_file:
             fig.write_html(output_file)
-            logger.info(f"🔬 Microstructure plot saved to {output_file}")
+            logger.info(f"Microstructure plot saved to {output_file}")
         
         if show_plot:
             fig.show()

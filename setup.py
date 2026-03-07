@@ -171,7 +171,7 @@ theta_jar_path = PROJECT_ROOT / "lumibot" / "resources" / "ThetaTerminal.jar"
 setuptools.setup(
     # Basic package information
     name="lumibot",
-    version="4.4.5.2",
+    version="4.4.52",
     author="Robert Grzesik",
     author_email="rob@lumiwealth.com",
     description="Backtesting and Trading Library, Made by Lumiwealth.",

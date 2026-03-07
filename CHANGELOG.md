@@ -1,6 +1,20 @@
 # Changelog
 
-## 4.4.51 - Unreleased
+## 4.4.52 - 2026-03-07
+
+### Added
+- **HFT Information-Driven Report UX Redesign:** Complete visual overhaul of the information structure report (`*_tearsheet_information_structure.html`) with card-based layouts, conditional color formatting, and responsive design that aligns with the QuantStats tearsheet visual language.
+  - Added CSS grid layout for FPAP metrics (PSR, DSR, MinTRL, Drawdown, TUW, Sample Size)
+  - Added status-based left-border coloring (green/orange/red) for metric cards
+  - Added conditional positive/negative coloring in benchmark comparison table
+  - Added `.metric-grid`, `.metric-card`, `.stats-grid`, `.stat-row` CSS classes (previously undefined)
+  - Added responsive breakpoints and print-optimized styles
+  - Removed inline styles and emojis from FPAP section output
+
+### Changed
+- HFT Indicators: Information-driven report (`create_information_structure_report`) redesigned with professional card-based UX, status-color coding, and responsive layout. FPAP metrics now render with proper visual hierarchy and conditional formatting.
+
+## 4.4.51 - 2026-03-07
 
 ### Added
 - **Local CI:** Run the same steps as GitHub Actions before push: `make ci` (full), `make ci-quick` (lint + unit only), `make install-ci`, `make lint`. Script: `scripts/run_ci_local.sh` (supports `RUN_BACKTEST=0`, `USE_UV=1`, `GIT_TOKEN` for private FPAP). Optional pre-push hook: `git config core.hooksPath .githooks` so `git push` runs `make ci-quick` first.
@@ -9,7 +23,6 @@
 - Opt-in early-assignment heuristic model for short ITM, physically-settled options (`strategy.parameters`: `option_early_assignment_enabled`, `option_early_assignment_max_dte_days`, `option_early_assignment_max_extrinsic`).
 
 ### Changed
-
 - Options expiration behavior now follows broker-style settlement defaults:
   - Equity/ETF options settle physically at expiration (short ITM -> assignment, long ITM -> exercise when account constraints allow).
   - Index options settle to cash at intrinsic value.
@@ -29,9 +42,6 @@
 - ThetaData backtesting: keep intraday index minute/hour fetch bounds aligned to the simulation timestamp instead of forcing full-window end coverage.
 - Long ITM equity option expirations now avoid unrealistic forced delivery when account constraints are not met; these contracts expire unexercised in backtests.
 - Acceptance baselines: refresh `aapl_deep_dip_calls` and `leaps_alpha_picks_short` metrics to match current option settlement behavior.
-
-### TODO
-- HFT indicator for information-driven bars still requires refinement and correction (to be added to TODOs).
 
 ## 4.4.50 - 2026-02-19
 

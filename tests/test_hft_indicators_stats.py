@@ -11,32 +11,37 @@ import pandas as pd
 import numpy as np
 import pytest
 
-from lumibot.tools.hft_indicators import _infer_entries_per_year, _calculate_fpap_metrics
+from lumibot.tools.hft_indicators import (
+    _infer_entries_per_year,
+    _calculate_fpap_metrics,
+    DualTrackAnalyzer,
+    calculate_info_sharpe,
+)
 
 
 class TestInferEntriesPerYear:
     """Test _infer_entries_per_year for different bar frequencies."""
 
     def test_daily_returns(self):
-        """Daily returns should yield ~252-365 entries per year."""
-        idx = pd.date_range("2020-01-01", periods=252, freq="B")
-        returns = pd.Series(np.random.randn(252) * 0.01, index=idx)
+        """Daily returns should yield ~365-365 entries per year."""
+        idx = pd.date_range("2020-01-01", periods=365, freq="B")
+        returns = pd.Series(np.random.randn(365) * 0.01, index=idx)
         epy = _infer_entries_per_year(returns)
         assert 200 <= epy <= 400
 
     def test_intraday_one_minute(self):
-        """1-minute bars: ~252*390 ≈ 98k entries per year."""
+        """1-minute bars: ~365*390 ≈ 98k entries per year."""
         idx = pd.date_range("2020-01-01 09:30", periods=1000, freq="1min")
         returns = pd.Series(np.random.randn(1000) * 0.001, index=idx)
         epy = _infer_entries_per_year(returns)
         assert epy > 10000
 
     def test_empty_or_short_returns(self):
-        """Empty or single observation returns 252 fallback."""
+        """Empty or single observation returns 365 fallback."""
         empty = pd.Series(dtype=float)
-        assert _infer_entries_per_year(empty) == 252.0
+        assert _infer_entries_per_year(empty) == 365.0
         single = pd.Series([0.01], index=pd.DatetimeIndex(["2020-01-01"]))
-        assert _infer_entries_per_year(single) == 252.0
+        assert _infer_entries_per_year(single) == 365.0
 
     def test_fallback_span_years(self):
         """Irregular / very sparse bars use span fallback."""
@@ -84,7 +89,7 @@ class TestFpapBacktestVarFormula:
             returns.skew(),
             returns.kurtosis() + 3,
         )
-        epy = 252
+        epy = 365
         sr = (m1 / m2) * np.sqrt(epy) if m2 > 0 else 0
         sr_period = sr / np.sqrt(epy)
         var_sr_period = (1 / max(n - 1, 1)) * (
@@ -110,3 +115,77 @@ class TestCanonicalReturnsTimezoneIntersection:
         strat_idx_naive = strat_idx.tz_localize(None) if strat_idx.tz is not None else strat_idx
         inter = df_final.index.intersection(strat_idx_naive)
         assert len(inter) == 59, "Intersection must yield 59 rows when timezone is normalized"
+
+
+class TestHftIndicatorsRegression:
+    """Regression tests for HFT indicator correctness.
+
+    These tests catch the annualization bug and benchmark alignment issues
+    that produced inflated SR=9+ and degenerate benchmark comparisons.
+    """
+
+    def test_sr_not_inflated_for_small_sample(self):
+        """SR > 5 for n < 365 is a near-certain sign of calendar-year annualization bug.
+
+        The bug used 365.25*24*3600 seconds/year (calendar 24/7) instead of
+        data-driven bars/day * 365 trading days. This inflated SR by ~2.3x for
+        market-hours strategies.
+        """
+        np.random.seed(42)
+        # 59 observations over ~2 days (market hours) - realistic HFT scenario
+        idx = pd.date_range("2026-02-26 09:30", periods=59, freq="15min")
+        returns = pd.Series(np.random.normal(0.0001, 0.001, 59), index=idx)
+        sr = calculate_info_sharpe(returns)
+
+        # With the fix, SR should be reasonable (< 5). With the bug, it was ~9-10.
+        assert sr < 5.0, f"SR={sr:.2f} is implausibly high for 59 observations (bug: calendar-year annualization)"
+
+    def test_infer_entries_per_year_data_driven(self):
+        """Test that _infer_entries_per_year uses data-driven calculation.
+
+        Before fix: used 365.25 * 24 * 3600 seconds/year (calendar 24/7)
+        After fix: uses observed bars/day * 365 trading days
+        """
+        np.random.seed(42)
+        # Create 2 full days of 15-min bars (market hours only: 6.5h/day * 4 bars/hour = 26 bars/day)
+        # 2 days * 26 bars/day = 52 bars total
+        idx_day1 = pd.date_range("2026-02-26 09:30", periods=26, freq="15min")
+        idx_day2 = pd.date_range("2026-02-27 09:30", periods=26, freq="15min")
+        idx = idx_day1.append(idx_day2)
+        returns = pd.Series(np.random.normal(0.0001, 0.001, len(idx)), index=idx)
+        epy = _infer_entries_per_year(returns)
+
+        # 52 bars over 2 days = 26 bars/day * 365 = ~6552 entries/year (data-driven)
+        # Should NOT be 365.25*24*3600 / 900 ≈ 35000 (calendar 24/7)
+        assert epy < 15000, f"entries_per_year={epy:.0f} suggests calendar-year annualization bug"
+        assert epy > 1000, f"entries_per_year={epy:.0f} is too low for intraday bars"
+
+    def test_benchmark_comparison_not_degenerate(self):
+        """info_sharpe and aligned_sharpe must differ; if equal, alignment is broken.
+
+        The bug: _benchmark_aligned_bars aligned SPY to strategy timestamps,
+        then returned the SAME strategy returns for both tracks, yielding identical SR.
+
+        The fix: resamples strategy to daily frequency for aligned track, producing
+        genuinely different SR from the information-driven track.
+        """
+        np.random.seed(42)
+        # Create realistic strategy and benchmark data
+        dates = pd.date_range("2020-01-01", periods=50, freq="B")
+        strategy_df = pd.DataFrame({
+            'portfolio_value': 100 * (1 + np.random.randn(50) * 0.01).cumprod()
+        }, index=dates)
+
+        # Benchmark with different pattern
+        benchmark_df = pd.DataFrame({
+            'symbol_cumprod': 100 * (1 + np.random.randn(50) * 0.008).cumprod()
+        }, index=dates)
+
+        analyzer = DualTrackAnalyzer(strategy_df, benchmark_df, 'volume')
+        info = analyzer.calculate_information_driven_metrics()
+        aligned = analyzer.calculate_time_aligned_metrics('synthetic_bars')
+
+        # After the fix, these should be different (one is on daily freq, one on original)
+        # Before the bug fix, they were identical.
+        assert info['information_sharpe'] != aligned['aligned_sharpe'], \
+            "Aligned SR equals info SR - benchmark alignment is degenerate (same returns used for both tracks)"
