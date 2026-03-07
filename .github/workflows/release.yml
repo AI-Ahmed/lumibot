@@ -28,10 +28,17 @@ jobs:
           cache: pip
 
       - name: Install dependencies
+        env:
+          GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements_dev.txt
+          if [ -n "$GIT_TOKEN" ]; then
+            sed 's/\$\${GIT_TOKEN}/'"$GIT_TOKEN"'/g' requirements.txt > requirements.resolved.txt
+          else
+            grep -v 'FPAP.git' requirements.txt > requirements.resolved.txt
+          fi
+          pip install -r requirements.resolved.txt
           pip install build
 
       - name: Validate tag version matches setup.py
