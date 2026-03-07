@@ -14,16 +14,15 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Use python from PATH, or python3, or repo .venv (pre-push hook often runs without venv activated)
-PYTHON=python
-if command -v python >/dev/null 2>&1; then
+# Prefer repo .venv so pre-push hook (no activated venv) uses project deps (ruff, pytest, etc.)
+if [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+  PYTHON="$REPO_ROOT/.venv/bin/python"
+elif command -v python >/dev/null 2>&1; then
   PYTHON=python
 elif command -v python3 >/dev/null 2>&1; then
   PYTHON=python3
-elif [ -x "$REPO_ROOT/.venv/bin/python" ]; then
-  PYTHON="$REPO_ROOT/.venv/bin/python"
 else
-  echo "run_ci_local.sh: python or python3 not found; install Python or activate a venv."
+  echo "run_ci_local.sh: no python found; activate the repo venv or install Python."
   exit 127
 fi
 export PYTHON
