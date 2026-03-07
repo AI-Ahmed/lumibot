@@ -80,7 +80,7 @@ shard_total = int(os.environ["SHARD_TOTAL"])
 markers = os.environ.get("PYTEST_MARKERS", "not apitest and not downloader")
 
 collect_cmd = [
-    "pytest", "tests/", "--ignore=tests/backtest/",
+    sys.executable, "-m", "pytest", "tests/", "--ignore=tests/backtest/",
     "-m", markers, "--collect-only", "-q",
 ]
 proc = subprocess.run(collect_cmd, capture_output=True, text=True)
@@ -126,7 +126,7 @@ shard_total = int(os.environ["SHARD_TOTAL"])
 markers = os.environ.get("PYTEST_MARKERS", "not apitest and not downloader")
 
 collect_cmd = [
-    "pytest", "tests/backtest/", "-m", markers, "--collect-only", "-q",
+    sys.executable, "-m", "pytest", "tests/backtest/", "-m", markers, "--collect-only", "-q",
 ]
 proc = subprocess.run(collect_cmd, capture_output=True, text=True)
 if proc.returncode != 0:
