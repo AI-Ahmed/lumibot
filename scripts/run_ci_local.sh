@@ -7,7 +7,7 @@
 #   RUN_BACKTEST=0 ./scripts/run_ci_local.sh   # skip backtest (faster)
 #
 # Optional: export GIT_TOKEN so the private FPAP dependency is installed (same as Actions).
-# Optional: USE_UV=1 to use uv instead of pip for install (requires uv).
+# Optional: USE_UV=0 to force pip even when uv is installed (e.g. in CI).
 
 set -euo pipefail
 
@@ -20,27 +20,32 @@ export BACKTESTING_DATA_SOURCE="${BACKTESTING_DATA_SOURCE:-none}"
 export BACKTESTING_SHOW_PROGRESS_BAR="${BACKTESTING_SHOW_PROGRESS_BAR:-false}"
 export PYTEST_MARKERS="${PYTEST_MARKERS:-not apitest and not downloader}"
 
-echo "=== Resolve and install dependencies (CI-like) ==="
-python -m pip install --upgrade pip
-pip install requests
+# Prefer uv when available (venvs created with "uv venv" often have no pip)
+USE_UV="${USE_UV:-}"
+if [ "$USE_UV" = "" ]; then
+  command -v uv >/dev/null 2>&1 && USE_UV=1 || USE_UV=0
+fi
 
+echo "=== Resolve and install dependencies (CI-like) ==="
 if [ -n "${GIT_TOKEN:-}" ]; then
   sed 's/${GIT_TOKEN}/'"$GIT_TOKEN"'/g' requirements.txt > requirements.resolved.txt
 else
   grep -v 'FPAP.git' requirements.txt > requirements.resolved.txt
 fi
 
-if [ "${USE_UV:-0}" = "1" ]; then
-  command -v uv >/dev/null 2>&1 || { echo "USE_UV=1 but uv not found"; exit 1; }
+if [ "$USE_UV" = "1" ]; then
+  uv pip install requests ruff
   uv pip install -r requirements.resolved.txt
 else
+  python -m pip install --upgrade pip
+  pip install requests ruff
   pip install -r requirements.resolved.txt
 fi
 
 echo "=== Lint (Ruff, same scope as CI) ==="
-ruff check --select F,I \
+python -m ruff check --select F,I \
   lumibot/tools/thetadata_helper.py \
-  lumibot/tools/thetadata_queue_client.py \
+  lumibot/tools/data_downloader_queue_client.py \
   lumibot/backtesting/thetadata_backtesting_pandas.py \
   lumibot/components/options_helper.py \
   lumibot/strategies/_strategy.py \

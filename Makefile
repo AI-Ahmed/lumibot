@@ -28,7 +28,7 @@ install-ci:
 lint:
 	ruff check --select F,I \
 	  lumibot/tools/thetadata_helper.py \
-	  lumibot/tools/thetadata_queue_client.py \
+	  lumibot/tools/data_downloader_queue_client.py \
 	  lumibot/backtesting/thetadata_backtesting_pandas.py \
 	  lumibot/components/options_helper.py \
 	  lumibot/strategies/_strategy.py \

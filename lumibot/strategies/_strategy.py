@@ -22,6 +22,7 @@ from sqlalchemy.exc import OperationalError
 from termcolor import colored
 
 from lumibot.constants import LUMIBOT_DEFAULT_PYTZ
+from lumibot.tools.helpers import to_datetime_aware
 from lumibot.tools.lumibot_logger import get_logger, get_strategy_logger
 from lumibot.tools.parquet_utils import (
     coerce_object_columns_to_json_strings,
@@ -29,8 +30,6 @@ from lumibot.tools.parquet_utils import (
     write_parquet_with_logging,
 )
 
-from lumibot.tools.helpers import to_datetime_aware
-from ..entities import Asset, Order, Position, Data, Bars
 from ..backtesting import (
     AlpacaBacktesting,
     BacktestingBroker,
@@ -43,8 +42,9 @@ from ..backtesting import (
     ThetaDataBacktestingPandas,
     YahooDataBacktesting,
 )
-
 from ..credentials import (
+    ALPACA_CONFIG,
+    ALPACA_MAX_MEMORY_BYTES,
     BACKTESTING_END,
     BACKTESTING_QUIET_LOGS,
     BACKTESTING_SHOW_PROGRESS_BAR,
@@ -64,19 +64,10 @@ from ..credentials import (
     SHOW_INDICATORS,
     SHOW_PLOT,
     SHOW_TEARSHEET,
-    LIVE_CONFIG,
-    POLYGON_MAX_MEMORY_BYTES,
-    ALPACA_MAX_MEMORY_BYTES,
-    ALPACA_CONFIG,
-    BACKTESTING_START,
-    BACKTESTING_END,
-    LOG_BACKTEST_PROGRESS_TO_FILE,
-    BACKTESTING_SHOW_PROGRESS_BAR,
-    BACKTESTING_QUIET_LOGS,
     STRATEGY_NAME,
     THETADATA_CONFIG,
 )
-
+from ..entities import Asset, Bars, Data, Order, Position
 from ..tools import (
     create_tearsheet,
     day_deduplicate,
@@ -84,7 +75,6 @@ from ..tools import (
     plot_indicators,
     plot_returns,
     stats_summary,
-    to_datetime_aware,
 )
 from ..traders import Trader
 from .strategy_executor import StrategyExecutor
@@ -3893,8 +3883,7 @@ class _Strategy:
         losing_trades = trade_df[trade_df['pl'] < 0]
         
         win_count = len(winning_trades)
-        loss_count = len(losing_trades)
-        
+
         win_rate = win_count / trade_count if trade_count > 0 else 0
         
         total_profit = trade_df['pl'].sum()
