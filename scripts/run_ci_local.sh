@@ -14,6 +14,20 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Use python from PATH, or python3, or repo .venv (pre-push hook often runs without venv activated)
+PYTHON=python
+if command -v python >/dev/null 2>&1; then
+  PYTHON=python
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON=python3
+elif [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+  PYTHON="$REPO_ROOT/.venv/bin/python"
+else
+  echo "run_ci_local.sh: python or python3 not found; install Python or activate a venv."
+  exit 127
+fi
+export PYTHON
+
 # CI-like env (match .github/workflows/cicd.yaml)
 export AIOHTTP_NO_EXTENSIONS="${AIOHTTP_NO_EXTENSIONS:-1}"
 export BACKTESTING_DATA_SOURCE="${BACKTESTING_DATA_SOURCE:-none}"
@@ -37,13 +51,13 @@ if [ "$USE_UV" = "1" ]; then
   uv pip install requests ruff pytest-mock
   uv pip install -r requirements.resolved.txt
 else
-  python -m pip install --upgrade pip
-  pip install requests ruff pytest-mock
-  pip install -r requirements.resolved.txt
+  "$PYTHON" -m pip install --upgrade pip
+  "$PYTHON" -m pip install requests ruff pytest-mock
+  "$PYTHON" -m pip install -r requirements.resolved.txt
 fi
 
 echo "=== Lint (Ruff, same scope as CI) ==="
-python -m ruff check --select F,I \
+"$PYTHON" -m ruff check --select F,I \
   lumibot/tools/thetadata_helper.py \
   lumibot/tools/data_downloader_queue_client.py \
   lumibot/backtesting/thetadata_backtesting_pandas.py \
@@ -56,7 +70,7 @@ python -m ruff check --select F,I \
   tests/test_thetadata_queue_client.py
 
 echo "=== Unit tests (shard 0/6, markers=$PYTEST_MARKERS) ==="
-SHARD_INDEX=0 SHARD_TOTAL=6 python - <<'PY'
+SHARD_INDEX=0 SHARD_TOTAL=6 "$PYTHON" - <<'PY'
 import os
 import subprocess
 import sys
@@ -94,7 +108,7 @@ print(f"Shard {shard_index}/{shard_total} files={len(selected_files)} tests={bin
 PY
 
 UNIT_FILES=$(cat shard_files.txt | tr '\n' ' ')
-python -m pytest -m "$PYTEST_MARKERS" --tb=short -q --durations=30 -x $UNIT_FILES
+"$PYTHON" -m pytest -m "$PYTEST_MARKERS" --tb=short -q --durations=30 -x $UNIT_FILES
 
 if [ "${RUN_BACKTEST:-1}" = "0" ]; then
   echo "=== Skipping backtest tests (RUN_BACKTEST=0) ==="
@@ -103,7 +117,7 @@ if [ "${RUN_BACKTEST:-1}" = "0" ]; then
 fi
 
 echo "=== Backtest tests (shard 0/4) ==="
-SHARD_INDEX=0 SHARD_TOTAL=4 python - <<'PY'
+SHARD_INDEX=0 SHARD_TOTAL=4 "$PYTHON" - <<'PY'
 import os
 import subprocess
 import sys
@@ -133,6 +147,6 @@ print(f"Shard {shard_index}/{shard_total} nodeids={len(bins[shard_index])}")
 PY
 
 BACKTEST_NODEIDS=$(cat shard_nodeids.txt | tr '\n' ' ')
-python -m pytest -m "$PYTEST_MARKERS" --tb=short -q --durations=30 -x $BACKTEST_NODEIDS
+"$PYTHON" -m pytest -m "$PYTEST_MARKERS" --tb=short -q --durations=30 -x $BACKTEST_NODEIDS
 
 echo "=== Local CI finished (lint + unit + backtest) ==="
