@@ -26,7 +26,7 @@ install-ci:
 	pip install -r requirements.resolved.txt
 
 lint:
-	ruff check --select F,I \
+	python -m ruff check --select F,I \
 	  lumibot/tools/thetadata_helper.py \
 	  lumibot/tools/data_downloader_queue_client.py \
 	  lumibot/backtesting/thetadata_backtesting_pandas.py \

@@ -71,7 +71,7 @@ jobs:
           # ThetaData backtesting surface area. To keep CI meaningful without blocking
           # the PR on unrelated legacy lint, lint only the ThetaData-related files and
           # tests this PR touches.
-          ruff check --select F,I \
+          python -m ruff check --select F,I \
             lumibot/tools/thetadata_helper.py \
             lumibot/tools/data_downloader_queue_client.py \
             lumibot/backtesting/thetadata_backtesting_pandas.py \

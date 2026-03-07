@@ -1,7 +1,11 @@
 """
 Pytest configuration and fixtures for LumiBot tests.
 Includes global cleanup for APScheduler instances to prevent CI hangs.
+Centralized credential validation and skip logic for API-dependent tests.
 """
+
+import os
+import warnings
 
 import pytest
 import gc
@@ -264,6 +268,29 @@ def _is_placeholder(value: str) -> bool:
     return v in placeholders
 
 
+def pytest_configure(config):
+    """Register custom markers for data-source tests.
+
+    Use these markers to gate tests that require specific API credentials.
+    When credentials are missing, tests are skipped with a clear warning.
+    """
+    config.addinivalue_line(
+        "markers", "polygon: marks tests requiring Polygon API key (POLYGON_API_KEY)"
+    )
+    config.addinivalue_line(
+        "markers",
+        "thetadata: marks tests requiring ThetaData credentials (THETADATA_USERNAME, THETADATA_PASSWORD)",
+    )
+    config.addinivalue_line(
+        "markers",
+        "alpaca: marks tests requiring Alpaca test credentials (ALPACA_TEST_API_KEY, ALPACA_TEST_API_SECRET)",
+    )
+    config.addinivalue_line(
+        "markers",
+        "tradier: marks tests requiring Tradier test credentials (TRADIER_TEST_ACCESS_TOKEN, TRADIER_TEST_ACCOUNT_NUMBER)",
+    )
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item: pytest.Item):
     """
@@ -274,12 +301,14 @@ def pytest_runtest_setup(item: pytest.Item):
       - downloader: tests that hit remote/downloader services
       - polygon: requires Polygon credentials
       - thetadata: requires ThetaData credentials
+      - alpaca: requires Alpaca test credentials
+      - tradier: requires Tradier test credentials
 
     Behavior:
-      - If a test is marked with polygon and/or thetadata, only those
+      - If a test is marked with provider-specific markers, only those
         provider credentials are required.
       - If a test has apitest/downloader but no provider-specific markers,
-        require both providers (legacy behavior for mixed-provider tests).
+        require polygon + thetadata (legacy behavior for mixed-provider tests).
     """
     has_apitest = item.get_closest_marker("apitest") is not None
     has_downloader = item.get_closest_marker("downloader") is not None
@@ -289,15 +318,21 @@ def pytest_runtest_setup(item: pytest.Item):
 
     requires_polygon = item.get_closest_marker("polygon") is not None
     requires_theta = item.get_closest_marker("thetadata") is not None
+    requires_alpaca = item.get_closest_marker("alpaca") is not None
+    requires_tradier = item.get_closest_marker("tradier") is not None
 
     # Determine which providers are required
-    if requires_polygon or requires_theta:
+    if requires_polygon or requires_theta or requires_alpaca or requires_tradier:
         need_polygon = requires_polygon
         need_theta = requires_theta
+        need_alpaca = requires_alpaca
+        need_tradier = requires_tradier
     else:
-        # No provider-specific markers: assume both may be used
+        # No provider-specific markers: assume polygon + thetadata (legacy)
         need_polygon = True
         need_theta = True
+        need_alpaca = False
+        need_tradier = False
 
     missing = []
 
@@ -315,6 +350,22 @@ def pytest_runtest_setup(item: pytest.Item):
         if _is_placeholder(theta_pass):
             missing.append("THETADATA_PASSWORD")
 
+    if need_alpaca:
+        alpaca_key = os.environ.get("ALPACA_TEST_API_KEY")
+        alpaca_secret = os.environ.get("ALPACA_TEST_API_SECRET")
+        if _is_placeholder(alpaca_key):
+            missing.append("ALPACA_TEST_API_KEY")
+        if _is_placeholder(alpaca_secret):
+            missing.append("ALPACA_TEST_API_SECRET")
+
+    if need_tradier:
+        tradier_token = os.environ.get("TRADIER_TEST_ACCESS_TOKEN")
+        tradier_account = os.environ.get("TRADIER_TEST_ACCOUNT_NUMBER")
+        if _is_placeholder(tradier_token):
+            missing.append("TRADIER_TEST_ACCESS_TOKEN")
+        if _is_placeholder(tradier_account):
+            missing.append("TRADIER_TEST_ACCOUNT_NUMBER")
+
     # Downloader-specific requirement: shared downloader API key
     # Only enforce when tests are explicitly marked with `downloader`.
     if has_downloader:
@@ -331,5 +382,11 @@ def pytest_runtest_setup(item: pytest.Item):
         reason = (
             "Skipping API test due to missing/placeholder credentials: "
             + ", ".join(missing)
+        )
+        warnings.warn(
+            f"Missing required keys for {item.name}: {', '.join(missing)}. "
+            "Add these secrets to run this test.",
+            UserWarning,
+            stacklevel=1,
         )
         pytest.skip(reason)
