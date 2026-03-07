@@ -18,6 +18,9 @@
 
 ### Fixed
 - **CI (GitHub Actions):** Private FPAP dependency now installs correctly in Actions. Pip does not expand env vars in `requirements.txt`; workflows now substitute `GIT_TOKEN` into a resolved requirements file before `pip install`, or omit the private line when the secret is unset (e.g. forks). Add repo secret `GIT_TOKEN` for FPAP install in CI.
+- **Local CI:** Script prefers `uv` when available (works with uv-created venvs that have no pip); installs `ruff` and `pytest-mock` so lint and unit tests run; lint path uses `data_downloader_queue_client` (renamed from `thetadata_queue_client`).
+- **Data.get_quote():** Require only `bid` and `ask` for quote (other quote columns optional); coerce `pd.NA`/NaN to `None` so Quote and downstream `float()` do not receive NA. Fixes IBKR futures backtest when bars have only bid/ask.
+- **BacktestingBroker.process_pending_orders():** Fix `UnboundLocalError` for `batch_id` when using the fast MARKET fill path (bid/ask present).
 - Indicators: trade-derived markers in `plot_indicators()` now use tooltip as-is (no redundant "Value:" prefix); aligns with trades plot quality. Header labels for trade-derived markers changed from "Buy"/"Sell" to "Bought"/"Sold".
 - Indicators plot: use "Strategy/Benchmark" instead of "default_plot" for subplot/axis titles when showing trade-derived markers with baseline; add `autosize=True` and `responsive=True` for better browser fill; reduce top margin and increase base height.
 - ThetaData daily options MTM: prefer snapshot quote marks over stale day marks, and allow forward-fill when snapshot data is unavailable.
