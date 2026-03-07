@@ -14,6 +14,7 @@ Local runs are great for fast feedback, but the full suite is often faster and m
 Recommended approach on `version/X.Y.Z` branches:
 
 - Run targeted tests locally for quick iteration.
+- **Run CI locally before push** to catch install/lint/test failures without waiting for Actions: `make ci` (full) or `make ci-quick` (lint + unit only). See root `Makefile` and `scripts/run_ci_local.sh`. Optional: `git config core.hooksPath .githooks` so `git push` runs `make ci-quick` first.
 - Push early/often so GitHub CI can run the full sharded suite for release confidence.
 
 Treat **green GitHub CI** as the “release-ready” signal since it matches the release workflow environment more closely than a single local machine.

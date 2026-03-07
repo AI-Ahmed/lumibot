@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Pre-push hook: run quick CI (lint + unit tests) before allowing push.
+# Enable with: git config core.hooksPath .githooks
+# Disable with: git config --unset core.hooksPath
+
+set -e
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+echo "Running local CI (lint + unit) before push..."
+make ci-quick

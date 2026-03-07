@@ -507,6 +507,32 @@ POLYGON_API_KEY=your_polygon_key
 - **Backtest Tests**: Strategy backtesting validation
 - **Performance Tests**: Speed and memory benchmarks
 
+### Run CI locally before push
+
+To run the same steps as GitHub Actions (install, lint, unit tests, backtest tests) before pushing:
+
+```bash
+# Full CI (lint + unit + backtest) — same as Actions
+make ci
+
+# Quick check (lint + unit only, no backtest) — faster
+make ci-quick
+
+# Install deps only (CI-like; use GIT_TOKEN if you need private FPAP)
+make install-ci
+
+# Lint only (same Ruff scope as CI)
+make lint
+```
+
+Optional: run CI automatically before every push by enabling the sample hook:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Then `git push` will run `make ci-quick` first; if it fails, the push is aborted.
+
 ## Remote Cache Configuration
 
 Lumibot can mirror its local parquet caches to AWS S3 when you enable the new
