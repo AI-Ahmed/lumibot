@@ -36,6 +36,7 @@ from ..backtesting import (
     InteractiveBrokersRESTBacktesting,
     YahooDataBacktesting,
 )
+from ..components.agents import AgentManager
 from ..credentials import (
     ALPACA_CONFIG,
     ALPACA_MAX_MEMORY_BYTES,
@@ -67,7 +68,6 @@ from ..tools import (
     plot_returns,
     stats_summary,
 )
-from ..components.agents import AgentManager
 from ..traders import Trader
 from .strategy_executor import StrategyExecutor
 
