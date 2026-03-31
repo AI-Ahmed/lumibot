@@ -67,6 +67,7 @@ from ..tools import (
     plot_returns,
     stats_summary,
 )
+from ..components.agents import AgentManager
 from ..traders import Trader
 from .strategy_executor import StrategyExecutor
 
