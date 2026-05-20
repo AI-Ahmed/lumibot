@@ -448,6 +448,70 @@ class GoogleADKRuntime:
             usage=usage,
         )
 
+    # Transient-error retry policy for the full agent call. Covers both the
+    # Gemini-native path (google-genai exceptions) and the LiteLlm path
+    # (network/timeouts below LiteLLM's own retry layer). LiteLLM already
+    # retries individual HTTP calls 3x; this outer retry handles whole-run
+    # failures like session setup errors, ADK runner glitches, and anything
+    # else that bubbles up.
+    #
+    # Retry schedule: 10 attempts with per-step backoff capped at 60s so no
+    # single wait exceeds one minute. Total budget ~= 5 minutes across all
+    # attempts. Prefer more small tries over a few long ones — most cloud
+    # provider 5xx storms clear within seconds or low-minutes, and a 5-min
+    # budget covers the common case without leaving a live bot frozen for
+    # 10 minutes on a single call. If the provider is still down after
+    # this budget, the strategy-level safety net (in manager.py's
+    # AgentHandle.run) catches the failure and skips this iteration so
+    # the strategy stays alive and retries on the next bar.
+    _MAX_RUN_ATTEMPTS = 10
+    _RETRY_BACKOFF_SECONDS = (2.0, 3.0, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 60.0, 60.0)
+
+    @staticmethod
+    def _max_attempts_for_request(request: RuntimeRequest) -> int:
+        raw = os.environ.get("LUMIBOT_AGENT_MAX_RUN_ATTEMPTS")
+        if raw:
+            try:
+                return max(int(raw), 1)
+            except Exception:
+                pass
+        mode = ""
+        if isinstance(request.runtime_context, dict):
+            mode = str(request.runtime_context.get("mode") or "").strip().lower()
+        # Backtests can multiply spend quickly because one strategy run may call
+        # the model hundreds of times. Keep provider retries conservative unless
+        # the user explicitly opts into a higher retry budget.
+        if mode == "backtesting":
+            return 2
+        return GoogleADKRuntime._MAX_RUN_ATTEMPTS
+
+    @staticmethod
+    def _run_timeout_seconds_for_request(request: RuntimeRequest) -> float | None:
+        raw = os.environ.get("LUMIBOT_AGENT_RUN_TIMEOUT_SECONDS")
+        if raw:
+            try:
+                timeout_seconds = float(raw)
+                return timeout_seconds if timeout_seconds > 0 else None
+            except Exception:
+                pass
+        return 300.0
+
+    @staticmethod
+    def _is_non_retryable(exc: BaseException) -> bool:
+        # Use the shared classifier: only transient and unknown errors retry.
+        # auth / config / billing surface immediately so we don't waste ~5
+        # minutes of retry budget on a wrong API key.
+        return _classify_agent_error(exc) not in ("transient", "unknown")
+
+    async def _run_async_with_timeout(self, request: RuntimeRequest, timeout_seconds: float) -> AgentRunResult:
+        try:
+            return await asyncio.wait_for(self._run_async(request), timeout=timeout_seconds)
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            raise TimeoutError(
+                f"Agent run exceeded {timeout_seconds:g}s timeout "
+                f"(model={request.model!r}, agent={request.agent_name!r})."
+            ) from exc
+
     def run(self, request: RuntimeRequest) -> AgentRunResult:
         return asyncio.run(self._run_async(request))
 
