@@ -1,5 +1,8 @@
-import asyncio
+from __future__ import annotations
+
 import contextlib
+import asyncio
+import hashlib
 import importlib
 import logging
 import json
@@ -8,24 +11,40 @@ import math
 import os
 import re
 import sys
+import time
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from enum import Enum
 from typing import Any
-from uuid import uuid4
-
-import httpx
-from anyio import run as anyio_run
-from anyio.from_thread import start_blocking_portal
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-from mcp.client.streamable_http import streamablehttp_client
+from uuid import UUID, uuid4
 
 from .schemas import AgentRunResult, AgentTraceEvent, BoundTool, MCPServer
 
 
 _GOOGLE_SDK_NOISE_FILTERS_CONFIGURED = False
+ClientSession = None
+StdioServerParameters = None
+stdio_client = None
+streamablehttp_client = None
+
+
+def _ensure_mcp_client_imports():
+    global ClientSession, StdioServerParameters, stdio_client, streamablehttp_client
+    if ClientSession is None or StdioServerParameters is None:
+        from mcp import ClientSession as _ClientSession, StdioServerParameters as _StdioServerParameters
+
+        ClientSession = _ClientSession
+        StdioServerParameters = _StdioServerParameters
+    if stdio_client is None:
+        from mcp.client.stdio import stdio_client as _stdio_client
+
+        stdio_client = _stdio_client
+    if streamablehttp_client is None:
+        from mcp.client.streamable_http import streamablehttp_client as _streamablehttp_client
+
+        streamablehttp_client = _streamablehttp_client
 
 
 class _GoogleGenAITypesNoiseFilter(logging.Filter):
@@ -114,6 +133,10 @@ def _json_safe_value(value: Any) -> Any:
         return value if math.isfinite(value) else None
     if isinstance(value, (datetime, date)):
         return value.isoformat()
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, Enum):
+        return _json_safe_value(value.value)
     if isinstance(value, list):
         return [_json_safe_value(item) for item in value]
     if isinstance(value, tuple):
@@ -134,7 +157,7 @@ def _json_safe_value(value: Any) -> Any:
             pass
         else:
             return coerced if math.isfinite(coerced) else None
-    return value
+    return str(value)
 
 
 def _to_serializable_dict(value: Any) -> dict[str, Any] | None:
@@ -225,6 +248,50 @@ def _coerce_usage_metadata(value: Any) -> dict[str, Any] | None:
     return None
 
 
+def _aggregate_usage_metadata(payloads: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not payloads:
+        return None
+    if len(payloads) == 1:
+        return payloads[0]
+
+    aggregate: dict[str, Any] = dict(payloads[-1])
+    additive_keys = {
+        "cached_content_token_count",
+        "cached_input_tokens",
+        "cached_prompt_tokens",
+        "cached_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "candidates_token_count",
+        "completion_tokens",
+        "prompt_token_count",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens",
+        "prompt_tokens",
+        "reasoning_tokens",
+        "thoughts_token_count",
+        "tool_use_prompt_token_count",
+        "total_token_count",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+    }
+    for key in additive_keys:
+        total = 0
+        seen = False
+        for payload in payloads:
+            value = payload.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                total += int(value)
+                seen = True
+        if seen:
+            aggregate[key] = total
+    aggregate["aggregated_usage_event_count"] = len(payloads)
+    return aggregate
+
+
 def _normalize_event(event: Any) -> list[AgentTraceEvent]:
     normalized: list[AgentTraceEvent] = []
     parts = getattr(getattr(event, "content", None), "parts", None) or []
@@ -287,9 +354,153 @@ class RuntimeRequest:
     runtime_context: dict[str, Any] | None
     memory_notes: list[dict[str, Any]]
     bound_tools: list[BoundTool]
+    provider_prompt_cache_key: str | None = None
 
 
 _LITELLM_CONFIGURED = False
+
+
+# Error classification for AI agent calls.
+#
+# The taxonomy has five buckets. Scope: AI agent calls only. The rest of
+# LumiBot's error handling (strategy_executor, brokers, data sources) is
+# unchanged. See `AgentHandle.run()` and `docsrc/agents.rst` for how these
+# buckets map to backtest-vs-live behavior.
+#
+#   "auth"      : missing/invalid API key, permission denied (401, 403)
+#   "config"    : bad model id, malformed prompt, context-window exceeded,
+#                 invalid payload (400, 404, 422)
+#   "billing"   : out of credits, payment required, quota exhausted (402,
+#                 429 + "insufficient_quota", 403 + billing/credits msg)
+#   "transient" : 5xx, rate-limit bursts, timeouts, connection errors
+#   "unknown"   : anything not matched above; treated as transient (safe default)
+
+_ERROR_CLASS_AUTH = (
+    "AuthenticationError",
+    "PermissionDeniedError",
+    "UnauthenticatedError",
+    "NotAuthorized",
+)
+_ERROR_CLASS_CONFIG = (
+    "BadRequestError",
+    "NotFoundError",
+    "UnprocessableEntityError",
+    "ContextWindowExceededError",
+    "ContentPolicyViolationError",
+    "InvalidRequestError",
+    "ImportError",
+    "ModuleNotFoundError",
+)
+_ERROR_CLASS_BILLING = (
+    "BillingError",
+    "InsufficientQuotaError",
+    "PaymentRequiredError",
+)
+_ERROR_CLASS_TRANSIENT = (
+    "APIConnectionError",
+    "APIResponseValidationError",
+    "APITimeoutError",
+    "InternalServerError",
+    "ServerError",
+    "ServiceUnavailableError",
+    "Timeout",
+    "TimeoutError",
+    "OverloadedError",
+    "RateLimitError",
+    "ServerDisconnectedError",
+    "ReadTimeout",
+    "ConnectTimeout",
+    "ConnectionError",
+)
+
+_BILLING_BODY_KEYWORDS = (
+    "insufficient_quota",
+    "insufficient funds",
+    "no credits",
+    "no credit",
+    "available credits",
+    "out of credits",
+    "spending limit",
+    "monthly spending limit",
+    "billing",
+    "payment",
+    "purchase those",
+    "team doesn't have any credits",
+    "team does not have any credits",
+    "quota exceeded",
+    "exceeded your current quota",
+)
+
+
+def _classify_agent_error(exc: BaseException) -> str:
+    """Map an exception raised by the AI agent stack to a bucket.
+
+    See the module-level docstring for the taxonomy. Safe default is
+    "unknown" so behavior matches "transient" (retry/skip) when we
+    cannot tell — failing closed is the wrong choice for AI errors
+    because most truly-unknown failures are transient provider issues.
+    """
+    exc_name = exc.__class__.__name__
+    message = str(exc)
+    message_lower = message.lower()
+
+    # HTTP status code if the provider SDK attached one.
+    status_code = None
+    for attr in ("status_code", "http_status", "code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            status_code = value
+            break
+
+    # Body/keyword check for billing — takes precedence over auth because
+    # providers often return 401/403 for "no credits" when the key itself
+    # is valid (e.g. xAI's "team doesn't have any credits yet").
+    if any(kw in message_lower for kw in _BILLING_BODY_KEYWORDS):
+        return "billing"
+
+    # Explicit class-name matches (litellm + google-genai + openai + anthropic).
+    if exc_name in _ERROR_CLASS_AUTH:
+        return "auth"
+    if exc_name in _ERROR_CLASS_CONFIG:
+        return "config"
+    if exc_name in _ERROR_CLASS_BILLING:
+        return "billing"
+    if exc_name in _ERROR_CLASS_TRANSIENT:
+        return "transient"
+
+    # HTTP status code based classification as a fallback.
+    if status_code is not None:
+        if status_code == 402:
+            return "billing"
+        if status_code in (401, 403):
+            # Already checked billing keywords above; if we got here it's auth.
+            return "auth"
+        if status_code == 404:
+            return "config"
+        if status_code in (400, 422):
+            return "config"
+        if status_code == 429:
+            # Rate limits are transient; insufficient_quota already caught above.
+            return "transient"
+        if 500 <= status_code < 600:
+            return "transient"
+
+    # Message substring fallback for providers that don't use standard class names.
+    lower_exc = exc_name.lower()
+    if any(kw in lower_exc for kw in ("auth", "permission", "unauthorized", "apikey")):
+        return "auth"
+    if "context" in lower_exc and ("length" in lower_exc or "window" in lower_exc):
+        return "config"
+    if any(kw in message_lower for kw in ("api key", "apikey", "unauthenticated", "permission denied")):
+        return "auth"
+    if "invalid model" in message_lower or "model not found" in message_lower:
+        return "config"
+    if "context length" in message_lower or "context_length" in message_lower or "context window" in message_lower:
+        return "config"
+    if "not json serializable" in message_lower or "not json-serializable" in message_lower:
+        return "config"
+
+    return "unknown"
 
 
 def _configure_litellm_quietly() -> None:
@@ -313,10 +524,285 @@ def _configure_litellm_quietly() -> None:
         litellm.suppress_debug_info = True
     except Exception:
         pass
+    # Provider param compatibility: Google ADK's LiteLlm bridge emits
+    # OpenAI-shaped params (e.g. max_completion_tokens). Some providers
+    # (xAI, Anthropic, a few others) reject unknown params with
+    # UnsupportedParamsError. drop_params makes LiteLLM silently drop
+    # params the target provider does not accept instead of failing the
+    # call. Affects only unknown kwargs; real errors still propagate.
+    try:
+        litellm.drop_params = True
+    except Exception:
+        pass
+    # Transient-error retry: rate-limit (429), server errors (500/502/503/529),
+    # and brief network blips all happen in normal operation. LiteLLM has
+    # provider-aware retry logic (exponential backoff, 429 Retry-After
+    # awareness). Enable it at the library level so every provider benefits.
+    # Does NOT retry 4xx client errors (auth, invalid model, context length).
+    try:
+        litellm.num_retries = 3
+    except Exception:
+        pass
     _LITELLM_CONFIGURED = True
 
 
-def _resolve_model_for_adk(model: Any) -> Any:
+def _sync_xai_api_key_alias() -> None:
+    """Allow Grok users to provide either the vendor key name or product name.
+
+    LiteLLM's xAI provider reads XAI_API_KEY. LumiBot's older Grok helper also
+    accepts GROK_API_KEY, so mirror GROK_API_KEY into XAI_API_KEY for xai/ models
+    when the canonical xAI env var is absent.
+    """
+    if not os.environ.get("XAI_API_KEY") and os.environ.get("GROK_API_KEY"):
+        os.environ["XAI_API_KEY"] = os.environ["GROK_API_KEY"]
+
+
+def _sync_gemini_api_key_alias() -> None:
+    """Allow product-facing GEMINI_API_KEY with Google SDK internals.
+
+    Google examples and some SDK paths use GOOGLE_API_KEY. LumiBot's public
+    docs use GEMINI_API_KEY, so mirror it when the Google name is absent.
+    """
+    if not os.environ.get("GOOGLE_API_KEY") and os.environ.get("GEMINI_API_KEY"):
+        os.environ["GOOGLE_API_KEY"] = os.environ["GEMINI_API_KEY"]
+
+
+def _sync_together_api_key_alias() -> None:
+    """Allow either Together's SDK key name or LiteLLM's provider key name.
+
+    Together's own examples commonly use TOGETHER_API_KEY, while LiteLLM's
+    Together provider reads TOGETHERAI_API_KEY. Mirror in both directions so
+    users can set either one.
+    """
+    if not os.environ.get("TOGETHERAI_API_KEY") and os.environ.get("TOGETHER_API_KEY"):
+        os.environ["TOGETHERAI_API_KEY"] = os.environ["TOGETHER_API_KEY"]
+    if not os.environ.get("TOGETHER_API_KEY") and os.environ.get("TOGETHERAI_API_KEY"):
+        os.environ["TOGETHER_API_KEY"] = os.environ["TOGETHERAI_API_KEY"]
+
+
+def _provider_prompt_cache_key(request: RuntimeRequest) -> str:
+    """Stable provider-routing key for server-side prompt caches.
+
+    This is not LumiBot's replay cache key. It intentionally excludes the
+    changing market context so providers can reuse the static prefix
+    (system prompt + tool declarations) while still computing each new bar.
+    """
+    payload = {
+        "agent": request.agent_name,
+        "model": request.model,
+        "system_prompt": request.system_prompt,
+        "tools": [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "source": tool.source,
+                "metadata": tool.metadata,
+            }
+            for tool in request.bound_tools
+        ],
+    }
+    digest = hashlib.sha256(json.dumps(_json_safe_value(payload), sort_keys=True).encode("utf-8")).hexdigest()
+    return f"lumibot:{request.agent_name}:{digest[:32]}"
+
+
+def _model_context_limit_tokens(model: Any) -> int | None:
+    if not isinstance(model, str):
+        return None
+    lower = model.strip().lower()
+    if lower.startswith("deepseek/deepseek-v4-"):
+        return 1_048_576
+    return None
+
+
+def _model_context_string_limit_chars(model: Any) -> int | None:
+    if not isinstance(model, str):
+        return None
+    lower = model.strip().lower()
+    if lower.startswith("deepseek/deepseek-v4-"):
+        return 20_000
+    return None
+
+
+def _truncate_preserving_edges(text: str, max_chars: int, *, label: str) -> str:
+    if len(text) <= max_chars:
+        return text
+    head_chars = max(max_chars // 2, 0)
+    tail_chars = max(max_chars - head_chars, 0)
+    omitted = len(text) - head_chars - tail_chars
+    notice = (
+        f"\n\n[Lumibot input context pruned {omitted} characters from {label} "
+        "to stay within the receiving model context window. Beginning and end "
+        "are preserved.]\n\n"
+    )
+    if len(notice) >= max_chars:
+        notice = f"\n[Pruned {omitted} chars from {label}.]\n"
+    available = max(max_chars - len(notice), 0)
+    head_chars = available // 2
+    tail_chars = available - head_chars
+    return f"{text[:head_chars]}{notice}{text[-tail_chars:] if tail_chars else ''}"
+
+
+def _prune_large_context_strings(value: Any, *, max_string_chars: int, path: str = "context") -> tuple[Any, int]:
+    if isinstance(value, str):
+        if len(value) <= max_string_chars:
+            return value, 0
+        return _truncate_preserving_edges(value, max_string_chars, label=path), 1
+    if isinstance(value, dict):
+        pruned = 0
+        output: dict[str, Any] = {}
+        for key, item in value.items():
+            child, child_pruned = _prune_large_context_strings(
+                item,
+                max_string_chars=max_string_chars,
+                path=f"{path}.{key}",
+            )
+            output[str(key)] = child
+            pruned += child_pruned
+        return output, pruned
+    if isinstance(value, list):
+        pruned = 0
+        output = []
+        for idx, item in enumerate(value):
+            child, child_pruned = _prune_large_context_strings(
+                item,
+                max_string_chars=max_string_chars,
+                path=f"{path}[{idx}]",
+            )
+            output.append(child)
+            pruned += child_pruned
+        return output, pruned
+    return value, 0
+
+
+def _serialized_content_length(value: Any) -> int:
+    try:
+        if hasattr(value, "model_dump"):
+            return len(json.dumps(_json_safe_value(value.model_dump(mode="json")), sort_keys=True, default=str))
+        return len(json.dumps(_json_safe_value(value), sort_keys=True, default=str))
+    except Exception:
+        return len(repr(value))
+
+
+def _request_contents_length(contents: list[Any]) -> int:
+    return sum(_serialized_content_length(content) for content in contents)
+
+
+def _part_has_function_response(part: Any) -> bool:
+    return getattr(part, "function_response", None) is not None
+
+
+def _function_response_payload_length(part: Any) -> int:
+    function_response = getattr(part, "function_response", None)
+    if function_response is None:
+        return 0
+    return _serialized_content_length(getattr(function_response, "response", None))
+
+
+def _replace_function_response_payload(part: Any, message: str) -> bool:
+    function_response = getattr(part, "function_response", None)
+    if function_response is None:
+        return False
+    replacement = {
+        "lumibot_context_pruned": True,
+        "message": message,
+    }
+    try:
+        function_response.response = replacement
+        return True
+    except Exception:
+        return False
+
+
+def _prune_request_contents_for_context_window(
+    contents: list[Any],
+    *,
+    context_limit_tokens: int,
+    reserve_ratio: float = 0.05,
+    preserve_recent_tool_results: int = 8,
+) -> dict[str, Any] | None:
+    """Trim oversized historical tool results before provider context failure.
+
+    This is input-side context pruning. It leaves the Lumibot system prompt,
+    task, tool declarations, function-call sequence, and most recent tool
+    results intact. Only older tool-result payloads are replaced, and only when
+    the serialized request is already larger than a conservative provider-window
+    budget.
+    """
+    if not contents:
+        return None
+
+    max_chars = int(context_limit_tokens * reserve_ratio)
+    before_chars = _request_contents_length(contents)
+    if before_chars <= max_chars:
+        return None
+
+    tool_response_parts: list[Any] = []
+    for content in contents:
+        for part in getattr(content, "parts", None) or []:
+            if _part_has_function_response(part):
+                tool_response_parts.append(part)
+
+    if len(tool_response_parts) <= preserve_recent_tool_results:
+        return None
+
+    pruned = 0
+    replacement_message = (
+        "Older tool result omitted by Lumibot before this model call because "
+        "the provider context window would otherwise be exceeded. Use the most "
+        "recent visible tool results or call a targeted tool again if this older "
+        "detail is still required."
+    )
+    candidates = tool_response_parts[: -preserve_recent_tool_results]
+    candidates.sort(key=_function_response_payload_length, reverse=True)
+    for part in candidates:
+        if _request_contents_length(contents) <= max_chars:
+            break
+        if _replace_function_response_payload(part, replacement_message):
+            pruned += 1
+
+    after_chars = _request_contents_length(contents)
+    if pruned <= 0:
+        return None
+    return {
+        "type": "provider_context_pruning",
+        "pruned_tool_results": pruned,
+        "before_chars": before_chars,
+        "after_chars": after_chars,
+        "max_chars": max_chars,
+    }
+
+
+def _copy_content_without_thought_parts(content: Any) -> tuple[Any, bool]:
+    parts = getattr(content, "parts", None)
+    if not parts:
+        return content, False
+    filtered_parts = [part for part in parts if not getattr(part, "thought", False)]
+    if len(filtered_parts) == len(parts):
+        return content, False
+    if hasattr(content, "model_copy"):
+        return content.model_copy(update={"parts": filtered_parts}), True
+    try:
+        return type(content)(role=getattr(content, "role", None), parts=filtered_parts), True
+    except Exception:
+        content.parts = filtered_parts
+        return content, True
+
+
+def _strip_thought_parts_from_litellm_request(llm_request: Any) -> None:
+    contents = getattr(llm_request, "contents", None)
+    if not contents:
+        return
+    updated = []
+    changed = False
+    for content in contents:
+        clean_content, content_changed = _copy_content_without_thought_parts(content)
+        updated.append(clean_content)
+        changed = changed or content_changed
+    if changed:
+        llm_request.contents = updated
+
+
+def _resolve_model_for_adk(model: Any, *, prompt_cache_key: str | None = None) -> Any:
     # Native Gemini IDs take ADK's fast path as plain strings. Any other
     # provider prefix (e.g. "openai/...", "xai/...", "anthropic/...") is
     # routed through google.adk.models.lite_llm.LiteLlm which normalizes
@@ -325,16 +811,61 @@ def _resolve_model_for_adk(model: Any) -> Any:
         return model
     lower = model.strip().lower()
     if lower.startswith("gemini-") or lower.startswith("models/gemini"):
+        _sync_gemini_api_key_alias()
         return model
+    if lower.startswith("xai/"):
+        _sync_xai_api_key_alias()
+    if lower.startswith("together_ai/"):
+        _sync_together_api_key_alias()
     _configure_litellm_quietly()
     try:
         from google.adk.models.lite_llm import LiteLlm
     except ImportError as exc:
         raise ImportError(
             f"Agent model '{model}' requires the 'litellm' package. "
-            "Install it with: pip install litellm"
+            "Install it with: pip install 'google-adk[extensions]' litellm"
         ) from exc
-    return LiteLlm(model=model)
+
+    class CerebrasLiteLlm(LiteLlm):
+        async def generate_content_async(self, llm_request: Any, stream: bool = False):
+            # ADK 2 preserves provider reasoning as Gemini thought parts and
+            # LiteLLM serializes those back to `messages.*.reasoning_content`.
+            # Cerebras rejects that nonstandard message field, so strip thought
+            # parts before request conversion while preserving normal text and
+            # tool-call history.
+            _strip_thought_parts_from_litellm_request(llm_request)
+            async for response in super().generate_content_async(llm_request, stream=stream):
+                yield response
+
+    kwargs: dict[str, Any] = {}
+    if prompt_cache_key:
+        if lower.startswith("openai/"):
+            # OpenAI prompt caching is automatic for long shared prefixes. The
+            # key improves routing stability and 24h is the documented maximum
+            # extended retention value.
+            kwargs["prompt_cache_key"] = prompt_cache_key
+            kwargs["prompt_cache_retention"] = "24h"
+        elif lower.startswith("xai/"):
+            # xAI recommends x-grok-conv-id for Chat Completions cache routing.
+            kwargs["headers"] = {"x-grok-conv-id": prompt_cache_key}
+    model_type = CerebrasLiteLlm if lower.startswith("cerebras/") else LiteLlm
+    return model_type(model=model, **kwargs)
+
+
+def _supports_explicit_temperature_for_adk_model(model: Any) -> bool:
+    """Return True only for ADK-native models known to accept temperature.
+
+    ADK's LiteLlm bridge forwards GenerateContentConfig fields to provider APIs.
+    OpenAI GPT-5/reasoning-class models reject custom temperature values and only
+    allow the provider default. Passing temperature=0.0 therefore breaks those
+    models before the agent can run. Keep deterministic temperature only on the
+    Gemini-native path; let LiteLLM providers use their provider defaults unless
+    a future explicit per-provider compatibility layer is added.
+    """
+    if not isinstance(model, str):
+        return False
+    lower = model.strip().lower()
+    return lower.startswith("gemini-") or lower.startswith("models/gemini")
 
 
 class GoogleADKRuntime:
@@ -368,49 +899,176 @@ class GoogleADKRuntime:
         self._google_genai_types = google_genai_types
         return self._llm_agent_type, self._runner_type, self._genai_types, self._function_tool_type
 
+    @staticmethod
+    def _maybe_build_gemini_thinking_planner(model: Any, genai_types: Any) -> Any | None:
+        """Gemini 3 thought text only shows up when ADK thinking is enabled via
+        BuiltInPlanner, not GenerateContentConfig.
+
+        BotSpot already uses this path successfully. LumiBot originally tried to
+        set `ThinkingConfig(include_thoughts=True)` inside
+        `GenerateContentConfig`, which still yielded thought token counts but not
+        explicit thought parts in normalized events. This helper mirrors the
+        BotSpot pattern so real thought parts can flow through `_normalize_event`.
+        """
+        if not isinstance(model, str):
+            return None
+        lower_model = model.strip().lower()
+        if not lower_model.startswith("gemini-3"):
+            return None
+        thinking_config_type = getattr(genai_types, "ThinkingConfig", None)
+        if thinking_config_type is None:
+            return None
+        try:
+            planners_module = importlib.import_module("google.adk.planners")
+        except ImportError:
+            return None
+        planner_type = getattr(planners_module, "BuiltInPlanner", None)
+        if planner_type is None:
+            return None
+        try:
+            thinking_config = thinking_config_type(include_thoughts=True)
+            return planner_type(thinking_config=thinking_config)
+        except Exception:
+            return None
+
     def _instruction_for(self, request: RuntimeRequest) -> str:
         lines = [request.system_prompt.strip()]
         lines.append("")
         lines.append("General rules:")
         lines.append("- Use tools for structured data and trading actions.")
+        if request.bound_tools:
+            tool_names = ", ".join(sorted(tool.name for tool in request.bound_tools))
+            lines.append(f"- Available tool names for this run: {tool_names}.")
+            lines.append("- Only call tool names that appear in the available tool list for this run.")
         lines.append("- Use DuckDB for time-series analysis when historical tables are available.")
         lines.append("- Return a short final summary after you finish using tools.")
-        if request.memory_notes:
-            lines.append("")
-            lines.append("Persistent memory from earlier runs:")
-            for note in request.memory_notes[-5:]:
-                timestamp = note.get("timestamp") or "unknown_time"
-                summary = note.get("summary") or ""
-                lines.append(f"- {timestamp}: {summary}")
         return "\n".join(lines).strip()
+
+    def _before_model_context_pruning_callback(self, request: RuntimeRequest):
+        context_limit = _model_context_limit_tokens(request.model)
+        if not context_limit:
+            return None
+
+        def _callback(*args: Any, callback_context: Any = None, llm_request: Any = None, **_kwargs: Any) -> None:
+            if llm_request is None and len(args) >= 2:
+                llm_request = args[1]
+            contents = getattr(llm_request, "contents", None)
+            if not isinstance(contents, list):
+                return None
+            pruning = _prune_request_contents_for_context_window(
+                contents,
+                context_limit_tokens=context_limit,
+            )
+            if pruning:
+                logging.getLogger(__name__).warning(
+                    "Pruned %s older tool result payload(s) for model=%s before provider context window overflow "
+                    "(request chars %s -> %s, budget %s).",
+                    pruning["pruned_tool_results"],
+                    request.model,
+                    pruning["before_chars"],
+                    pruning["after_chars"],
+                    pruning["max_chars"],
+                )
+            return None
+
+        return _callback
 
     def _build_user_text(self, request: RuntimeRequest) -> str:
         sections: list[str] = []
+        tool_names = {tool.name for tool in request.bound_tools}
         if request.runtime_context:
             sections.append(
                 f"Runtime Context JSON:\n{json.dumps(_json_safe_value(request.runtime_context), sort_keys=True, default=str)}"
             )
+        if request.bound_tools:
+            sections.append(
+                "Available Tools JSON:\n"
+                f"{json.dumps(sorted(tool_names), sort_keys=True, default=str)}"
+            )
+        if request.memory_notes:
+            memory_notes = _json_safe_value(request.memory_notes[-5:])
+            context_string_limit = _model_context_string_limit_chars(request.model)
+            if context_string_limit:
+                memory_notes, memory_pruned = _prune_large_context_strings(
+                    memory_notes,
+                    max_string_chars=max(context_string_limit // 2, 1),
+                    path="memory_notes",
+                )
+                if memory_pruned:
+                    sections.append(f"Lumibot Context Notice:\nPruned {memory_pruned} oversized memory string(s).")
+            sections.append(
+                "Persistent Memory JSON:\n"
+                f"{json.dumps(memory_notes, sort_keys=True, default=str)}"
+            )
         if request.task_prompt:
             sections.append(f"Task:\n{request.task_prompt.strip()}")
+        else:
+            required_categories = [
+                "account_positions or account_portfolio",
+                "market_last_price or market_load_history_table",
+                "duckdb_query after loading a price table",
+                "get_indicator or get_indicators",
+            ]
+            if "alpaca_news" in tool_names:
+                required_categories.append("alpaca_news")
+            fred_tools = sorted(name for name in tool_names if name.startswith("get_fred_") or name == "list_fred_series")
+            if fred_tools:
+                required_categories.append(" or ".join(fred_tools))
+            required_categories.extend(
+                [
+                    "get_income_statement, get_balance_sheet, get_cash_flow, or get_company_facts",
+                    "get_filings, search_filing, or get_filing_document",
+                ]
+            )
+            sections.append(
+                "Task:\n"
+                "Do your normal job for the current market state. Before making a trading decision, use the available "
+                "tools to review account/portfolio state, current market prices, recent price history, technical "
+                "indicators, relevant news when configured, macro/FRED data when configured, and SEC financial/filing "
+                "evidence for relevant single-stock candidates. Specifically, include calls from these available "
+                f"categories: {'; '.join(required_categories)}. "
+                "In backtests, date-bound every external data request to the current simulated datetime and do not use "
+                "future information."
+            )
         if request.context:
-            sections.append(f"User Context JSON:\n{json.dumps(_json_safe_value(request.context), sort_keys=True, default=str)}")
-        if not sections:
-            sections.append("Task:\nDo your normal job for the current market state.")
+            context_payload = _json_safe_value(request.context)
+            context_string_limit = _model_context_string_limit_chars(request.model)
+            if context_string_limit:
+                context_payload, context_pruned = _prune_large_context_strings(
+                    context_payload,
+                    max_string_chars=context_string_limit,
+                    path="context",
+                )
+                if context_pruned:
+                    sections.append(f"Lumibot Context Notice:\nPruned {context_pruned} oversized context string(s).")
+            sections.append(f"User Context JSON:\n{json.dumps(context_payload, sort_keys=True, default=str)}")
         return "\n\n".join(sections)
 
     async def _run_async(self, request: RuntimeRequest) -> AgentRunResult:
+        started_at = _utc_iso_timestamp()
+        started_perf = time.perf_counter()
+        first_event_at: str | None = None
+        first_event_perf: float | None = None
         LlmAgentType, InMemoryRunnerType, genai_types, function_tool_type = self._ensure_adk()
         tool_name_map = {_tool_function_name(tool.name): tool.name for tool in request.bound_tools}
         tools = [function_tool_type(_wrap_tool_callable(tool)) for tool in request.bound_tools]
+        config_kwargs: dict[str, Any] = {
+            "max_output_tokens": 65535,
+        }
+        if _supports_explicit_temperature_for_adk_model(request.model):
+            config_kwargs["temperature"] = 0.0
+        planner = self._maybe_build_gemini_thinking_planner(request.model, genai_types)
         agent = LlmAgentType(
             name=request.agent_name,
-            model=_resolve_model_for_adk(request.model),
+            model=_resolve_model_for_adk(
+                request.model,
+                prompt_cache_key=request.provider_prompt_cache_key or _provider_prompt_cache_key(request),
+            ),
             instruction=self._instruction_for(request),
             tools=tools,
-            generate_content_config=genai_types.GenerateContentConfig(
-                temperature=0.0,
-                max_output_tokens=65535,
-            ),
+            generate_content_config=genai_types.GenerateContentConfig(**config_kwargs),
+            planner=planner,
+            before_model_callback=self._before_model_context_pruning_callback(request),
         )
         runner = InMemoryRunnerType(agent=agent, app_name="lumibot-agents")
         session_id = str(uuid4())
@@ -426,26 +1084,40 @@ class GoogleADKRuntime:
         )
         events: list[AgentTraceEvent] = []
         async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=content):
-            events.extend(_normalize_event(event))
-        timestamp = _utc_iso_timestamp()
+            normalized_events = _normalize_event(event)
+            if normalized_events and first_event_perf is None:
+                first_event_perf = time.perf_counter()
+                first_event_at = _utc_iso_timestamp()
+            timestamp = _utc_iso_timestamp()
+            for normalized_event in normalized_events:
+                normalized_event.timestamp = timestamp
+            events.extend(normalized_events)
         for event in events:
             if event.tool_name:
                 event.tool_name = tool_name_map.get(event.tool_name, event.tool_name)
-            event.timestamp = timestamp
         summary = None
         text_chunks = [event.text for event in events if event.kind == "text" and event.text]
         if text_chunks:
             summary = text_chunks[-1]
-        usage = None
-        for event in reversed(events):
-            if event.kind == "usage":
-                usage = event.payload
-                break
+        usage = _aggregate_usage_metadata(
+            [event.payload for event in events if event.kind == "usage" and isinstance(event.payload, dict)]
+        )
+        ended_at = _utc_iso_timestamp()
+        ended_perf = time.perf_counter()
         return AgentRunResult(
             summary=summary,
             model=request.model,
             events=events,
             usage=usage,
+            started_at=started_at,
+            first_event_at=first_event_at,
+            ended_at=ended_at,
+            latency_ms=max(int((ended_perf - started_perf) * 1000), 0),
+            first_event_latency_ms=(
+                max(int((first_event_perf - started_perf) * 1000), 0)
+                if first_event_perf is not None
+                else None
+            ),
         )
 
     # Transient-error retry policy for the full agent call. Covers both the
@@ -465,6 +1137,7 @@ class GoogleADKRuntime:
     # AgentHandle.run) catches the failure and skips this iteration so
     # the strategy stays alive and retries on the next bar.
     _MAX_RUN_ATTEMPTS = 10
+    _DEFAULT_RUN_TIMEOUT_SECONDS = 1800.0
     _RETRY_BACKOFF_SECONDS = (2.0, 3.0, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 60.0, 60.0)
 
     @staticmethod
@@ -475,6 +1148,12 @@ class GoogleADKRuntime:
                 return max(int(raw), 1)
             except Exception:
                 pass
+        mutating_order_tools = {"orders_submit_order", "orders_cancel_order", "orders_modify_order"}
+        if any(tool.name in mutating_order_tools for tool in request.bound_tools):
+            # Retrying the whole agent run after a broker-side effect can duplicate orders.
+            # Research-only agents keep the larger retry budget; trading agents fail fast
+            # and let the next scheduled/bar iteration re-evaluate from current broker state.
+            return 1
         mode = ""
         if isinstance(request.runtime_context, dict):
             mode = str(request.runtime_context.get("mode") or "").strip().lower()
@@ -494,7 +1173,10 @@ class GoogleADKRuntime:
                 return timeout_seconds if timeout_seconds > 0 else None
             except Exception:
                 pass
-        return 300.0
+        # Agentic trading/research runs can legitimately spend many minutes
+        # across model calls and tool calls. Keep the default high enough for
+        # realistic multi-tool agents while still preventing indefinite hangs.
+        return GoogleADKRuntime._DEFAULT_RUN_TIMEOUT_SECONDS
 
     @staticmethod
     def _is_non_retryable(exc: BaseException) -> bool:
@@ -513,7 +1195,37 @@ class GoogleADKRuntime:
             ) from exc
 
     def run(self, request: RuntimeRequest) -> AgentRunResult:
-        return asyncio.run(self._run_async(request))
+        import time as _time
+
+        last_exc: BaseException | None = None
+        max_attempts = self._max_attempts_for_request(request)
+        timeout_seconds = self._run_timeout_seconds_for_request(request)
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if timeout_seconds is None:
+                    return asyncio.run(self._run_async(request))
+                return asyncio.run(self._run_async_with_timeout(request, timeout_seconds))
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as exc:  # noqa: BLE001 - intentional broad catch for retry
+                last_exc = exc
+                if self._is_non_retryable(exc):
+                    raise
+                if attempt >= max_attempts:
+                    break
+                delay = self._RETRY_BACKOFF_SECONDS[min(attempt - 1, len(self._RETRY_BACKOFF_SECONDS) - 1)]
+                try:
+                    sys.stderr.write(
+                        f"[lumibot.agents] transient error on attempt {attempt}/{max_attempts} "
+                        f"for model={request.model!r}: {exc.__class__.__name__}: {str(exc)[:240]}. "
+                        f"Retrying in {delay:.0f}s...\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                _time.sleep(delay)
+        assert last_exc is not None
+        raise last_exc
 
 
 class StubAgentRuntime:
@@ -610,6 +1322,7 @@ def _jsonable(value: Any) -> Any:
 
 
 async def _with_mcp_session(server: MCPServer, callback):
+    _ensure_mcp_client_imports()
     transport = (server.transport or "http").lower().replace("-", "_")
     if transport == "stdio":
         parameters = StdioServerParameters(
@@ -640,10 +1353,16 @@ async def _with_mcp_session(server: MCPServer, callback):
 
 
 def _run_mcp_sync(async_fn, *args):
+    import asyncio
+
     try:
         asyncio.get_running_loop()
     except RuntimeError:
+        from anyio import run as anyio_run
+
         return anyio_run(async_fn, *args)
+    from anyio.from_thread import start_blocking_portal
+
     with start_blocking_portal() as portal:
         return portal.call(async_fn, *args)
 
@@ -682,6 +1401,8 @@ async def _call_mcp_tool_async(server: MCPServer, name: str, arguments: dict[str
 
 
 async def _legacy_http_list_tools(server: MCPServer) -> list[dict[str, Any]]:
+    import httpx
+
     payload = {
         "jsonrpc": "2.0",
         "id": "tools-list",
@@ -698,6 +1419,8 @@ async def _legacy_http_list_tools(server: MCPServer) -> list[dict[str, Any]]:
 
 
 async def _legacy_http_call_tool(server: MCPServer, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    import httpx
+
     payload = {
         "jsonrpc": "2.0",
         "id": f"{name}-call",
