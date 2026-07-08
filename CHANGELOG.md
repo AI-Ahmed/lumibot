@@ -1,6 +1,39 @@
 # Changelog
 
-## 4.4.52 - 2026-03-07
+## 4.4.53 - 2026-07-08
+
+### Removed
+- ⚠️ **Breaking (equity-only fork):** Deleted `options_helper.py`, `futures_symbols.py`, and `entities/chains.py` plus all dependent tests, examples, and Sphinx pages.
+- ⚠️ **Breaking (equity-only fork):** Removed continuous-futures position resolution from `Strategy.get_position()` (`_get_continuous_future_position`).
+- Removed forbidden broker/data-source modules, scripts, examples, acceptance strategies, and test suites (Polygon, ThetaData, DataBento, Tradier, Schwab, Tradovate, Bitunix, ProjectX, CCXT, crypto, futures, options, multileg).
+- Removed `ThetaTerminal.jar` bundling artifact and forbidden `docsrc` pages (`options_helper`, `entities.chains`, `strategy_methods.options`, broker/backtesting provider stubs).
+- Removed options-only portfolio valuation tests and smart-limit live/matrix Alpaca option harnesses.
+
+### Added
+- `TestValidateOrderPosition` regression coverage for `BUY_TO_COVER` / `BUY_TO_CLOSE` short-position validation.
+- `docs/UPSTREAM_MERGE_PROTOCOL.md` engineering runbook for filtered upstream syncs.
+
+### Changed
+- `validate_order_position()` now validates cover/close buy orders before the general buy bypass (fixes unreachable `BUY_TO_COVER` branch).
+- `BACKTESTING_DATA_SOURCE` JSON routing maps and multi-provider `datasource_class` dicts now fail fast with explicit equity-only errors.
+- Default backtesting data source remains **`yahoo`**; valid env overrides: `yahoo`, `alpaca`, `ibkr`.
+- `docsrc/deployment.rst` and `docsrc/environment_variables.rst` list Alpaca + IB only; stripped Tradier/Polygon/ThetaData/DataBento/CCXT sections.
+- `docsrc/examples.rst`, `faq.rst`, and `common_mistakes.rst` no longer document options strategies.
+- Acceptance backtest manifest retains equity-only `TQQQ 200-Day MA.py`.
+
+### Fixed
+- `repair_times_and_fill()` timezone-naive vs timezone-aware comparison errors in pandas backtesting tests.
+- `_infer_entries_per_year()` intraday annualization for HFT indicator stats.
+- `BacktestingBroker` trade-event audit column test setup (`_processed_filled_orders` / `_processed_new_orders`).
+- Drift rebalancer unit tests for market-open gating and short-position validation.
+- Progress bar quiet-log assertion (`Portfolio:` label).
+
+## 4.4.52 - 2026-07-08
+
+### Removed
+- ⚠️ **Breaking (equity-only fork):** Removed broker integrations and dependencies for Tradier, Schwab, Tradovate, Bitunix, ProjectX, and CCXT.
+- ⚠️ **Breaking (equity-only fork):** Removed data-source dependencies and docs for Polygon, ThetaData, and DataBento (`polygon-api-client`, `thetadata`, `databento`, `lumiwealth-tradier`, `schwab-py`, `ccxt`).
+- Removed ThetaTerminal.jar bundling from `setup.py` build pipeline.
 
 ### Added
 - **HFT Information-Driven Report UX Redesign:** Complete visual overhaul of the information structure report (`*_tearsheet_information_structure.html`) with card-based layouts, conditional color formatting, and responsive design that aligns with the QuantStats tearsheet visual language.

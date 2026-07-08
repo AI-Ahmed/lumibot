@@ -16,7 +16,6 @@ import shutil
 from pathlib import Path
 
 import setuptools
-from setuptools.command.build_py import build_py as _build_py
 
 
 # Load environment variables from .env file
@@ -43,40 +42,12 @@ if DIST_DIR.exists():
     shutil.rmtree(DIST_DIR)
 
 
-class BuildWithThetaJar(_build_py):
-    """Optionally bundle ThetaTerminal.jar if present locally.
-
-    This makes ThetaData optional at build/install time. If the JAR is not
-    present in lumibot/resources, we simply skip bundling it instead of failing
-    the build.
-    """
-
-    def run(self):
-        super().run()
-        self._maybe_copy_theta_terminal()
-
-    def _maybe_copy_theta_terminal(self):
-        src = PROJECT_ROOT / "lumibot" / "resources" / "ThetaTerminal.jar"
-        if not src.exists():
-            # Optional: nothing to do if JAR isn't in the repo
-            print("[build] ThetaTerminal.jar not found, skipping bundling (ThetaData is optional).")
-            return
-        dest = Path(self.build_lib) / "lumibot" / "resources" / "ThetaTerminal.jar"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dest)
-        print(
-            f"[build] Bundled ThetaTerminal.jar -> {dest} "
-            f"(size={dest.stat().st_size} bytes)"
-        )
-
-
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 # Base requirements without the private package
 install_requires = [
     "loguru>=0.7.3,<0.8.3",
-    "polygon-api-client>=1.13.3",
     "alpaca-py>=0.42.0",
     "alpha_vantage",
     "ibapi==9.81.1.post1",
@@ -97,25 +68,20 @@ install_requires = [
     "yappi>=1.6.0",
     "quantstats-lumi>=1.1.0",
     "python-dotenv",  # Secret Storage
-    "ccxt>=4.4.80",
     "termcolor>=2.0",
     "jsonpickle",
     "apscheduler>=3.10.4",
     "appdirs",
     "pyarrow>=15.0.0",
     "tqdm",
-    "lumiwealth-tradier>=0.1.18",
     "pytz",
     "psycopg2-binary",
     "exchange_calendars>=4.6.0",
     "duckdb",
     "tabulate",
-    "thetadata==0.9.11",
-    "databento>=0.42.0",
     "holidays",
     "psutil",
     "openai",
-    "schwab-py>=1.5.0",
     "Flask>=2.3",
     "free-proxy",
     "requests-oauthlib",
@@ -162,16 +128,12 @@ extras_require = {
     "ta": ta_extras,
     "private": private_extras,  # Will include FPAP if GIT_TOKEN is available
     "all": ta_extras + private_extras,  # All packages (public + private)
-    # Optional dependencies to enable ThetaData support
-    "thetadata": ["thetadata"],
 }
-
-theta_jar_path = PROJECT_ROOT / "lumibot" / "resources" / "ThetaTerminal.jar"
 
 setuptools.setup(
     # Basic package information
     name="lumibot",
-    version="4.4.52",
+    version="4.4.53",
     author="Robert Grzesik",
     author_email="rob@lumiwealth.com",
     description="Backtesting and Trading Library, Made by Lumiwealth.",
@@ -184,11 +146,10 @@ setuptools.setup(
     install_requires=install_requires,
     extras_require=extras_require,
     
-    # Include configuration files, and only include ThetaTerminal.jar if present
     package_data={
         "lumibot": [
             "resources/conf.yaml",
-        ] + (["resources/ThetaTerminal.jar"] if theta_jar_path.exists() else []),
+        ],
     },
     classifiers=[
         "Programming Language :: Python :: 3",
@@ -198,5 +159,4 @@ setuptools.setup(
         "Operating System :: OS Independent",
     ],
     python_requires=">=3.10",
-    cmdclass={"build_py": BuildWithThetaJar},
 )
