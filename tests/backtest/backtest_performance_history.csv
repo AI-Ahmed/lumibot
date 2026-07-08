@@ -169,3 +169,4 @@ timestamp,test_name,data_source,trading_days,execution_time_seconds,git_commit,l
 2026-07-08T22:21:14.152866,test_passing_trader_class_into_backtest_creates_trader_class,unknown,,0.456,21bfa996,4.4.52,,,,,Auto-tracked from test_passing_trader_into_backtest
 2026-07-08T22:21:20.578291,test_tearsheet_summary_matches_kpm,unknown,,3.969,21bfa996,4.4.52,,,,,Auto-tracked from test_tearsheet_summary_kpm_alignment
 2026-07-08T22:21:21.714994,test_yahoo_last_price,Yahoo,,0.425,21bfa996,4.4.52,,,,,Auto-tracked from test_yahoo
+2026-07-08T23:04:22.682234,test_yahoo_last_price,Yahoo,,0.961,245c7101,4.4.54,,,,,Auto-tracked from test_yahoo
