@@ -58,7 +58,7 @@ from ..credentials import (
     SHOW_TEARSHEET,
     STRATEGY_NAME,
 )
-from ..entities import Asset, Bars, Data, Order, Position
+from ..entities import Asset, Data, Order, Position
 from ..tools import (
     create_tearsheet,
     day_deduplicate,

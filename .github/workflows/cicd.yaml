@@ -65,23 +65,15 @@ jobs:
           fi
           pip install -r requirements.resolved.txt
 
-      - name: Run Ruff (ThetaData scope)
+      - name: Run Ruff (equity-only core scope)
         run: |
-          # NOTE: The repo currently has a large backlog of Ruff violations outside the
-          # ThetaData backtesting surface area. To keep CI meaningful without blocking
-          # the PR on unrelated legacy lint, lint only the ThetaData-related files and
-          # tests this PR touches.
+          # Lint a focused equity-only surface (brokers, backtesting, strategy, core tests)
+          # instead of deleted ThetaData/options modules.
           python -m ruff check --select F,I \
-            lumibot/tools/thetadata_helper.py \
             lumibot/tools/data_downloader_queue_client.py \
-            lumibot/backtesting/thetadata_backtesting_pandas.py \
-            lumibot/components/options_helper.py \
             lumibot/strategies/_strategy.py \
             tests/backtest/test_acceptance_backtests_ci.py \
-            tests/test_thetadata_day_timestamp_alignment.py \
-            tests/test_thetadata_get_last_price_trade_only.py \
-            tests/test_options_helper_thetadata_actionable_strikes.py \
-            tests/test_thetadata_queue_client.py
+            tests/test_backtesting_data_source_env.py
 
   unit-tests:
     name: Unit Tests (shard ${{ matrix.shard }}/6)

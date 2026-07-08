@@ -33,15 +33,8 @@ logger = logging.getLogger(__name__)
 
 
 def _update_download_status_queue_info(**kwargs) -> None:
-    """Best-effort progress UI hook (ThetaData helper removed in equity-only fork)."""
-    try:
-        from lumibot.tools.thetadata_helper import update_download_status_queue_info
-    except ImportError:
-        return
-    try:
-        update_download_status_queue_info(**kwargs)
-    except Exception:
-        pass
+    """No-op progress hook (ThetaData helper removed in equity-only fork)."""
+    return
 
 # Lightweight, non-secret telemetry for backtest audit/debugging.
 #

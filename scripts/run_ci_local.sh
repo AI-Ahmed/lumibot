@@ -57,16 +57,10 @@ fi
 
 echo "=== Lint (Ruff, same scope as CI) ==="
 "$PYTHON" -m ruff check --select F,I \
-  lumibot/tools/thetadata_helper.py \
   lumibot/tools/data_downloader_queue_client.py \
-  lumibot/backtesting/thetadata_backtesting_pandas.py \
-  lumibot/components/options_helper.py \
   lumibot/strategies/_strategy.py \
   tests/backtest/test_acceptance_backtests_ci.py \
-  tests/test_thetadata_day_timestamp_alignment.py \
-  tests/test_thetadata_get_last_price_trade_only.py \
-  tests/test_options_helper_thetadata_actionable_strikes.py \
-  tests/test_thetadata_queue_client.py
+  tests/test_backtesting_data_source_env.py
 
 echo "=== Unit tests (shard 0/6, markers=$PYTEST_MARKERS) ==="
 SHARD_INDEX=0 SHARD_TOTAL=6 "$PYTHON" - <<'PY'
