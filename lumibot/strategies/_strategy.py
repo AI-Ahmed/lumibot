@@ -1,467 +1,105 @@
-from __future__ import annotations
-
+import datetime
 import io
+import json
 import math
 import os
+import random
+import string
 import time
-from collections import deque
-from importlib import import_module
+import traceback
+import uuid
+from decimal import Decimal
+from typing import Dict, List, Union
 
-from lumibot._lazy_imports import LazyClassMeta, LazyModule, LazyStrategyLogger, lazy_class, lazy_typing
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+import pandas as pd
+import polars as pl
+import requests
+from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import OperationalError
+from termcolor import colored
 
-def _env_flag_enabled(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "y", "on")
+from lumibot.constants import LUMIBOT_DEFAULT_PYTZ
+from lumibot.tools.helpers import to_datetime_aware
+from lumibot.tools.lumibot_logger import get_logger, get_strategy_logger
+from lumibot.tools.parquet_utils import (
+    coerce_object_columns_to_json_strings,
+    is_parquet_required,
+    write_parquet_with_logging,
+)
 
-
-def _scheduled_live_strategy_import() -> bool:
-    is_backtesting = os.environ.get("IS_BACKTESTING")
-    return _env_flag_enabled("LUMIBOT_SCHEDULED_EXECUTION") and (
-        is_backtesting is None or is_backtesting.strip().lower() == "false"
-    )
-
-
-_DEFER_CREDENTIALS_ON_IMPORT = _scheduled_live_strategy_import()
-
-
-def _credentials():
-    return import_module("lumibot.credentials")
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in ("1", "true", "yes", "y", "on")
-
-
-def _db_connection_str_from_env():
-    if os.environ.get("ACCOUNT_HISTORY_DB_CONNECTION_STR"):
-        return os.environ.get("ACCOUNT_HISTORY_DB_CONNECTION_STR")
-    return os.environ.get("DB_CONNECTION_STR")
-
-
-if _DEFER_CREDENTIALS_ON_IMPORT:
-    IS_BACKTESTING = False
-    BACKTESTING_START = None
-    BACKTESTING_END = None
-    BACKTESTING_DATA_SOURCE = os.environ.get("BACKTESTING_DATA_SOURCE", "ThetaData")
-    BACKTESTING_SHOW_PROGRESS_BAR = _env_bool("BACKTESTING_SHOW_PROGRESS_BAR", True)
-    DB_CONNECTION_STR = _db_connection_str_from_env()
-    DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
-    HIDE_POSITIONS = _env_bool("HIDE_POSITIONS")
-    HIDE_TRADES = _env_bool("HIDE_TRADES")
-    LIVE_CONFIG = os.environ.get("LIVE_CONFIG")
-    LOG_BACKTEST_PROGRESS_TO_FILE = os.environ.get("LOG_BACKTEST_PROGRESS_TO_FILE")
-    LUMIWEALTH_API_KEY = os.environ.get("LUMIWEALTH_API_KEY")
-    MARKET = os.environ.get("MARKET")
-    POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
-    POLYGON_MAX_MEMORY_BYTES = os.environ.get("POLYGON_MAX_MEMORY_BYTES")
-    SHOW_INDICATORS = os.environ.get("SHOW_INDICATORS", "True") == "True"
-    SHOW_PLOT = os.environ.get("SHOW_PLOT", "True") == "True"
-    SHOW_TEARSHEET = os.environ.get("SHOW_TEARSHEET", "True") == "True"
-    STRATEGY_NAME = os.environ.get("STRATEGY_NAME")
-    THETADATA_CONFIG = {
-        "THETADATA_USERNAME": os.environ.get("THETADATA_USERNAME"),
-        "THETADATA_PASSWORD": os.environ.get("THETADATA_PASSWORD"),
-    }
-
-    def get_default_broker():
-        return _credentials().get_default_broker()
-
-    def get_default_data_source():
-        return _credentials().get_default_data_source()
-
-else:
-    from ..credentials import (
-        BACKTESTING_DATA_SOURCE,
-        BACKTESTING_END,
-        BACKTESTING_SHOW_PROGRESS_BAR,
-        BACKTESTING_START,
-        DB_CONNECTION_STR,
-        DISCORD_WEBHOOK_URL,
-        HIDE_POSITIONS,
-        HIDE_TRADES,
-        IS_BACKTESTING,
-        LIVE_CONFIG,
-        LOG_BACKTEST_PROGRESS_TO_FILE,
-        LUMIWEALTH_API_KEY,
-        MARKET,
-        POLYGON_API_KEY,
-        POLYGON_MAX_MEMORY_BYTES,
-        SHOW_INDICATORS,
-        SHOW_PLOT,
-        SHOW_TEARSHEET,
-        STRATEGY_NAME,
-        THETADATA_CONFIG,
-        get_default_broker,
-        get_default_data_source,
-    )
-
-mdates = LazyModule("matplotlib.dates")
-pd = LazyModule("pandas")
-pl = LazyModule("polars")
-plt = LazyModule("matplotlib.pyplot")
-requests = LazyModule("requests")
-datetime = LazyModule("datetime")
-ticker = LazyModule("matplotlib.ticker")
-Asset = lazy_class("lumibot.entities", "Asset")
-CashEvent = lazy_class("lumibot.entities", "CashEvent")
-Data = lazy_class("lumibot.entities", "Data")
-Order = lazy_class("lumibot.entities", "Order")
-Decimal = lazy_class("decimal", "Decimal")
-Dict = lazy_typing("Dict")
-List = lazy_typing("List")
-Union = lazy_typing("Union")
-_DEFAULT_QUOTE_ASSET = object()
-TYPE_CHECKING = False
-
-# Legacy test/extension patch points. Normal default broker resolution goes
-# through credentials getters so strategy imports stay cheap for scheduled runs.
-BROKER = None
-DATA_SOURCE = None
-
-if TYPE_CHECKING:
-    from ..entities import CashEvent, Data, Position
-
-
-def colored(*args, **kwargs):
-    from termcolor import colored as _colored
-
-    return _colored(*args, **kwargs)
-
-
-def get_logger(*args, **kwargs):
-    from lumibot.tools.lumibot_logger import get_logger as _get_logger
-
-    return _get_logger(*args, **kwargs)
-
-
-def get_strategy_logger(*args, **kwargs):
-    from lumibot.tools.lumibot_logger import get_strategy_logger as _get_strategy_logger
-
-    return _get_strategy_logger(*args, **kwargs)
-
-
-def _default_trader_class():
-    trader_cls = globals().get("Trader")
-    if trader_cls is not None:
-        return trader_cls
-
-    from ..traders import Trader
-
-    return Trader
-
-
-def _cash_event_class():
-    from ..entities import CashEvent
-
-    return CashEvent
-
-
-def _position_class():
-    from ..entities import Position
-
-    return Position
-
-
-def _random_suffix(length: int = 6) -> str:
-    import random
-    import string
-
-    return "".join(random.choices(string.ascii_letters + string.digits, k=length))
-
-
-def _uuid4():
-    import uuid
-
-    return uuid.uuid4()
-
-
-def _format_exc():
-    import traceback
-
-    return traceback.format_exc()
-
-
-_LAZY_ENTITY_EXPORTS = {
-    "CashEvent": _cash_event_class,
-    "Position": _position_class,
-}
-
-
-def __getattr__(name):
-    factory = _LAZY_ENTITY_EXPORTS.get(name)
-    if factory is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    value = factory()
-    globals()[name] = value
-    return value
-
+from ..backtesting import (
+    AlpacaBacktesting,
+    BacktestingBroker,
+    InteractiveBrokersRESTBacktesting,
+    YahooDataBacktesting,
+)
+from ..credentials import (
+    ALPACA_CONFIG,
+    ALPACA_MAX_MEMORY_BYTES,
+    BACKTESTING_END,
+    BACKTESTING_QUIET_LOGS,
+    BACKTESTING_SHOW_PROGRESS_BAR,
+    BACKTESTING_START,
+    BROKER,
+    DATA_SOURCE,
+    DB_CONNECTION_STR,
+    DISCORD_WEBHOOK_URL,
+    HIDE_POSITIONS,
+    HIDE_TRADES,
+    LIVE_CONFIG,
+    LOG_BACKTEST_PROGRESS_TO_FILE,
+    LUMIWEALTH_API_KEY,
+    MARKET,
+    SHOW_INDICATORS,
+    SHOW_PLOT,
+    SHOW_TEARSHEET,
+    STRATEGY_NAME,
+)
+from ..entities import Asset, Data, Order, Position
+from ..tools import (
+    create_tearsheet,
+    day_deduplicate,
+    get_symbol_returns,
+    plot_indicators,
+    plot_returns,
+    stats_summary,
+)
+from ..traders import Trader
+from .strategy_executor import StrategyExecutor
 
 # Set the stats table name for when storing stats in a database, defined by db_connection_str
 STATS_TABLE_NAME = "strategy_tracker"
 
-_BACKTESTING_CLASS_MODULES = {
-    "AlpacaBacktesting": "lumibot.backtesting.alpaca_backtesting",
-    "BacktestingBroker": "lumibot.backtesting.backtesting_broker",
-    "CcxtBacktesting": "lumibot.backtesting.ccxt_backtesting",
-    "DataBentoDataBacktesting": "lumibot.backtesting.databento_backtesting",
-    "InteractiveBrokersRESTBacktesting": "lumibot.backtesting.interactive_brokers_rest_backtesting",
-    "PolymarketBacktesting": "lumibot.backtesting.polymarket_backtesting",
-    "PolygonDataBacktesting": "lumibot.backtesting.polygon_backtesting",
-    "RoutedBacktestingPandas": "lumibot.backtesting.routed_backtesting",
-    "ThetaDataBacktesting": "lumibot.backtesting.thetadata_backtesting",
-    "ThetaDataBacktestingPandas": "lumibot.backtesting.thetadata_backtesting_pandas",
-    "YahooDataBacktesting": "lumibot.backtesting.yahoo_backtesting",
-}
-
-AlpacaBacktesting = lazy_class("lumibot.backtesting.alpaca_backtesting", "AlpacaBacktesting")
-BacktestingBroker = lazy_class("lumibot.backtesting.backtesting_broker", "BacktestingBroker")
-CcxtBacktesting = lazy_class("lumibot.backtesting.ccxt_backtesting", "CcxtBacktesting")
-DataBentoDataBacktesting = lazy_class("lumibot.backtesting.databento_backtesting", "DataBentoDataBacktesting")
-InteractiveBrokersRESTBacktesting = lazy_class(
-    "lumibot.backtesting.interactive_brokers_rest_backtesting",
-    "InteractiveBrokersRESTBacktesting",
-)
-PolymarketBacktesting = lazy_class("lumibot.backtesting.polymarket_backtesting", "PolymarketBacktesting")
-PolygonDataBacktesting = lazy_class("lumibot.backtesting.polygon_backtesting", "PolygonDataBacktesting")
-RoutedBacktestingPandas = lazy_class("lumibot.backtesting.routed_backtesting", "RoutedBacktestingPandas")
-ThetaDataBacktesting = lazy_class("lumibot.backtesting.thetadata_backtesting", "ThetaDataBacktesting")
-ThetaDataBacktestingPandas = lazy_class(
-    "lumibot.backtesting.thetadata_backtesting_pandas",
-    "ThetaDataBacktestingPandas",
-)
-YahooDataBacktesting = lazy_class("lumibot.backtesting.yahoo_backtesting", "YahooDataBacktesting")
-Trader = lazy_class("lumibot.traders", "Trader")
-
-
-def _get_backtesting_class(name):
-    patched = globals().get(name)
-    if patched is not None:
-        return _resolve_lazy_class(patched)
-    module = import_module(_BACKTESTING_CLASS_MODULES[name])
-    return getattr(module, name)
-
-
-def _resolve_lazy_class(value):
-    if isinstance(value, LazyClassMeta):
-        return value._load()
-    return value
-
-
-def _get_tool_function(name):
-    from .. import tools
-
-    return getattr(tools, name)
-
-
-def _default_pytz():
-    from lumibot.constants import LUMIBOT_DEFAULT_PYTZ
-
-    return LUMIBOT_DEFAULT_PYTZ
-
-
-def cash_flow_adjusted_returns(*args, **kwargs):
-    return _get_tool_function("cash_flow_adjusted_returns")(*args, **kwargs)
-
-
-def coerce_object_columns_to_json_strings(*args, **kwargs):
-    from lumibot.tools.parquet_utils import coerce_object_columns_to_json_strings as _impl
-
-    return _impl(*args, **kwargs)
-
-
-def create_engine(*args, **kwargs):
-    from sqlalchemy import create_engine as _create_engine
-
-    return _create_engine(*args, **kwargs)
-
-
-def create_tearsheet(*args, **kwargs):
-    return _get_tool_function("create_tearsheet")(*args, **kwargs)
-
-
-def cumulative_to_period_flows(*args, **kwargs):
-    return _get_tool_function("cumulative_to_period_flows")(*args, **kwargs)
-
-
-def day_deduplicate(*args, **kwargs):
-    return _get_tool_function("day_deduplicate")(*args, **kwargs)
-
-
-def get_symbol_returns(*args, **kwargs):
-    return _get_tool_function("get_symbol_returns")(*args, **kwargs)
-
-
-def inspect(*args, **kwargs):
-    from sqlalchemy import inspect as _inspect
-
-    return _inspect(*args, **kwargs)
-
-
-def is_parquet_required(*args, **kwargs):
-    from lumibot.tools.parquet_utils import is_parquet_required as _impl
-
-    return _impl(*args, **kwargs)
-
-
-def plot_indicators(*args, **kwargs):
-    return _get_tool_function("plot_indicators")(*args, **kwargs)
-
-
-def plot_returns(*args, **kwargs):
-    return _get_tool_function("plot_returns")(*args, **kwargs)
-
-
-def stats_summary(*args, **kwargs):
-    return _get_tool_function("stats_summary")(*args, **kwargs)
-
-
-def text(*args, **kwargs):
-    from sqlalchemy import text as _text
-
-    return _text(*args, **kwargs)
-
-
-def to_datetime_aware(*args, **kwargs):
-    return _get_tool_function("to_datetime_aware")(*args, **kwargs)
-
-
-def write_parquet_with_logging(*args, **kwargs):
-    from lumibot.tools.parquet_utils import write_parquet_with_logging as _impl
-
-    return _impl(*args, **kwargs)
-
-
-class _LazyStrategyComponent:
-    __slots__ = ("_factory", "_instance")
-
-    def __init__(self, factory):
-        object.__setattr__(self, "_factory", factory)
-        object.__setattr__(self, "_instance", None)
-
-    def _load(self):
-        instance = object.__getattribute__(self, "_instance")
-        if instance is None:
-            instance = object.__getattribute__(self, "_factory")()
-            object.__setattr__(self, "_instance", instance)
-        return instance
-
-    def __getattr__(self, name):
-        return getattr(self._load(), name)
-
-    def __setattr__(self, name, value):
-        if name in {"_factory", "_instance"}:
-            object.__setattr__(self, name, value)
-            return
-        setattr(self._load(), name, value)
-
-    def __delattr__(self, name):
-        if name in {"_factory", "_instance"}:
-            object.__delattr__(self, name)
-            return
-        delattr(self._load(), name)
-
-    def __getitem__(self, key):
-        return self._load()[key]
-
-    def __setitem__(self, key, value):
-        self._load()[key] = value
-
-    def __contains__(self, item):
-        return item in self._load()
-
-    def __iter__(self):
-        return iter(self._load())
-
-    def __len__(self):
-        return len(self._load())
-
-    def __bool__(self):
-        return bool(self._load())
-
-    def __dir__(self):
-        return dir(self._load())
-
-    def __repr__(self):
-        instance = object.__getattribute__(self, "_instance")
-        if instance is None:
-            return "<lazy strategy component>"
-        return repr(instance)
-
-
-def _lazy_strategy_component(module_name, class_name, strategy):
-    return _LazyStrategyComponent(lambda: getattr(import_module(module_name), class_name)(strategy))
-
-
-_SAFE_JSON_ENCODER_CLASS = None
-
-
-def _json_module():
-    import json
-
-    return json
-
-
-def _json_dumps(*args, **kwargs):
-    return _json_module().dumps(*args, **kwargs)
-
-
-def _json_loads(*args, **kwargs):
-    return _json_module().loads(*args, **kwargs)
-
-
-def _get_backtesting_parameters():
-    if not _DEFER_CREDENTIALS_ON_IMPORT:
-        return getattr(_credentials(), "BACKTESTING_PARAMETERS", None)
-
-    raw = os.environ.get("BACKTESTING_PARAMETERS")
-    if raw is None:
-        return None
-    raw = raw.strip()
-    if not raw or raw.lower() in ("none", "null", "{}"):
-        return None
-    try:
-        parsed = _json_loads(raw)
-    except Exception:
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def _safe_json_encoder_class():
-    global _SAFE_JSON_ENCODER_CLASS
-    if _SAFE_JSON_ENCODER_CLASS is None:
-        json = _json_module()
-
-        class _SafeJSONEncoder(json.JSONEncoder):
-            """Custom JSON encoder for Lumibot objects."""
-
-            def default(self, obj):
-                # Handle objects with to_dict method (Asset, Order, Position etc)
-                if hasattr(obj, 'to_dict'):
-                    return obj.to_dict()
-
-                # Handle dates and times
-                if isinstance(obj, (datetime.date, datetime.datetime)):
-                    return obj.isoformat()
-
-                # Handle Decimal
-                if isinstance(obj, Decimal):
-                    return float(obj)
-
-                # Handle sets
-                if isinstance(obj, set):
-                    return list(obj)
-
-                return super().default(obj)
-
-        _SafeJSONEncoder.__name__ = "SafeJSONEncoder"
-        _SAFE_JSON_ENCODER_CLASS = _SafeJSONEncoder
-    return _SAFE_JSON_ENCODER_CLASS
-
-
-def SafeJSONEncoder(*args, **kwargs):
-    return _safe_json_encoder_class()(*args, **kwargs)
+class SafeJSONEncoder(json.JSONEncoder):
+    """Custom JSON encoder for Lumibot objects.
+    
+    Handles:
+    - Objects with to_dict() method -> dictionary 
+    - datetime.date and datetime.datetime -> ISO format string
+    - Decimal -> float
+    - Sets -> list
+    """
+    def default(self, obj):
+        # Handle objects with to_dict method (Asset, Order, Position etc)
+        if hasattr(obj, 'to_dict'):
+            return obj.to_dict()
+
+        # Handle dates and times
+        if isinstance(obj, (datetime.date, datetime.datetime)):
+            return obj.isoformat()
+
+        # Handle Decimal
+        if isinstance(obj, Decimal):
+            return float(obj)
+
+        # Handle sets
+        if isinstance(obj, set):
+            return list(obj)
+
+        return super().default(obj)
 
 class Vars:
     def __init__(self):
@@ -502,7 +140,7 @@ class _Strategy:
             if tzinfo is None or tzinfo.utcoffset(value) is None:
                 return to_datetime_aware(value)
             if not hasattr(tzinfo, "zone"):
-                return value.astimezone(_default_pytz())
+                return value.astimezone(LUMIBOT_DEFAULT_PYTZ)
         return value
 
     @property
@@ -531,7 +169,7 @@ class _Strategy:
         analyze_backtest: bool = True,
         backtesting_start=None,
         backtesting_end=None,
-        quote_asset=_DEFAULT_QUOTE_ASSET,
+        quote_asset=Asset(symbol="USD", asset_type="forex"),
         starting_positions=None,
         filled_order_callback=None,
         name=None,
@@ -657,43 +295,13 @@ class _Strategy:
         self.buy_trading_slippages = buy_trading_slippages
         self.sell_trading_slippages = sell_trading_slippages
         self.save_logfile = save_logfile
-        broker_was_provided = broker is not None
         self.broker = broker
+        self.backtest_start = backtesting_start
+        self.backtest_end = backtesting_end
 
         # initialize cash variables
         self._position_value = None
         self._portfolio_value = None
-        self._cash_deposits_total = 0.0
-        self._cash_withdrawals_total = 0.0
-        self._cash_adjustments_net_total = 0.0
-        self._cash_financing_enabled = False
-        self._cash_financing_account_mode = "margin"
-        self._cash_financing_day_count_basis = 360
-        self._cash_financing_missing_rate_policy = "carry_forward"
-        self._cash_financing_credit_rate_annual = None
-        self._cash_financing_debit_rate_annual = None
-        self._cash_financing_last_valid_credit_rate_annual = None
-        self._cash_financing_last_valid_debit_rate_annual = None
-        self._cash_financing_last_accrual_date = None
-        self._cash_financing_credit_total = 0.0
-        self._cash_financing_debit_total = 0.0
-        self._cash_financing_net_total = 0.0
-        self._cash_financing_days_accrued = 0
-        self._cash_financing_events = 0
-        self._cash_financing_last_credit_rate_used = None
-        self._cash_financing_last_debit_rate_used = None
-        self._cash_event_initial_history_loaded = False
-        self._cash_event_poll_lookback_days = 7
-        self._cash_event_initial_poll_lookback_days = None
-        self._cash_event_poll_interval_seconds = 300
-        self._cash_event_cloud_emit_limit = 50
-        self._cash_event_fetch_limit = 100
-        self._cash_event_initial_fetch_limit = 5000
-        self._cash_event_dedupe_capacity = 1000
-        self._cash_event_last_poll_at = None
-        self._cash_event_pending_for_cloud = []
-        self._cash_event_sent_ids = set()
-        self._cash_event_sent_id_order = deque()
 
         # Only log one message about cloud API key being missing
         self._logged_missing_lumiwealth_api_key = False
@@ -709,7 +317,7 @@ class _Strategy:
 
         # Create an adapter with 'strategy_name' set to the instance's name
         if not hasattr(self, "logger") or self.logger is None:
-            self.logger = LazyStrategyLogger(__name__, self._name)
+            self.logger = get_strategy_logger(__name__, self._name)
 
         # Don't set log level here - let the logger hierarchy and quiet logs setting handle it
         # The StrategyLoggerAdapter will check BACKTESTING_QUIET_LOGS in its methods
@@ -718,20 +326,12 @@ class _Strategy:
         self._logged_get_historical_prices_assets = set()
 
         if self.broker == None:
-            self.broker = BROKER if BROKER is not None else get_default_broker()
+            self.broker = BROKER
 
         # Handle data source initialization
         self._data_source = data_source
         if self._data_source is None:
-            # Live DATA_SOURCE overrides should not replace a backtesting broker's
-            # concrete data source. Backtests are selected through
-            # BACKTESTING_DATA_SOURCE or the explicit datasource_class argument.
-            if self.broker is not None and getattr(self.broker, "IS_BACKTESTING_BROKER", False):
-                self._data_source = None
-            elif DATA_SOURCE is not None:
-                self._data_source = DATA_SOURCE
-            elif not (_DEFER_CREDENTIALS_ON_IMPORT and broker_was_provided and not os.environ.get("DATA_SOURCE")):
-                self._data_source = get_default_data_source()
+            self._data_source = DATA_SOURCE
 
         # If we have a custom data source, attach it to the broker
         if self._data_source is not None and self.broker is not None:
@@ -800,9 +400,6 @@ class _Strategy:
             self.logger.error(colored(error_message, "red"))
             raise ValueError(error_message)
 
-        if quote_asset is _DEFAULT_QUOTE_ASSET:
-            quote_asset = Asset(symbol="USD", asset_type="forex")
-
         self._quote_asset = quote_asset if self.broker.name != "bitunix" else Asset("USDT", Asset.AssetType.CRYPTO)
 
         # Check if the quote_assets exists on the broker
@@ -850,7 +447,7 @@ class _Strategy:
             self.starting_positions = starting_positions
             if self.starting_positions is not None and len(self.starting_positions) > 0:
                 for asset, quantity in self.starting_positions.items():
-                    position = _position_class()(
+                    position = Position(
                         self._name,
                         asset,
                         Decimal(quantity),
@@ -954,11 +551,8 @@ class _Strategy:
         self._minutes_after_closing = minutes_after_closing
         self._sleeptime = sleeptime
         self._risk_free_rate = risk_free_rate
-
-        if self._should_defer_executor_build():
-            self._executor_instance = None
-        else:
-            self._executor_instance = self._build_executor()
+        self._executor = StrategyExecutor(self)
+        self.broker._add_subscriber(self._executor)
 
         # Stats related variables
         self._stats_file = stats_file
@@ -972,16 +566,6 @@ class _Strategy:
         self.should_send_summary_to_discord = should_send_summary_to_discord
         self._last_backup_state = None
         self.vars = Vars()
-        self.agents = _lazy_strategy_component("lumibot.components.agents", "AgentManager", self)
-        self.indicators = _lazy_strategy_component("lumibot.indicators", "Indicators", self)
-        self.fundamentals = _lazy_strategy_component("lumibot.fundamentals", "SECFundamentals", self)
-        self.macro = _lazy_strategy_component("lumibot.macro", "FREDMacroData", self)
-        self.notifications = _lazy_strategy_component(
-            "lumibot.components.notifications",
-            "NotificationManager",
-            self,
-        )
-        self.memory = _lazy_strategy_component("lumibot.components.memory", "MemoryStore", self)
 
         # Storing parameters for the initialize method
         if not hasattr(self, "parameters") or not isinstance(self.parameters, dict) or self.parameters is None:
@@ -990,66 +574,10 @@ class _Strategy:
         if parameters is not None and isinstance(self.parameters, dict):
             self.parameters = {**self.parameters, **parameters}
 
-        # Apply BACKTESTING_PARAMETERS env var override (highest priority, wins over code-level params)
-        BACKTESTING_PARAMETERS = _get_backtesting_parameters()
-        if BACKTESTING_PARAMETERS is not None and isinstance(BACKTESTING_PARAMETERS, dict):
-            self.parameters = {**self.parameters, **BACKTESTING_PARAMETERS}
-            self.logger.info(
-                colored(
-                    f"Applied BACKTESTING_PARAMETERS override: {list(BACKTESTING_PARAMETERS.keys())}",
-                    "green",
-                )
-            )
-
-        cash_financing_cfg = self.parameters.get("cash_financing")
-        if isinstance(cash_financing_cfg, dict):
-            self._configure_cash_financing(
-                enabled=cash_financing_cfg.get("enabled", True),
-                account_mode=cash_financing_cfg.get("account_mode", "margin"),
-                day_count_basis=cash_financing_cfg.get("day_count_basis", 360),
-                missing_rate_policy=cash_financing_cfg.get("missing_rate_policy", "carry_forward"),
-            )
-            self._set_cash_financing_rates(
-                credit_rate_annual=cash_financing_cfg.get("credit_rate_annual"),
-                debit_rate_annual=cash_financing_cfg.get("debit_rate_annual"),
-            )
-
         self._strategy_returns_df = None
         self._benchmark_returns_df = None
 
         self._filled_order_callback = filled_order_callback
-
-    @property
-    def _executor(self):
-        executor = getattr(self, "_executor_instance", None)
-        if executor is None:
-            executor = self._build_executor()
-            self._executor_instance = executor
-        return executor
-
-    @_executor.setter
-    def _executor(self, executor):
-        self._executor_instance = executor
-
-    def _build_executor(self):
-        from .strategy_executor import StrategyExecutor
-
-        executor = StrategyExecutor(self)
-        subscribers = getattr(self.broker, "_subscribers", None)
-        try:
-            already_subscribed = subscribers is not None and executor in subscribers
-        except TypeError:
-            already_subscribed = False
-        if not already_subscribed:
-            self.broker._add_subscriber(executor)
-        return executor
-
-    def _should_defer_executor_build(self):
-        if not (_DEFER_CREDENTIALS_ON_IMPORT and not self.is_backtesting):
-            return False
-        if getattr(self.broker, "stream", None) is not None:
-            return False
-        return getattr(self.broker, "_orders_thread", None) is None
 
     # =============Internal functions===================
     def _copy_dict(self):
@@ -1092,6 +620,7 @@ class _Strategy:
         - The order is not None.
         - The order is an instance of the Order class.
         - The order quantity is not zero.
+        - For HFT strategies, check if sell order would result in negative position.
         """
 
         # Check if order is None
@@ -1122,6 +651,22 @@ class _Strategy:
             )
             return False
 
+        # Delegate position validation to broker for unified validation
+        # This ensures single source of truth and proper error event dispatching
+        if order.is_sell_order():
+            # Use broker's position validation for consistency
+            # The broker will handle position checks and error events properly
+            validation_result = self.broker.validate_order_position(order, self.name)
+            if not validation_result.is_valid:
+                # Log the validation failure but let broker handle the error events
+                self.logger.info(
+                    f"Order validation deferred to broker: {validation_result.message} "
+                    f"Order will be processed by broker validation system."
+                )
+                # Return True to allow broker to handle validation and error events
+                # This ensures proper error dispatching and logging
+                return True
+
         return True
 
     def _set_cash_position(self, cash: float):
@@ -1131,306 +676,30 @@ class _Strategy:
             if position is not None and position.asset == self._quote_asset:
                 position.quantity = cash
                 self.broker._filled_positions[x] = position
-                self._cash_position = position
                 return
 
         # If not in positions, create a new position for cash
-        cash_decimal = Decimal(cash)
-        available_cash = cash_decimal if self._quote_asset.asset_type == Asset.AssetType.CRYPTO else 0
-        position = _position_class()(
+        position = Position(
             self._name,
             self._quote_asset,
-            cash_decimal,
+            Decimal(cash),
             orders=None,
             hold=0,
-            available=available_cash,
+            available=Decimal(cash),
         )
         self.broker._filled_positions.append(position)
-        self._cash_position = position
-
-    def _get_cash_position(self):
-        cash_position = getattr(self, "_cash_position", None)
-        if (
-            cash_position is not None
-            and getattr(cash_position, "asset", None) == self._quote_asset
-            and getattr(cash_position, "strategy", None) == self._name
-        ):
-            return cash_position
-
-        cash_position = self.broker.get_tracked_position(self._name, self._quote_asset)
-        self._cash_position = cash_position
-        return cash_position
-
-    @staticmethod
-    def _coerce_cash_rate(value, field_name):
-        if value is None:
-            return None
-        try:
-            rate = float(value)
-        except (TypeError, ValueError):
-            raise ValueError(f"{field_name} must be a finite non-negative number")
-        if not math.isfinite(rate) or rate < 0:
-            raise ValueError(f"{field_name} must be a finite non-negative number")
-        return rate
-
-    def _configure_cash_financing(
-        self,
-        *,
-        enabled: bool | None = None,
-        account_mode: str | None = None,
-        day_count_basis: int | None = None,
-        missing_rate_policy: str | None = None,
-    ) -> None:
-        if enabled is not None:
-            self._cash_financing_enabled = bool(enabled)
-
-        if account_mode is not None:
-            normalized_account_mode = str(account_mode).strip().lower()
-            if normalized_account_mode not in {"margin", "cash"}:
-                raise ValueError("account_mode must be 'margin' or 'cash'")
-            self._cash_financing_account_mode = normalized_account_mode
-
-        if day_count_basis is not None:
-            try:
-                basis = int(day_count_basis)
-            except (TypeError, ValueError):
-                raise ValueError("day_count_basis must be a positive integer")
-            if basis <= 0:
-                raise ValueError("day_count_basis must be a positive integer")
-            self._cash_financing_day_count_basis = basis
-
-        if missing_rate_policy is not None:
-            normalized_missing_policy = str(missing_rate_policy).strip().lower()
-            if normalized_missing_policy not in {"carry_forward", "error"}:
-                raise ValueError("missing_rate_policy must be 'carry_forward' or 'error'")
-            self._cash_financing_missing_rate_policy = normalized_missing_policy
-
-    def _set_cash_financing_rates(
-        self,
-        *,
-        credit_rate_annual: float | None = None,
-        debit_rate_annual: float | None = None,
-    ) -> None:
-        if credit_rate_annual is not None:
-            normalized_credit_rate = self._coerce_cash_rate(credit_rate_annual, "credit_rate_annual")
-            self._cash_financing_credit_rate_annual = normalized_credit_rate
-            self._cash_financing_last_valid_credit_rate_annual = normalized_credit_rate
-
-        if debit_rate_annual is not None:
-            normalized_debit_rate = self._coerce_cash_rate(debit_rate_annual, "debit_rate_annual")
-            self._cash_financing_debit_rate_annual = normalized_debit_rate
-            self._cash_financing_last_valid_debit_rate_annual = normalized_debit_rate
-
-    def _resolve_cash_financing_rate(self, *, side: str) -> float:
-        if side == "credit":
-            rate = self._cash_financing_credit_rate_annual
-            fallback_rate = self._cash_financing_last_valid_credit_rate_annual
-        elif side == "debit":
-            rate = self._cash_financing_debit_rate_annual
-            fallback_rate = self._cash_financing_last_valid_debit_rate_annual
-        else:
-            raise ValueError(f"Unknown financing side: {side}")
-
-        if rate is not None:
-            return float(rate)
-
-        if self._cash_financing_missing_rate_policy == "carry_forward" and fallback_rate is not None:
-            return float(fallback_rate)
-
-        raise ValueError(
-            f"Missing {side} financing rate for {self._name}. "
-            "Set rates via set_cash_financing_rates()."
-        )
-
-    def _apply_cash_adjustment(
-        self,
-        *,
-        delta_cash: float,
-        reason: str,
-        kind: str,
-        allow_negative: bool | None = None,
-    ) -> float:
-        if not self.is_backtesting:
-            raise RuntimeError("Cash adjustments are only supported in backtesting")
-
-        try:
-            delta = float(delta_cash)
-        except (TypeError, ValueError):
-            raise ValueError("delta_cash must be a finite number")
-
-        if not math.isfinite(delta):
-            raise ValueError("delta_cash must be a finite number")
-
-        allow_negative_effective = (
-            self._cash_financing_account_mode == "margin"
-            if allow_negative is None
-            else bool(allow_negative)
-        )
-
-        current_cash = float(self.cash or 0.0)
-        updated_cash = current_cash + delta
-
-        if (not allow_negative_effective) and updated_cash < 0:
-            raise ValueError(
-                f"Cash adjustment '{reason}' would create negative cash "
-                f"({updated_cash:.2f}) while account_mode='cash'"
-            )
-
-        self._set_cash_position(updated_cash)
-
-        if kind == "deposit":
-            self._cash_deposits_total += abs(delta)
-        elif kind == "withdrawal":
-            self._cash_withdrawals_total += abs(delta)
-
-        self._cash_adjustments_net_total += delta
-        self._record_backtest_cash_event(
-            event_type=kind if kind in {"deposit", "withdrawal", "adjustment"} else "adjustment",
-            amount=delta,
-            reason=reason,
-            description=reason,
-            is_external_cash_flow=True,
-            raw_type=f"backtest_{kind}",
-        )
-        return updated_cash
-
-    def _record_backtest_cash_event(
-        self,
-        *,
-        event_type: str,
-        amount: float,
-        reason: str | None = None,
-        description: str | None = None,
-        is_external_cash_flow: bool = False,
-        raw_type: str | None = None,
-        raw_subtype: str | None = None,
-    ) -> None:
-        if not self.is_backtesting:
-            return
-        try:
-            normalized_amount = float(amount)
-        except (TypeError, ValueError):
-            return
-        if not math.isfinite(normalized_amount) or abs(normalized_amount) < 1e-12:
-            return
-
-        current_dt = self.get_datetime()
-        if current_dt is None:
-            return
-
-        try:
-            cash_event = _cash_event_class()(
-                broker_name="backtesting",
-                event_type=event_type,
-                amount=normalized_amount,
-                occurred_at=current_dt,
-                raw_type=raw_type,
-                raw_subtype=raw_subtype,
-                description=description or reason,
-                is_external_cash_flow=is_external_cash_flow,
-            )
-        except Exception:
-            return
-
-        broker = getattr(self, "broker", None)
-        record_cash_event = getattr(broker, "record_cash_event", None)
-        if callable(record_cash_event):
-            record_cash_event(
-                cash_event,
-                strategy=getattr(self, "_name", None),
-                reason=reason,
-                occurred_at=current_dt,
-            )
-
-    def _apply_daily_cash_financing_if_needed(self) -> None:
-        if not self.is_backtesting or not self._cash_financing_enabled:
-            return
-
-        current_dt = self.get_datetime()
-        if current_dt is None:
-            return
-        current_date = current_dt.date() if hasattr(current_dt, "date") else current_dt
-
-        if self._cash_financing_last_accrual_date == current_date:
-            return
-
-        if self._cash_financing_last_accrual_date is None:
-            days_to_accrue = 1
-        else:
-            days_delta = (current_date - self._cash_financing_last_accrual_date).days
-            if days_delta <= 0:
-                return
-            days_to_accrue = days_delta
-
-        current_cash = float(self.cash or 0.0)
-        if self._cash_financing_account_mode == "cash" and current_cash < 0:
-            raise ValueError(
-                "Negative cash is not permitted while account_mode='cash'. "
-                "Switch to account_mode='margin' or prevent negative balances."
-            )
-
-        credit_rate = self._resolve_cash_financing_rate(side="credit")
-        debit_rate = self._resolve_cash_financing_rate(side="debit")
-
-        if current_cash >= 0:
-            annual_rate = credit_rate
-        else:
-            annual_rate = debit_rate
-
-        daily_rate = annual_rate / float(self._cash_financing_day_count_basis)
-        cash_factor = (1.0 + daily_rate) ** days_to_accrue
-        updated_cash = current_cash * cash_factor
-        delta_cash = updated_cash - current_cash
-
-        self._set_cash_position(updated_cash)
-
-        if delta_cash >= 0:
-            self._cash_financing_credit_total += delta_cash
-        else:
-            self._cash_financing_debit_total += abs(delta_cash)
-        self._cash_financing_net_total += delta_cash
-        self._cash_financing_days_accrued += days_to_accrue
-        self._cash_financing_events += 1
-        self._cash_financing_last_credit_rate_used = credit_rate
-        self._cash_financing_last_debit_rate_used = debit_rate
-        self._cash_financing_last_accrual_date = current_date
-
-        if abs(delta_cash) >= 1e-12:
-            financing_reason = "cash_financing_credit" if delta_cash >= 0 else "cash_financing_debit"
-            financing_description = (
-                f"Daily cash financing {'credit' if delta_cash >= 0 else 'debit'} "
-                f"for {days_to_accrue} day(s)"
-            )
-            self._record_backtest_cash_event(
-                event_type="interest",
-                amount=delta_cash,
-                reason=financing_reason,
-                description=financing_description,
-                is_external_cash_flow=False,
-                raw_type=financing_reason,
-                raw_subtype=f"annual_rate={annual_rate:.12f}",
-            )
 
     def _sanitize_user_asset(self, asset):
         if isinstance(asset, Asset):
             return asset
         elif isinstance(asset, tuple):
             return asset
+        elif isinstance(asset, list):
+            return [self._sanitize_user_asset(a) for a in asset]
         elif isinstance(asset, str):
             # Make sure the asset is uppercase for consistency (and because some brokers require it)
             asset = asset.upper()
-            cache = getattr(self, "_sanitized_string_asset_cache", None)
-            if cache is None:
-                cache = {}
-                self._sanitized_string_asset_cache = cache
-            cached = cache.get(asset)
-            if cached is not None:
-                return cached
-            sanitized = Asset(symbol=asset)
-            if len(cache) >= 256:
-                cache.clear()
-            cache[asset] = sanitized
-            return sanitized
+            return Asset(symbol=asset)
         else:
             if self.broker.data_source.SOURCE != "CCXT":
                 raise ValueError(f"You must enter a symbol string or an asset object. You " f"entered {asset}")
@@ -1467,13 +736,12 @@ class _Strategy:
             self.last_broker_balances_update = None
 
         UPDATE_INTERVAL = 59
-        last_update = self.last_broker_balances_update
-        now_monotonic = time.monotonic()
         if (
-            last_update is None
+            self.last_broker_balances_update is None
             or force_update
-            or not isinstance(last_update, (int, float))
-            or last_update + UPDATE_INTERVAL < now_monotonic
+            or (
+                self.last_broker_balances_update + datetime.timedelta(seconds=UPDATE_INTERVAL) < datetime.datetime.now()
+            )
         ):
             try:
                 broker_balances = self.broker._get_balances_at_broker(self._quote_asset, self)
@@ -1483,18 +751,13 @@ class _Strategy:
 
             if broker_balances is not None:
                 cash, position_value, portfolio_value = broker_balances
-                if cash is None or position_value is None or portfolio_value is None:
-                    self.logger.warning(
-                        "Broker returned incomplete balances; leaving cached cash and portfolio values unchanged."
-                    )
-                    return False
 
                 # Update cash position instead of setting _cash directly
                 self._set_cash_position(cash)
                 self._position_value = position_value
                 self._portfolio_value = portfolio_value
 
-                self.last_broker_balances_update = now_monotonic
+                self.last_broker_balances_update = datetime.datetime.now()
                 return True
 
             else:
@@ -1514,108 +777,54 @@ class _Strategy:
         if not self.is_backtesting:
             return
 
-        filled_positions = getattr(self.broker, "_filled_positions", None)
-        filled_positions_revision = getattr(filled_positions, "revision", 0)
-        broker_datetime = getattr(self.broker, "datetime", None)
-        cache_key = (broker_datetime, filled_positions_revision)
-        if getattr(self, "_portfolio_value_cache_key", None) == cache_key:
-            return getattr(self, "_portfolio_value_cache_value", self._portfolio_value)
-
         with self._executor.lock:
             # Initialize last known prices tracker for forward-fill fallback.
             # This is used when OHLC data is missing (common for illiquid options like LEAPS).
             if not hasattr(self, '_last_known_prices'):
                 self._last_known_prices = {}
 
-            # Option quotes are frequently sparse/unreliable outside regular session hours.
-            # For backtests, avoid ingesting off-session option marks into portfolio valuation,
-            # which can otherwise poison forward-fill with stale placeholder values.
-            option_mark_time_local = None
-            broker_dt = getattr(self.broker, "datetime", None)
-            if isinstance(broker_dt, datetime.datetime):
-                try:
-                    if broker_dt.tzinfo is None:
-                        option_mark_time_local = _default_pytz().localize(broker_dt)
-                    else:
-                        option_mark_time_local = broker_dt.astimezone(_default_pytz())
-                except Exception:
-                    option_mark_time_local = None
-
-            option_marking_allowed = True
-            if option_mark_time_local is not None:
-                t_local = option_mark_time_local.time()
-                option_marking_allowed = (t_local >= datetime.time(9, 30)) and (t_local <= datetime.time(16, 0))
-                if not option_marking_allowed and self.is_backtesting:
-                    try:
-                        cadence_seconds = self._get_sleeptime_seconds()
-                    except Exception:
-                        cadence_seconds = None
-                    if cadence_seconds is not None and cadence_seconds >= 20 * 3600:
-                        # Daily-cadence backtests commonly evaluate at midnight while using
-                        # daily/EOD bars. Treat those marks as valid for portfolio valuation;
-                        # intraday backtests still reject off-session option marks.
-                        option_marking_allowed = True
-
-            def _asset_type_key(asset_obj):
-                cached_asset_type_key = getattr(asset_obj, "_cached_asset_type_key", None)
-                if cached_asset_type_key is not None:
-                    return cached_asset_type_key
-                raw_asset_type = getattr(asset_obj, "asset_type", "")
-                raw_asset_type = getattr(raw_asset_type, "value", raw_asset_type)
-                return str(raw_asset_type).lower()
-
             # Used for traditional brokers, for crypto this could be 0
             portfolio_value = self.cash
-            quote_asset = self._quote_asset
-            data_source = self.broker.data_source
-            option_source = self.broker.option_source
+
             positions = self.broker.get_tracked_positions(self._name)
+            assets_original = [position.asset for position in positions]
 
             # Set the base currency for crypto valuations.
 
             prices = {}
-            if not hasattr(self, "_forward_fill_warning_cache"):
-                # Throttle repetitive backtest forward-fill warnings (asset, day) to keep
-                # valuation logs informative without dominating runtime.
-                self._forward_fill_warning_cache = set()
-            for position in positions:
-                asset = position.asset
-                if asset != quote_asset:
+            for asset in assets_original:
+                if asset != self._quote_asset:
                     asset_is_option = False
-                    asset_type_key = _asset_type_key(asset)
-                    if asset_type_key in {"crypto", "forex"}:
-                        asset = (asset, quote_asset)
-                    elif asset_type_key == "option":
+                    if asset.asset_type == "crypto" or asset.asset_type == "forex":
+                        asset = (asset, self._quote_asset)
+                    elif asset.asset_type == "option":
                         asset_is_option = True
 
-                    if option_source is not None and asset_is_option:
-                        source = option_source
+                    if self.broker.option_source is not None and asset_is_option:
+                        source = self.broker.option_source
                     else:
-                        source = data_source
+                        source = self.broker.data_source
                     prices[asset] = self._get_price_from_source(source, asset)
 
             for position in positions:
-                position_asset = position.asset
-                position_asset_type = _asset_type_key(position_asset)
                 # Turn the asset into a tuple if it's a crypto asset
                 asset = (
-                    position_asset
-                    if position_asset_type not in {"crypto", "forex"}
-                    else (position_asset, quote_asset)
+                    position.asset
+                    if (position.asset.asset_type != "crypto") and (position.asset.asset_type != "forex")
+                    else (position.asset, self._quote_asset)
                 )
                 quantity = position.quantity
                 price = prices.get(asset)
-                is_option_asset = isinstance(asset, Asset) and position_asset_type == "option"
 
                 # If the asset is the quote asset, then we already have included it from cash
                 # Eg. if we have a position of USDT and USDT is the quote_asset then we already consider it as cash
-                if quote_asset is not None:
+                if self._quote_asset is not None:
                     if isinstance(asset, tuple) and asset == (
-                        quote_asset,
-                        quote_asset,
+                        self._quote_asset,
+                        self._quote_asset,
                     ):
                         continue
-                    elif isinstance(asset, Asset) and asset == quote_asset:
+                    elif isinstance(asset, Asset) and asset == self._quote_asset:
                         continue
 
                 # Normalize "missing" prices to None so forward-fill fallback can apply.
@@ -1631,10 +840,6 @@ class _Strategy:
                         else:
                             price = price_float
 
-                # For backtests, ignore option marks outside regular options hours.
-                if self.is_backtesting and is_option_asset and not option_marking_allowed:
-                    price = None
-
                 # Track valid prices for forward-fill fallback
                 if price is not None:
                     self._last_known_prices[asset] = price
@@ -1646,16 +851,10 @@ class _Strategy:
                         price = self._last_known_prices[asset]
                         base_asset = asset[0] if isinstance(asset, tuple) else asset
                         asset_symbol = getattr(base_asset, 'symbol', str(base_asset))
-                        # Throttle noisy forward-fill warnings to once per contract/symbol per run.
-                        # Daily option strategies can otherwise emit thousands of lines that materially
-                        # slow long backtests and bloat logs.
-                        warn_key = str(base_asset)
-                        if warn_key not in self._forward_fill_warning_cache:
-                            self._forward_fill_warning_cache.add(warn_key)
-                            self.logger.warning(
-                                "Using forward-filled price %.4f for %s at %s (no current price available).",
-                                price, asset_symbol, self.broker.datetime,
-                            )
+                        self.logger.warning(
+                            "Using forward-filled price %.4f for %s at %s (no current price available).",
+                            price, asset_symbol, self.broker.datetime,
+                        )
                     else:
                         # No price history - must skip this position
                         if isinstance(asset, Asset):
@@ -1686,7 +885,7 @@ class _Strategy:
                 if isinstance(asset, tuple):
                     multiplier = 1
                 else:
-                    multiplier = asset.multiplier if position_asset_type in {"option", "future", "cont_future"} else 1
+                    multiplier = asset.multiplier if asset.asset_type in ["option", "future", "cont_future"] else 1
 
                 # BACKTESTING ONLY: Special handling for futures portfolio value
                 # In backtesting, cash has margin deducted, so we need to add it back
@@ -1694,7 +893,7 @@ class _Strategy:
                 if (
                     self.is_backtesting
                     and not isinstance(asset, tuple)
-                    and position_asset_type in {"future", "cont_future"}
+                    and asset.asset_type in ["future", "cont_future"]
                 ):
                     # Import here to avoid circular dependency
                     from lumibot.backtesting.backtesting_broker import get_futures_margin_requirement
@@ -1714,8 +913,6 @@ class _Strategy:
                     portfolio_value += position_value
 
             self._portfolio_value = portfolio_value
-            self._portfolio_value_cache_key = cache_key
-            self._portfolio_value_cache_value = portfolio_value
         return portfolio_value
 
     def _get_price_from_source(self, source, asset):
@@ -1723,122 +920,13 @@ class _Strategy:
         if source is None:
             return None
 
-        snapshot_price = None
         timestep_hint = None
-        base_asset = asset[0] if isinstance(asset, tuple) else asset
-        base_asset_type = getattr(base_asset, "_cached_asset_type_key", None)
-        if base_asset_type is None:
-            base_asset_type = getattr(base_asset, "asset_type", None)
-            base_asset_type = getattr(base_asset_type, "value", base_asset_type)
-            base_asset_type = str(base_asset_type).lower()
-        is_option_asset = base_asset_type == "option"
-        ThetaDataBacktestingPandas = _get_backtesting_class("ThetaDataBacktestingPandas") if self.is_backtesting else None
-        is_thetadata_option_backtest = (
-            self.is_backtesting
-            and is_option_asset
-            and isinstance(source, ThetaDataBacktestingPandas)
-        )
-
-        def _thetadata_quote_mark(quote_obj):
-            if quote_obj is None:
-                return None
-            bid = getattr(quote_obj, "bid", None)
-            ask = getattr(quote_obj, "ask", None)
-            price = getattr(quote_obj, "price", None)
-
-            def _coerce(val):
-                try:
-                    numeric = float(val)
-                except (TypeError, ValueError):
-                    return None
-                if math.isnan(numeric) or numeric <= 0:
-                    return None
-                return numeric
-
-            bid_val = _coerce(bid)
-            ask_val = _coerce(ask)
-            if bid_val is not None and ask_val is not None:
-                return (bid_val + ask_val) / 2
-            if bid_val is not None:
-                return bid_val
-            if ask_val is not None:
-                return ask_val
-            return _coerce(price)
-
-        # Determine if this strategy is effectively daily cadence.
         try:
             cadence_seconds = self._get_sleeptime_seconds()
             if cadence_seconds is not None and cadence_seconds >= 20 * 3600:
                 timestep_hint = "day"
         except Exception:
             timestep_hint = None
-
-        # ThetaData backtesting: for options, mark-to-market should be quote-driven (NBBO mark) and
-        # extremely fast. Calling `get_price_snapshot()` first causes an extra `_update_pandas_data()`
-        # pass per asset (and often still falls back to `get_quote()`), which is the dominant cost in
-        # long, option-heavy intraday backtests.
-        if is_thetadata_option_backtest:
-            try:
-                get_quote = getattr(source, "get_quote", None)
-                if callable(get_quote):
-                    quote_asset = getattr(self, "_quote_asset", None)
-                    # ThetaData backtesting option MTM should be quote-driven when available.
-                    # Prefer the normal quote path first (usually day/EOD for daily cadence),
-                    # then fall back to a minimal intraday NBBO snapshot when day/EOD pricing
-                    # is missing (ThetaData can return 472/no-data for option EOD history even
-                    # when intraday quote history exists).
-                    if quote_asset is not None:
-                        quote = get_quote(base_asset, quote=quote_asset, timestep=timestep_hint or "minute")
-                    else:
-                        quote = get_quote(base_asset, timestep=timestep_hint or "minute")
-                    quote_mark = _thetadata_quote_mark(quote)
-                    day_quote_mark = quote_mark
-                    if timestep_hint != "day":
-                        if quote_mark is not None:
-                            return quote_mark
-
-                    # Daily-cadence fallback: intraday quote snapshots are the most robust source
-                    # of option marks. Even when day quotes exist, they can be stale in some
-                    # provider/cache states; prefer snapshot mark when available.
-                    if timestep_hint == "day":
-                        # Only attempt snapshot-only lookup when it's safe to do so.
-                        #
-                        # Some unit tests (and custom sources) override `get_quote()` at the class
-                        # level and treat repeated calls as an error (or always return the same
-                        # quote object regardless of timestep). For bound methods, only the real
-                        # ThetaDataBacktestingPandas implementation is guaranteed to understand
-                        # `snapshot_only`. For non-bound callables (e.g., instance-level stubs used
-                        # by tests), allow the fallback.
-                        can_try_snapshot = True
-                        func = getattr(get_quote, "__func__", None)
-                        if func is not None and func is not ThetaDataBacktestingPandas.get_quote:
-                            can_try_snapshot = False
-                        if can_try_snapshot:
-                            quote_kwargs = {"timestep": "minute", "snapshot_only": True}
-                            if quote_asset is not None:
-                                quote = get_quote(base_asset, quote=quote_asset, **quote_kwargs)
-                            else:
-                                quote = get_quote(base_asset, **quote_kwargs)
-                            quote_mark = _thetadata_quote_mark(quote)
-                            if quote_mark is not None:
-                                return quote_mark
-
-                        # If snapshot probing failed, avoid forcing day-quote marks for established
-                        # positions when we already have a prior valid mark to forward-fill from.
-                        # This prevents stale day quotes from creating artificial intraday MTM cliffs.
-                        has_last_known_price = False
-                        try:
-                            has_last_known_price = base_asset in getattr(self, "_last_known_prices", {})
-                        except Exception:
-                            has_last_known_price = False
-
-                        if has_last_known_price:
-                            return None
-                        if day_quote_mark is not None:
-                            return day_quote_mark
-            except Exception as e:
-                self.logger.debug("ThetaData quote-mark lookup failed for %s: %s", base_asset, e)
-            return None
 
         if hasattr(source, "get_price_snapshot"):
             try:
@@ -1853,15 +941,9 @@ class _Strategy:
                     type(source).__name__,
                 )
             else:
-                # ThetaData backtests: options often have no prints, but NBBO quotes exist.
-                # Portfolio mark-to-market should use mark (mid) when bid/ask are available.
-                if is_thetadata_option_backtest:
-                    snapshot_price = self._pick_thetadata_option_mark_price(base_asset, snapshot)
-                else:
-                    snapshot_price = self._pick_snapshot_price(asset, snapshot)
-
-        if snapshot_price is not None:
-            return snapshot_price
+                snapshot_price = self._pick_snapshot_price(asset, snapshot)
+                if snapshot_price is not None:
+                    return snapshot_price
 
         get_last_price = getattr(source, "get_last_price", None)
         if callable(get_last_price):
@@ -1869,89 +951,11 @@ class _Strategy:
             if price is not None:
                 return price
 
-        # Quote fallback for options when OHLC is missing.
-        # Options often have sparse OHLC data (LEAPS may not trade for days),
-        # but bid/ask quotes from market makers are typically available.
-        # This calls get_quote() which loads minute-level quote data.
-        if hasattr(base_asset, 'asset_type') and base_asset.asset_type == 'option':
-            try:
-                get_quote = getattr(source, 'get_quote', None)
-                if callable(get_quote):
-                    quote = get_quote(base_asset, timestep=timestep_hint or "minute")
-                    if quote is not None:
-                        bid = getattr(quote, 'bid', None)
-                        ask = getattr(quote, 'ask', None)
-                        try:
-                            bid_val = float(bid) if bid is not None else None
-                            ask_val = float(ask) if ask is not None else None
-                        except (TypeError, ValueError):
-                            bid_val = None
-                            ask_val = None
-
-                        # IMPORTANT: Treat 0/negative bid/ask as "no actionable quote".
-                        # Returning 0 here causes positions to be valued at $0 and breaks
-                        # the forward-fill MTM fallback, producing sawtooth equity curves.
-                        if bid_val is None or ask_val is None:
-                            return None
-                        if bid_val <= 0 or ask_val <= 0:
-                            return None
-
-                        mid_price = (bid_val + ask_val) / 2
-                        if mid_price > 0:
-                            self.logger.debug(
-                                "Using quote mid-price %.4f for %s (bid=%.4f, ask=%.4f)",
-                                mid_price, base_asset, bid_val, ask_val
-                            )
-                            return mid_price
-            except Exception as e:
-                self.logger.debug("Quote fallback failed for %s: %s", base_asset, e)
-
         self.logger.warning(
             "Data source %s for asset %s does not provide get_last_price; returning None.",
             type(source).__name__,
             asset,
         )
-        return None
-
-    def _pick_thetadata_option_mark_price(self, option_asset: Asset, snapshot):
-        """ThetaData backtests: prefer mark (NBBO mid) for option MTM when available."""
-        if not snapshot:
-            return None
-
-        def _positive(value):
-            value = self._coerce_snapshot_price(value)
-            if value is None:
-                return None
-            try:
-                numeric = float(value)
-            except (TypeError, ValueError):
-                return None
-            if math.isnan(numeric) or numeric <= 0:
-                return None
-            return numeric
-
-        bid = _positive(snapshot.get("bid"))
-        ask = _positive(snapshot.get("ask"))
-        close = _positive(snapshot.get("close"))
-
-        if bid is not None and ask is not None:
-            return (bid + ask) / 2.0
-        if bid is not None:
-            return bid
-        if ask is not None:
-            return ask
-        if close is not None:
-            return close
-
-        expiry = getattr(option_asset, "expiration", None)
-        now_dt = getattr(self.broker, "datetime", None)
-        if expiry is not None and now_dt is not None:
-            try:
-                if now_dt.date() >= expiry:
-                    return 0.0
-            except Exception:
-                pass
-
         return None
 
     def _pick_snapshot_price(self, asset, snapshot):
@@ -1966,7 +970,7 @@ class _Strategy:
 
         now = self._normalize_snapshot_datetime(getattr(self.broker, "datetime", None))
         if now is None:
-            now = self._normalize_snapshot_datetime(datetime.datetime.now(_default_pytz()))
+            now = self._normalize_snapshot_datetime(datetime.datetime.now(LUMIBOT_DEFAULT_PYTZ))
 
         trade_time = self._normalize_snapshot_datetime(snapshot.get("last_trade_time"))
         bid_time = self._normalize_snapshot_datetime(snapshot.get("last_bid_time"))
@@ -2049,16 +1053,16 @@ class _Strategy:
         if isinstance(dt_value, datetime.datetime):
             if dt_value.tzinfo is None:
                 try:
-                    return _default_pytz().localize(dt_value)
+                    return LUMIBOT_DEFAULT_PYTZ.localize(dt_value)
                 except ValueError:
-                    return dt_value.replace(tzinfo=_default_pytz())
-            return dt_value.astimezone(_default_pytz())
+                    return dt_value.replace(tzinfo=LUMIBOT_DEFAULT_PYTZ)
+            return dt_value.astimezone(LUMIBOT_DEFAULT_PYTZ)
         return None
 
     @staticmethod
     def _snapshot_stale_threshold_seconds():
         try:
-            return int(os.environ.get("THETADATA_MTM_STALE_SECONDS", "120"))
+            return int(os.environ.get("LUMIBOT_MTM_STALE_SECONDS", "120"))
         except (TypeError, ValueError):
             return 120
 
@@ -2136,10 +1140,6 @@ class _Strategy:
                 return self.cash
 
             dividends_per_share = self.get_yesterday_dividends(assets)
-            cash_position = self._get_cash_position()
-            cash = cash_position.quantity if cash_position is not None else 0.0
-            cash_delta = 0.0
-            cash_updated = False
 
             for position in positions:
                 asset = position.asset
@@ -2154,169 +1154,16 @@ class _Strategy:
                 if tracker_key in self._dividends_applied_tracker:
                     continue  # Already applied dividend for this asset on this date
 
-                dividend_amount = dividend_per_share * float(quantity)
-                cash_delta += dividend_amount
-                cash_updated = True
-                self._record_backtest_cash_event(
-                    event_type="dividend",
-                    amount=dividend_amount,
-                    reason="dividend",
-                    description=(
-                        f"{getattr(asset, 'symbol', str(asset))} dividend "
-                        f"{float(dividend_per_share):.6f} x {float(quantity):.6f}"
-                    ),
-                    raw_type="dividend",
-                    raw_subtype=getattr(asset, "symbol", None),
-                )
+                cash = self.cash
+                if cash is None:
+                    cash = 0
+                cash += dividend_per_share * float(quantity)
+                self._set_cash_position(cash)
 
                 # Mark as applied
                 self._dividends_applied_tracker.add(tracker_key)
 
-            if cash_updated:
-                updated_cash = cash + cash_delta
-                self._set_cash_position(updated_cash)
-                return updated_cash
-
-            return cash
-
-    def _update_positions_with_splits(self):
-        if not self.is_backtesting:
-            return 0
-
-        with self._executor.lock:
-            if not hasattr(self, '_stock_splits_applied_tracker'):
-                self._stock_splits_applied_tracker = set()
-
-            current_dt = self.get_datetime()
-            current_date = current_dt.date() if hasattr(current_dt, 'date') else current_dt
-            positions = self.broker.get_tracked_positions(self._name)
-
-            stock_positions = []
-            assets = []
-            for position in positions:
-                asset = position.asset
-                if asset == self._quote_asset:
-                    continue
-                asset_type = getattr(asset, "asset_type", "")
-                asset_type = getattr(asset_type, "value", asset_type)
-                if str(asset_type).lower() != "stock":
-                    continue
-                if not position.quantity:
-                    continue
-                stock_positions.append(position)
-                assets.append(asset)
-
-            if not assets:
-                return 0
-
-            data_source = getattr(getattr(self, "broker", None), "data_source", None)
-            get_splits = getattr(data_source, "get_yesterday_stock_splits", None)
-            if not callable(get_splits):
-                return 0
-
-            try:
-                split_ratios = get_splits(assets, quote=self._quote_asset)
-            except Exception:
-                self.logger.debug("Unable to read stock split ratios for %s", current_date, exc_info=True)
-                return 0
-
-            applied = 0
-            should_apply_splits = getattr(data_source, "should_apply_stock_splits_to_positions", None)
-            for position in stock_positions:
-                asset = position.asset
-                if callable(should_apply_splits):
-                    try:
-                        if not should_apply_splits(asset, quote=self._quote_asset):
-                            continue
-                    except Exception:
-                        self.logger.debug(
-                            "Unable to determine stock split accounting mode for %s on %s",
-                            getattr(asset, "symbol", asset),
-                            current_date,
-                            exc_info=True,
-                        )
-                        continue
-
-                raw_ratio = 0 if split_ratios is None else split_ratios.get(asset, 0)
-                try:
-                    split_ratio = float(raw_ratio)
-                except (TypeError, ValueError):
-                    continue
-                if not math.isfinite(split_ratio) or split_ratio <= 0 or abs(split_ratio - 1.0) < 1e-12:
-                    continue
-
-                symbol = getattr(asset, 'symbol', str(asset))
-                tracker_key = (current_date, symbol, f"{split_ratio:.12g}")
-                if tracker_key in self._stock_splits_applied_tracker:
-                    continue
-
-                try:
-                    old_quantity = getattr(position, "_quantity", Decimal(str(position.quantity)))
-                    split_ratio_decimal = Decimal(str(split_ratio))
-                    new_quantity = old_quantity * split_ratio_decimal
-                except Exception:
-                    self.logger.warning(
-                        "Skipping %s stock split ratio %.12g on %s because quantity %r could not be adjusted.",
-                        symbol,
-                        split_ratio,
-                        current_date,
-                        getattr(position, "quantity", None),
-                    )
-                    continue
-
-                old_quantity_float = float(old_quantity)
-                new_quantity_float = float(new_quantity)
-                position.quantity = new_quantity
-
-                avg_fill_price = getattr(position, "avg_fill_price", None)
-                if avg_fill_price is not None:
-                    try:
-                        position.avg_fill_price = float(Decimal(str(avg_fill_price)) / split_ratio_decimal)
-                    except Exception:
-                        pass
-
-                filled_positions = getattr(self.broker, "_filled_positions", None)
-                if hasattr(filled_positions, "revision"):
-                    filled_positions.revision += 1
-                for cache_name in (
-                    "_tracked_position_cache",
-                    "_tracked_positions_cache",
-                    "_asset_potential_total_cache",
-                ):
-                    cache = getattr(self.broker, cache_name, None)
-                    if hasattr(cache, "clear"):
-                        cache.clear()
-                self._portfolio_value_cache_key = None
-                self._portfolio_value_cache_value = None
-
-                record_event = getattr(self.broker, "record_corporate_action_event", None)
-                if callable(record_event):
-                    record_event(
-                        action_type="stock_split",
-                        asset=asset,
-                        strategy=getattr(self, "_name", None),
-                        ratio=split_ratio,
-                        quantity_before=old_quantity_float,
-                        quantity_after=new_quantity_float,
-                        occurred_at=current_dt,
-                        description=(
-                            f"{symbol} stock split ratio {split_ratio:.12g}: "
-                            f"quantity {old_quantity_float:.12g} -> {new_quantity_float:.12g}"
-                        ),
-                    )
-
-                self._stock_splits_applied_tracker.add(tracker_key)
-                applied += 1
-                self.logger.info(
-                    "Applied %s stock split ratio %.12g on %s: quantity %.12g -> %.12g",
-                    symbol,
-                    split_ratio,
-                    current_date,
-                    old_quantity_float,
-                    new_quantity_float,
-                )
-
-            return applied
+            return self.cash
 
     # =============Stats functions=====================
 
@@ -2332,37 +1179,63 @@ class _Strategy:
         if "datetime" in self._stats.columns:
             self._stats = self._stats.set_index("datetime")
             self._stats = self._stats.sort_index()
-
-        cumulative_period_columns = (
-            ("cash_deposits_total", "cash_deposits_period"),
-            ("cash_withdrawals_total", "cash_withdrawals_period"),
-            ("cash_adjustments_net_total", "cash_adjustments_net_period"),
-            ("cash_financing_credit_total", "cash_financing_credit_period"),
-            ("cash_financing_debit_total", "cash_financing_debit_period"),
-            ("cash_financing_net_total", "cash_financing_net_period"),
-        )
-
-        for total_col, period_col in cumulative_period_columns:
-            if total_col in self._stats.columns:
-                self._stats[period_col] = cumulative_to_period_flows(self._stats[total_col])
-
-        external_flow_totals = (
-            self._stats["cash_adjustments_net_total"]
-            if "cash_adjustments_net_total" in self._stats.columns
-            else None
-        )
-        self._stats["return"] = cash_flow_adjusted_returns(
-            self._stats["portfolio_value"],
-            external_flow_totals,
-        )
-        if "portfolio_value" in self._stats.columns:
-            adjusted_base = float(self._stats["portfolio_value"].iloc[0])
-            if external_flow_totals is not None:
-                adjusted_base -= float(external_flow_totals.iloc[0])
-            self._stats["cash_adjusted_portfolio_value"] = (
-                (1.0 + self._stats["return"].fillna(0.0)).cumprod() * adjusted_base
-            )
+        
+        # Calculate standard returns
+        self._stats["return"] = self._stats["portfolio_value"].pct_change()
         self._stats_dirty = False
+        
+        # Add intraday metrics for HFT strategies
+        # Add trading day column for grouping
+        if self._is_hft_strategy():
+            # Add intraday cumulative return column
+            self._stats["intraday_cumulative_return"] = (1 + self._stats["return"]).cumprod() - 1
+            
+            # Add trading day column for grouping
+            self._stats["trading_day"] = self._stats.index.date
+            
+            # Calculate intraday volatility (standard deviation of returns within each day)
+            day_groups = self._stats.groupby("trading_day")
+            
+            # Create a dictionary to store intraday metrics
+            intraday_metrics = {}
+            
+            # Calculate various intraday metrics
+            intraday_metrics["max_intraday_return"] = day_groups["intraday_cumulative_return"].max()
+            intraday_metrics["min_intraday_return"] = day_groups["intraday_cumulative_return"].min()
+            intraday_metrics["intraday_volatility"] = day_groups["return"].std()
+            
+            # Calculate intraday Sharpe ratio (mean return / std of returns)
+            # Handle division by zero by replacing NaN with 0
+            mean_returns = day_groups["return"].mean()
+            std_returns = day_groups["return"].std()
+            intraday_metrics["intraday_sharpe"] = mean_returns / std_returns.replace(0, float('nan'))
+            intraday_metrics["intraday_sharpe"] = intraday_metrics["intraday_sharpe"].fillna(0)
+            
+            # Calculate trade frequency (number of non-zero returns per day)
+            intraday_metrics["trade_frequency"] = day_groups["return"].apply(lambda x: (x != 0).sum())
+            
+            # Store these metrics in the strategy for later use in tearsheet
+            self._intraday_metrics = pd.DataFrame(intraday_metrics)
+            
+            # Add a summary of intraday metrics to the strategy parameters
+            if not hasattr(self, "parameters"):
+                self.parameters = {}
+                
+            if "HFT Metrics" not in self.parameters:
+                self.parameters["HFT Metrics"] = {}
+                
+            # Add average metrics
+            self.parameters["HFT Metrics"]["Avg Max Intraday Return"] = intraday_metrics["max_intraday_return"].mean()
+            self.parameters["HFT Metrics"]["Avg Min Intraday Return"] = intraday_metrics["min_intraday_return"].mean()
+            self.parameters["HFT Metrics"]["Avg Intraday Volatility"] = intraday_metrics["intraday_volatility"].mean()
+            self.parameters["HFT Metrics"]["Avg Intraday Sharpe"] = intraday_metrics["intraday_sharpe"].mean()
+            self.parameters["HFT Metrics"]["Avg Daily Trade Count"] = intraday_metrics["trade_frequency"].mean()
+            
+            # Add maximum values
+            self.parameters["HFT Metrics"]["Max Intraday Return"] = intraday_metrics["max_intraday_return"].max()
+            self.parameters["HFT Metrics"]["Max Intraday Drawdown"] = intraday_metrics["min_intraday_return"].min()
+            self.parameters["HFT Metrics"]["Max Intraday Volatility"] = intraday_metrics["intraday_volatility"].max()
+            self.parameters["HFT Metrics"]["Max Daily Trade Count"] = intraday_metrics["trade_frequency"].max()
 
         return self._stats
 
@@ -2410,86 +1283,35 @@ class _Strategy:
             # is at the start of the day, so the graph cuts short. This may be needed
             # for other timeframes as well
             backtesting_end_adjusted = self._backtesting_end
-            AlpacaBacktesting = _get_backtesting_class("AlpacaBacktesting")
-            PolygonDataBacktesting = _get_backtesting_class("PolygonDataBacktesting")
-            RoutedBacktestingPandas = _get_backtesting_class("RoutedBacktestingPandas")
-
-            # If we are using the polgon data source, then get the benchmark returns from polygon
-            if type(self.broker.data_source) == PolygonDataBacktesting:
-                benchmark_asset = self._benchmark_asset
-                # If the benchmark asset is a string, then convert it to an Asset object
-                if isinstance(benchmark_asset, str):
-                    benchmark_asset = Asset(benchmark_asset)
-
-                timestep = "minute"
-                # If the strategy sleeptime is in days then use daily data, eg. "1D"
-                if "D" in str(self._sleeptime):
-                    timestep = "day"
-
-                bars = self.broker.data_source.get_historical_prices_between_dates(
-                    benchmark_asset,
-                    timestep,
-                    start_date=self._backtesting_start,
-                    end_date=backtesting_end_adjusted,
-                    quote=self._quote_asset,
-                )
-                df = bars.df
-
-                # Add returns column
-                if hasattr(df, 'select'):  # Polars DataFrame
-                    df = df.with_columns(pl.col("close").pct_change().alias("return"))
-                    # Add the symbol_cumprod column for polars
-                    df = df.with_columns((1 + pl.col("return")).cum_prod().alias("symbol_cumprod"))
-                else:  # Pandas DataFrame
-                    df["return"] = df["close"].pct_change(fill_method=None)
-                    # Add the symbol_cumprod column for pandas
-                    df["symbol_cumprod"] = (1 + df["return"]).cumprod()
-
-                self._benchmark_returns_df = df
-
-            # For data sources of type CCXT, benchmark_asset gets bechmark_asset from the CCXT backtest data source.
-            elif self.broker.data_source.SOURCE.upper() == "CCXT":
-                benchmark_asset = self._benchmark_asset
-                # If the benchmark asset is a string, then convert it to an Asset object
-                if isinstance(benchmark_asset, str):
-                    asset_quote = benchmark_asset.split("/")
-                    if len(asset_quote) == 2:
-                        benchmark_asset = (Asset(symbol=asset_quote[0], asset_type="crypto"),
-                                           Asset(symbol=asset_quote[1], asset_type="crypto"))
-                    else:
-                        benchmark_asset = Asset(symbol=benchmark_asset, asset_type="crypto")
-
-                timestep = "minute"
-                # If the strategy sleeptime is in days then use daily data, eg. "1D"
-                if "D" in str(self._sleeptime):
-                    timestep = "day"
-
-                bars = self.broker.data_source.get_historical_prices_between_dates(
-                    benchmark_asset,
-                    timestep,
-                    start_date=self._backtesting_start,
-                    end_date=backtesting_end_adjusted,
-                    quote=self._quote_asset,
-                )
-                df = bars.df
-
-                # Add the symbol_cumprod column
-                df["symbol_cumprod"] = (1 + df["return"]).cumprod()
-
-                self._benchmark_returns_df = df
 
             # IBKR backtests:
             # - For crypto benchmarks, prefer the IBKR data source (Yahoo crypto tickers are inconsistent).
             # - For equity benchmarks (e.g., SPY), prefer Yahoo to avoid IBKR history flakiness impacting
             #   tearsheet generation (benchmark is cosmetic; strategy stats are authoritative).
-            elif str(getattr(self.broker.data_source, "SOURCE", "") or "").upper() == "INTERACTIVEBROKERSREST":
-                def _fallback_benchmark() -> None:
-                    """Avoid benchmark contamination by leaving benchmark empty on fetch failure."""
-                    self.logger.warning(
-                        "IBKR benchmark bars unavailable; leaving benchmark empty (no strategy-equity fallback)."
-                    )
-                    self._benchmark_returns_df = None
-                    return
+            if str(getattr(self.broker.data_source, "SOURCE", "") or "").upper() == "INTERACTIVEBROKERSREST":
+                def _fallback_benchmark_from_strategy() -> None:
+                    """Fallback: use the strategy equity curve as a benchmark so tearsheets remain available."""
+                    try:
+                        if self._strategy_returns_df is None or self._strategy_returns_df.empty:
+                            return
+                        if "portfolio_value" not in self._strategy_returns_df.columns:
+                            return
+                        series = self._strategy_returns_df["portfolio_value"].astype(float).copy()
+                        first = float(series.dropna().iloc[0]) if not series.dropna().empty else None
+                        if first is None or first == 0:
+                            return
+                        bench = pd.DataFrame(index=self._strategy_returns_df.index)
+                        # Match the shape expected by plotting + tearsheet code:
+                        # - `plot_returns()` expects a `return` column
+                        # - tearsheets typically consume `symbol_cumprod`
+                        bench["return"] = series.pct_change(fill_method=None)
+                        bench["symbol_cumprod"] = (1 + bench["return"]).cumprod()
+                        self._benchmark_returns_df = bench
+                        self.logger.warning(
+                            "IBKR benchmark bars unavailable; using strategy equity curve as benchmark for tearsheet generation."
+                        )
+                    except Exception:
+                        return
 
                 benchmark_asset = self._benchmark_asset
                 if isinstance(benchmark_asset, str):
@@ -2507,7 +1329,7 @@ class _Strategy:
                                 backtesting_end_adjusted,
                             )
                         except Exception:
-                            _fallback_benchmark()
+                            _fallback_benchmark_from_strategy()
                         return
                 elif isinstance(benchmark_asset, Asset) and str(getattr(benchmark_asset, "asset_type", "")).lower() == "stock":
                     try:
@@ -2517,7 +1339,7 @@ class _Strategy:
                             backtesting_end_adjusted,
                         )
                     except Exception:
-                        _fallback_benchmark()
+                        _fallback_benchmark_from_strategy()
                     return
 
                 timestep = "minute"
@@ -2533,98 +1355,12 @@ class _Strategy:
                 )
                 if bars is None or getattr(bars, "df", None) is None:
                     self.logger.error(f"Couldn't get benchmark bars from IBKR data source: {benchmark_asset}")
-                    _fallback_benchmark()
+                    _fallback_benchmark_from_strategy()
                     return
                 df = bars.df
                 if df is None or df.empty or "close" not in df.columns:
                     self.logger.error(f"IBKR benchmark bars empty/invalid: {benchmark_asset}")
-                    _fallback_benchmark()
-                    return
-                df = df.copy()
-                df["return"] = df["close"].pct_change(fill_method=None)
-                df["symbol_cumprod"] = (1 + df["return"]).cumprod()
-                self._benchmark_returns_df = df
-
-            # Router backtests (prod-like Theta+IBKR routing):
-            # Prefer the routed data source over Yahoo so benchmarks remain cacheable and don't
-            # require external network access (Yahoo can be rate-limited and slow).
-            elif RoutedBacktestingPandas is not None and isinstance(self.broker.data_source, RoutedBacktestingPandas):
-                def _fallback_benchmark(local_benchmark_asset) -> None:
-                    """Fallback for router benchmark failures without using strategy-equity returns.
-
-                    Why:
-                    - Router benchmark fetches can fail transiently for symbols like SPY.
-                    - Using strategy-equity as a benchmark contaminates tearsheet metrics.
-                    - A Yahoo stock benchmark fallback keeps benchmark reporting available while
-                      preserving strategy metric integrity.
-                    """
-                    fallback_symbol = None
-                    if isinstance(local_benchmark_asset, str):
-                        parts = [p.strip() for p in local_benchmark_asset.split("/") if p.strip()]
-                        if len(parts) == 1:
-                            fallback_symbol = parts[0]
-                    elif (
-                        isinstance(local_benchmark_asset, Asset)
-                        and str(getattr(local_benchmark_asset, "asset_type", "")).lower() == "stock"
-                    ):
-                        fallback_symbol = local_benchmark_asset.symbol
-
-                    if fallback_symbol:
-                        try:
-                            self._benchmark_returns_df = get_symbol_returns(
-                                fallback_symbol,
-                                self._backtesting_start,
-                                backtesting_end_adjusted,
-                            )
-                            if self._benchmark_returns_df is not None and not self._benchmark_returns_df.empty:
-                                self.logger.warning(
-                                    "Router benchmark bars unavailable for %s; using Yahoo fallback.",
-                                    fallback_symbol,
-                                )
-                                return
-                        except Exception:
-                            pass
-
-                    self.logger.warning(
-                        "Router benchmark bars unavailable; leaving benchmark empty (no strategy-equity fallback)."
-                    )
-                    self._benchmark_returns_df = None
-                    return
-
-                benchmark_asset = self._benchmark_asset
-                if isinstance(benchmark_asset, str):
-                    parts = [p.strip() for p in benchmark_asset.split("/") if p.strip()]
-                    if len(parts) == 2:
-                        benchmark_asset = (
-                            Asset(symbol=parts[0], asset_type="crypto"),
-                            Asset(symbol=parts[1], asset_type="forex"),
-                        )
-                    else:
-                        # Keep behavior consistent with Yahoo benchmarks: use daily series.
-                        benchmark_asset = Asset(symbol=benchmark_asset, asset_type="stock")
-
-                # Use daily bars for benchmark across intraday strategies to keep tearsheet cost bounded.
-                timestep = "day"
-
-                try:
-                    bars = self.broker.data_source.get_historical_prices_between_dates(
-                        benchmark_asset,
-                        timestep,
-                        start_date=self._backtesting_start,
-                        end_date=backtesting_end_adjusted,
-                        quote=self._quote_asset,
-                    )
-                except Exception:
-                    bars = None
-
-                if bars is None or getattr(bars, "df", None) is None:
-                    self.logger.error(f"Couldn't get benchmark bars from Router data source: {benchmark_asset}")
-                    _fallback_benchmark(benchmark_asset)
-                    return
-                df = bars.df
-                if df is None or df.empty or "close" not in df.columns:
-                    self.logger.error(f"Router benchmark bars empty/invalid: {benchmark_asset}")
-                    _fallback_benchmark(benchmark_asset)
+                    _fallback_benchmark_from_strategy()
                     return
                 df = df.copy()
                 df["return"] = df["close"].pct_change(fill_method=None)
@@ -2641,6 +1377,7 @@ class _Strategy:
                 if df is None or df.empty:
                     self.logger.error(f"Couldn't get_historical_prices_between_dates: {benchmark_asset}")
                     return
+
                 df = df.loc[self._backtesting_start:self._backtesting_end].copy()
                 if hasattr(df, 'select'):  # Polars DataFrame
                     df = df.with_columns(pl.col("close").pct_change().alias("return"))
@@ -2673,11 +1410,12 @@ class _Strategy:
     def plot_returns_vs_benchmark(
         self,
         plot_file_html="backtest_result.html",
-        trades_file=None,
         trades_df=None,
         show_plot=True,
     ):
-        if self._strategy_returns_df is None:
+        if not show_plot:
+            return
+        elif self._strategy_returns_df is None:
             self.logger.warning("Cannot plot returns because the strategy returns are missing")
         elif self._benchmark_returns_df is None:
             self.logger.warning("Cannot plot returns because the benchmark returns are missing")
@@ -2687,143 +1425,85 @@ class _Strategy:
                 f"{self._log_strat_name()}Strategy",
                 self._benchmark_returns_df,
                 str(self._benchmark_asset),
-                plot_file_html=plot_file_html,
-                trades_file=trades_file,
-                trades_df=trades_df,
-                show_plot=show_plot,
+                plot_file_html,
+                trades_df,
+                show_plot,
                 initial_budget=self._initial_budget,
             )
 
-    @staticmethod
-    def _extract_returns_series(frame, returns_col: str = "return", value_col: str | None = None) -> pd.Series:
-        """Extract a clean returns series from a strategy/benchmark dataframe."""
-        if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
-            return pd.Series(dtype=float)
-
-        if returns_col in frame.columns:
-            series = pd.to_numeric(frame[returns_col], errors="coerce")
-        elif value_col and value_col in frame.columns:
-            values = pd.to_numeric(frame[value_col], errors="coerce")
-            series = values.pct_change(fill_method=None)
+    def _is_hft_strategy(self):
+        """
+        Detect if this is a high-frequency trading strategy based on trading frequency
+        or sleeptime configuration.
+        
+        Returns
+        -------
+        bool
+            True if the strategy appears to be HFT, False otherwise
+        """
+        # First check: if sleeptime is very small (seconds or milliseconds), consider it HFT
+        if hasattr(self, '_sleeptime'):
+            sleeptime_str = str(self._sleeptime).lower()
+            
+            # Check for millisecond-level trading frequency
+            if 'ms' in sleeptime_str or sleeptime_str.endswith('s') and float(sleeptime_str.rstrip('s')) < 5:
+                return True
+                
+            # Check for very frequent minute-level trading (less than 5 minutes)
+            if sleeptime_str.endswith('m') and float(sleeptime_str.rstrip('m')) < 5:
+                return True
+        
+        # Second check: based on historical trading frequency
+        if len(self._stats_list) == 0:
+            return False
+            
+        # Calculate average iterations per day
+        trading_days = set()
+        for row in self._stats_list:
+            if 'datetime' in row:
+                if hasattr(row['datetime'], 'date'):
+                    trading_days.add(row['datetime'].date())
+                else:
+                    # Try to convert to datetime if it's not already
+                    try:
+                        dt = pd.to_datetime(row['datetime'])
+                        trading_days.add(dt.date())
+                    except:
+                        pass
+        
+        # If we couldn't extract dates, use a conservative estimate
+        if not trading_days:
+            return False
+            
+        avg_iterations_per_day = len(self._stats_list) / max(1, len(trading_days))
+        
+        # Consider it HFT if more than 100 iterations per day on average
+        return avg_iterations_per_day > 100
+    
+    def _get_appropriate_resample_rule(self):
+        """
+        Determine the appropriate resampling rule based on strategy characteristics.
+        
+        Returns
+        -------
+        str
+            The pandas resample rule to use
+        """
+        if self._is_hft_strategy():
+            # For HFT strategies, use minute-level resampling
+            # This can be adjusted based on specific needs
+            return "1min"  # 1-minute intervals
         else:
-            return pd.Series(dtype=float)
-
-        series = series.dropna()
-        if series.empty:
-            return pd.Series(dtype=float)
-
-        try:
-            idx = pd.to_datetime(series.index)
-            if getattr(idx, "tz", None) is not None:
-                idx = idx.tz_localize(None)
-            series.index = idx
-        except Exception:
-            pass
-
-        return series
-
-    @staticmethod
-    def _build_drawdown_inputs(strategy_returns: pd.Series) -> tuple[pd.Series, pd.DataFrame]:
-        """Build drawdown series/details passed to custom tearsheet metric hooks."""
-        if strategy_returns is None or strategy_returns.empty:
-            return pd.Series(dtype=float), pd.DataFrame()
-
-        growth = (1.0 + strategy_returns.fillna(0.0)).cumprod()
-        high_water_mark = growth.cummax()
-        drawdown = (growth / high_water_mark) - 1.0
-        drawdown.name = "drawdown"
-
-        drawdown_details = pd.DataFrame()
-        try:
-            import quantstats_lumi as _qs
-
-            drawdown_details = _qs.stats.drawdown_details(drawdown)
-        except Exception:
-            drawdown_details = pd.DataFrame()
-
-        return drawdown, drawdown_details
-
-    def _default_cash_tearsheet_metrics(self) -> dict:
-        metrics = {
-            "Cash Deposits Total": float(getattr(self, "_cash_deposits_total", 0.0)),
-            "Cash Withdrawals Total": float(getattr(self, "_cash_withdrawals_total", 0.0)),
-            "Cash Adjustments Net Total": float(getattr(self, "_cash_adjustments_net_total", 0.0)),
-            "Cash Financing Credit Total": float(getattr(self, "_cash_financing_credit_total", 0.0)),
-            "Cash Financing Debit Total": float(getattr(self, "_cash_financing_debit_total", 0.0)),
-            "Cash Financing Net Total": float(getattr(self, "_cash_financing_net_total", 0.0)),
-            "Cash Financing Days Accrued": int(getattr(self, "_cash_financing_days_accrued", 0)),
-            "Cash Financing Events": int(getattr(self, "_cash_financing_events", 0)),
-        }
-
-        has_non_zero_flow = any(
-            abs(float(metrics[key])) > 0.0
-            for key in (
-                "Cash Deposits Total",
-                "Cash Withdrawals Total",
-                "Cash Adjustments Net Total",
-                "Cash Financing Credit Total",
-                "Cash Financing Debit Total",
-                "Cash Financing Net Total",
-            )
-        )
-        has_financing_config = bool(getattr(self, "_cash_financing_enabled", False))
-        has_financing_activity = bool(metrics["Cash Financing Days Accrued"] or metrics["Cash Financing Events"])
-
-        if not (has_non_zero_flow or has_financing_config or has_financing_activity):
-            return {}
-
-        return metrics
-
-    def _collect_custom_tearsheet_metrics(self) -> dict:
-        """Invoke Strategy.tearsheet_custom_metrics() if implemented."""
-        base_metrics = self._default_cash_tearsheet_metrics()
-        hook = getattr(self, "tearsheet_custom_metrics", None)
-        if not callable(hook):
-            return base_metrics
-
-        stats_df = self._stats.copy(deep=True) if isinstance(self._stats, pd.DataFrame) else None
-        strategy_returns = self._extract_returns_series(
-            self._strategy_returns_df,
-            returns_col="return",
-            value_col="portfolio_value",
-        )
-        benchmark_returns = self._extract_returns_series(
-            self._benchmark_returns_df,
-            returns_col="return",
-            value_col="symbol_cumprod",
-        )
-        drawdown, drawdown_details = self._build_drawdown_inputs(strategy_returns)
-
-        try:
-            custom_metrics = hook(
-                stats_df=stats_df,
-                strategy_returns=strategy_returns,
-                benchmark_returns=benchmark_returns if not benchmark_returns.empty else None,
-                drawdown=drawdown,
-                drawdown_details=drawdown_details,
-                risk_free_rate=self.risk_free_rate,
-            )
-        except Exception as exc:
-            self.logger.warning("tearsheet_custom_metrics() failed; continuing without custom metrics: %s", exc)
-            return base_metrics
-
-        if custom_metrics is None:
-            return base_metrics
-        if not isinstance(custom_metrics, dict):
-            self.logger.warning(
-                "tearsheet_custom_metrics() must return a dict, got %s; ignoring custom metrics.",
-                type(custom_metrics).__name__,
-            )
-            return base_metrics
-
-        return {**base_metrics, **custom_metrics}
-
+            # For regular strategies, use daily resampling
+            return "D"
+            
     def tearsheet(
         self,
         save_tearsheet=True,
         tearsheet_file=None,
         show_tearsheet=True,
-        tearsheet_metrics_file=None,
+        resample_rule=None,  # Changed default to None for auto-detection
+        bar_type="volume",  # Bar type for HFT strategies: 'volume', 'dollar', 'imbalance', 'runs', 'time', 'auto'
     ):
         if not save_tearsheet and not show_tearsheet:
             return None
@@ -2860,6 +1540,41 @@ class _Strategy:
 
             strat_name = self._name if self._name is not None else "Strategy"
 
+            # Auto-detect appropriate resample rule if not specified
+            if resample_rule is None:
+                resample_rule = self._get_appropriate_resample_rule()
+                
+                # Add information about detected strategy type to parameters
+                if "Strategy Info" not in strategy_parameters:
+                    strategy_parameters["Strategy Info"] = {}
+                    
+                strategy_parameters["Strategy Info"]["Detected Type"] = "High-Frequency Trading" if resample_rule != "D" else "Standard"
+                strategy_parameters["Strategy Info"]["Resample Rule"] = resample_rule
+            
+            # Check if bar_type is specified in strategy parameters (allows override from strategy)
+            if "bar_type" in self.parameters:
+                bar_type = self.parameters["bar_type"]
+                
+            # For HFT strategies, include trade metrics in the parameters
+            if hasattr(self, '_trade_history') and self._trade_history:
+                # Analyze trades and add metrics to parameters
+                trade_metrics = self.analyze_trades()
+                
+                if "Trade Metrics" not in strategy_parameters:
+                    strategy_parameters["Trade Metrics"] = {}
+                
+                # Format the metrics for display
+                strategy_parameters["Trade Metrics"]["Trade Count"] = trade_metrics["trade_count"]
+                strategy_parameters["Trade Metrics"]["Win Rate"] = f"{trade_metrics['win_rate']:.2%}"
+                strategy_parameters["Trade Metrics"]["Profit Factor"] = f"{trade_metrics['profit_factor']:.2f}"
+                strategy_parameters["Trade Metrics"]["Avg Profit/Trade"] = f"${trade_metrics['avg_profit_per_trade']:.2f}"
+                strategy_parameters["Trade Metrics"]["Avg Profit %/Trade"] = f"{trade_metrics['avg_profit_pct_per_trade']:.2f}%"
+                strategy_parameters["Trade Metrics"]["Total P&L"] = f"${trade_metrics['total_profit']:.2f}"
+                strategy_parameters["Trade Metrics"]["Max Profit"] = f"${trade_metrics['max_profit']:.2f}"
+                strategy_parameters["Trade Metrics"]["Max Loss"] = f"${trade_metrics['max_loss']:.2f}"
+                strategy_parameters["Trade Metrics"]["Avg Win"] = f"${trade_metrics['avg_win']:.2f}"
+                strategy_parameters["Trade Metrics"]["Avg Loss"] = f"${trade_metrics['avg_loss']:.2f}"
+
             lumibot_version = None
             backtesting_data_sources = None
             backtest_time_seconds = None
@@ -2890,8 +1605,6 @@ class _Strategy:
             except Exception:
                 pass
 
-            custom_metrics = self._collect_custom_tearsheet_metrics()
-
             result = create_tearsheet(
                 self._strategy_returns_df,
                 strat_name,
@@ -2902,11 +1615,11 @@ class _Strategy:
                 save_tearsheet,
                 risk_free_rate=self.risk_free_rate,
                 strategy_parameters=strategy_parameters,
+                resample_rule=resample_rule,  # Pass the resample_rule parameter
+                bar_type=bar_type,  # Pass the bar_type parameter
                 lumibot_version=lumibot_version,
                 backtesting_data_sources=backtesting_data_sources,
                 backtest_time_seconds=backtest_time_seconds,
-                tearsheet_metrics_file=tearsheet_metrics_file,
-                custom_metrics=custom_metrics,
             )
 
             return result
@@ -2914,7 +1627,7 @@ class _Strategy:
     @classmethod
     def run_backtest(
         self,
-        datasource_class=None,
+        datasource_class,
         backtesting_start: datetime = None,
         backtesting_end: datetime = None,
         minutes_before_closing = 5,
@@ -2933,11 +1646,10 @@ class _Strategy:
         trades_file = None,
         settings_file = None,
         pandas_data: Union[List, Dict[Asset, Data]] = None,
-        quote_asset = _DEFAULT_QUOTE_ASSET,
+        quote_asset = Asset(symbol="USD", asset_type="forex"),
         starting_positions = None,
         show_plot = None,
         tearsheet_file = None,
-        tearsheet_metrics_file = None,
         save_tearsheet = True,
         show_tearsheet = None,
         parameters = {},
@@ -2955,20 +1667,20 @@ class _Strategy:
         use_quote_data = False,
         show_progress_bar = True,
         quiet_logs = False,
-        trader_class = None,
+        trader_class = Trader,
         include_cash_positions=False,
         save_stats_file = True,
+        resample_rule = None,  # Add resample_rule parameter
+        bar_type = "volume",  # Bar type for HFT tearsheet: 'volume', 'dollar', 'imbalance', 'runs', 'time', 'auto'
         **kwargs,
     ):
         """Backtest a strategy.
 
         Parameters
         ----------
-        datasource_class : class, optional
+        datasource_class : class
             The datasource class to use. For example, if you want to use the yahoo finance datasource,
-            then you would pass YahooDataBacktesting as the datasource_class. When BACKTESTING_DATA_SOURCE
-            is configured in the environment, you may leave this as None and let the runtime resolve the
-            effective backtesting data source from the environment instead.
+            then you would pass YahooDataBacktesting as the datasource_class.
         backtesting_start : datetime
             The start date of the backtesting period.
         backtesting_end : datetime
@@ -3078,40 +1790,20 @@ class _Strategy:
         >>> benchmark_asset = Asset(symbol="QQQ", asset_type="stock")
         >>>
         >>> backtest = MyStrategy.backtest(
-        >>>     datasource_class=None,
+        >>>     datasource_class=YahooDataBacktesting,
         >>>     backtesting_start=backtesting_start,
         >>>     backtesting_end=backtesting_end,
         >>>     benchmark_asset=benchmark_asset,
         >>> )
         """
-        backtesting_credentials = _credentials()
-        default_backtesting_start = getattr(backtesting_credentials, "BACKTESTING_START", BACKTESTING_START)
-        default_backtesting_end = getattr(backtesting_credentials, "BACKTESTING_END", BACKTESTING_END)
-        default_backtesting_data_source = getattr(
-            backtesting_credentials,
-            "BACKTESTING_DATA_SOURCE",
-            BACKTESTING_DATA_SOURCE,
-        )
-        default_show_plot = getattr(backtesting_credentials, "SHOW_PLOT", SHOW_PLOT)
-        default_show_tearsheet = getattr(backtesting_credentials, "SHOW_TEARSHEET", SHOW_TEARSHEET)
-        default_show_indicators = getattr(backtesting_credentials, "SHOW_INDICATORS", SHOW_INDICATORS)
-        default_polygon_api_key = getattr(backtesting_credentials, "POLYGON_API_KEY", POLYGON_API_KEY)
-        default_thetadata_config = getattr(backtesting_credentials, "THETADATA_CONFIG", THETADATA_CONFIG)
-        default_show_progress_bar = getattr(
-            backtesting_credentials,
-            "BACKTESTING_SHOW_PROGRESS_BAR",
-            BACKTESTING_SHOW_PROGRESS_BAR,
-        )
-        default_polygon_max_memory_bytes = getattr(
-            backtesting_credentials,
-            "POLYGON_MAX_MEMORY_BYTES",
-            POLYGON_MAX_MEMORY_BYTES,
-        )
-        default_log_backtest_progress_to_file = getattr(
-            backtesting_credentials,
-            "LOG_BACKTEST_PROGRESS_TO_FILE",
-            LOG_BACKTEST_PROGRESS_TO_FILE,
-        )
+        
+        # Reset progress bar state at the start of each backtest
+        try:
+            from lumibot.tools.helpers import reset_progress_bar_state
+            reset_progress_bar_state()
+        except ImportError:
+            # If helpers module isn't available, continue without resetting
+            pass
 
         if name is None:
             name = self.__name__
@@ -3119,14 +1811,11 @@ class _Strategy:
         self._name = name
         self._analyze_backtest = analyze_backtest
 
-        if quote_asset is _DEFAULT_QUOTE_ASSET:
-            quote_asset = Asset(symbol="USD", asset_type="forex")
-
         # Set backtesting_start: priority 1 - passed argument, 2 - BACKTESTING_START env var, 3 - default to 1 year ago
         if backtesting_start is not None:
             pass
-        elif default_backtesting_start is not None:
-            backtesting_start = default_backtesting_start
+        elif BACKTESTING_START is not None:
+            backtesting_start = BACKTESTING_START
         else:
             backtesting_start = datetime.datetime.now() - datetime.timedelta(days=365)
             get_logger(__name__).warning(
@@ -3139,8 +1828,8 @@ class _Strategy:
         # Set backtesting_end: priority 1 - passed argument, 2 - BACKTESTING_END env var, 3 - default to yesterday
         if backtesting_end is not None:
             pass
-        elif default_backtesting_end is not None:
-            backtesting_end = default_backtesting_end
+        elif BACKTESTING_END is not None:
+            backtesting_end = BACKTESTING_END
         else:
             backtesting_end = datetime.datetime.now() - datetime.timedelta(days=1)
             get_logger(__name__).warning(
@@ -3152,157 +1841,80 @@ class _Strategy:
 
         # Create an adapter with 'strategy_name' set to the instance's name
         if not hasattr(self, "logger") or self.logger is None:
-            self.logger = LazyStrategyLogger(__name__, self._name)
-
-        if trader_class is None:
-            trader_class = _default_trader_class()
+            self.logger = get_strategy_logger(__name__, self._name)
 
         # If show_plot is None, then set it to True
         if show_plot is None:
-            show_plot = default_show_plot
+            show_plot = SHOW_PLOT
 
         # If show_tearsheet is None, then set it to True
         if show_tearsheet is None:
-            show_tearsheet = default_show_tearsheet
+            show_tearsheet = SHOW_TEARSHEET
 
         # If show_indicators is None, then set it to True
         if show_indicators is None:
-            show_indicators = default_show_indicators
+            show_indicators = SHOW_INDICATORS
+
+        from lumibot.credentials import BACKTESTING_DATA_SOURCE as _DEFAULT_BACKTESTING_DATA_SOURCE
 
         # Determine whether an environment override exists. When BACKTESTING_DATA_SOURCE
         # is set (and not blank/\"none\"), it should take precedence even if a
         # datasource_class argument was provided.
         env_override_raw = os.environ.get("BACKTESTING_DATA_SOURCE")
         env_override_name = None
-        env_override_routing = None
 
         if env_override_raw is not None:
             trimmed = env_override_raw.strip()
             if trimmed and trimmed.lower() != "none":
-                if trimmed.startswith("{") and trimmed.endswith("}"):
-                    try:
-                        parsed = _json_loads(trimmed)
-                    except Exception:
-                        parsed = None
-                    if isinstance(parsed, dict):
-                        env_override_name = "router"
-                        env_override_routing = parsed
-                    else:
-                        env_override_name = trimmed.lower()
-                else:
-                    env_override_name = trimmed.lower()
+                if trimmed.startswith("{"):
+                    raise ValueError(
+                        "JSON routing maps are not supported in this equity-only build. "
+                        "Set BACKTESTING_DATA_SOURCE to one of: 'yahoo', 'alpaca', 'ibkr'."
+                    )
+                env_override_name = trimmed.lower()
         elif datasource_class is None:
-            # No override provided and no class in code – fall back to the default
-            # configured in credentials (ThetaData unless the project overrides it).
-            env_override_name = default_backtesting_data_source.lower()
+            env_override_name = _DEFAULT_BACKTESTING_DATA_SOURCE.lower()
 
         if env_override_name is not None:
             datasource_map = {
-                "polygon": "PolygonDataBacktesting",
-                "thetadata": "ThetaDataBacktesting",
-                "yahoo": "YahooDataBacktesting",
-                "alpaca": "AlpacaBacktesting",
-                "ccxt": "CcxtBacktesting",
-                "databento": "DataBentoDataBacktesting",
-                "ibkr": "InteractiveBrokersRESTBacktesting",
-                "interactivebrokersrest": "InteractiveBrokersRESTBacktesting",
-                "interactive_brokers_rest": "InteractiveBrokersRESTBacktesting",
-                "polymarket": "PolymarketBacktesting",
-                "polymarket_clob": "PolymarketBacktesting",
-                "router": "RoutedBacktestingPandas",
-                "thetadata_ibkr": "RoutedBacktestingPandas",
-                "theta_ibkr": "RoutedBacktestingPandas",
+                "yahoo": YahooDataBacktesting,
+                "alpaca": AlpacaBacktesting,
+                "ibkr": InteractiveBrokersRESTBacktesting,
+                "interactivebrokersrest": InteractiveBrokersRESTBacktesting,
+                "interactive_brokers_rest": InteractiveBrokersRESTBacktesting,
             }
 
             if env_override_name not in datasource_map:
-                label = env_override_raw or default_backtesting_data_source
+                label = env_override_raw or _DEFAULT_BACKTESTING_DATA_SOURCE
                 raise ValueError(
                     f"Unknown BACKTESTING_DATA_SOURCE: '{label}'. "
                     f"Valid options: {list(datasource_map.keys())}"
                 )
 
-            datasource_class = _get_backtesting_class(datasource_map[env_override_name])
+            datasource_class = datasource_map[env_override_name]
 
-            if env_override_routing is not None:
-                if config is None:
-                    config = {}
-                if isinstance(config, dict):
-                    merged = dict(config)
-                    merged["backtesting_data_routing"] = env_override_routing
-                    config = merged
-                else:
-                    try:
-                        setattr(config, "backtesting_data_routing", env_override_routing)
-                    except Exception:
-                        pass
-
-            label = env_override_raw or default_backtesting_data_source
-            if quiet_logs:
-                get_logger(__name__).debug(
-                    colored(
-                        f"Using BACKTESTING_DATA_SOURCE setting for backtest data: {label}",
-                        "green"
-                    )
-                )
-            else:
-                get_logger(__name__).info(
-                    colored(
-                        f"Using BACKTESTING_DATA_SOURCE setting for backtest data: {label}",
-                        "green"
-                    )
-                )
+            label = env_override_raw or _DEFAULT_BACKTESTING_DATA_SOURCE
+            get_logger(__name__).info(colored(
+                f"Using BACKTESTING_DATA_SOURCE setting for backtest data: {label}",
+                "green"
+            ))
         elif datasource_class is None:
             raise ValueError(
                 "No backtesting data source provided. Set BACKTESTING_DATA_SOURCE in the environment "
                 "or pass datasource_class when calling backtest()."
             )
 
-        # Make sure polygon_api_key is set if using PolygonDataBacktesting
-        polygon_api_key = polygon_api_key if polygon_api_key is not None else default_polygon_api_key
-        if datasource_class.__name__ == 'PolygonDataBacktesting' and polygon_api_key is None:
-            raise ValueError(
-                "Please set `POLYGON_API_KEY` to your API key from polygon.io as an environment variable if "
-                "you are using PolygonDataBacktesting. If you don't have one, you can get a free API key "
-                "from https://polygon.io/."
-            )
-
-        # Make sure thetadata_username and thetadata_password are set if using ThetaDataBacktesting
-        if thetadata_username is None or thetadata_password is None:
-            # Try getting the Theta Data credentials from credentials
-            thetadata_username = default_thetadata_config.get('THETADATA_USERNAME')
-            thetadata_password = default_thetadata_config.get('THETADATA_PASSWORD')
-
-            # Check again if theta data username and pass are set (before checking dict)
-            if datasource_class.__name__ == 'ThetaDataBacktesting' and (thetadata_username is None or thetadata_password is None):
-                raise ValueError(
-                    "Please set `thetadata_username` and `thetadata_password` in the backtest() function if "
-                    "you are using ThetaDataBacktesting. If you don't have one, you can do registeration "
-                    "from https://www.thetadata.net/."
-                )
-
-        # check if datasource_class is a class or a dictionary
+        # dict-based multi-provider routing (options/stock split) is not supported
         if isinstance(datasource_class, dict):
-            optionsource_class = datasource_class["OPTION"]
-            datasource_class = datasource_class["STOCK"]
-            # check if optionsource_class and datasource_class are the same type of class
-            if optionsource_class == datasource_class:
-                use_other_option_source = False
-            else:
-                use_other_option_source = True
-
-            # Check ThetaData credentials for optionsource_class after dict extraction
-            if optionsource_class.__name__ == 'ThetaDataBacktesting' and (thetadata_username is None or thetadata_password is None):
-                raise ValueError(
-                    "Please set `thetadata_username` and `thetadata_password` in the backtest() function if "
-                    "you are using ThetaDataBacktesting. If you don't have one, you can do registeration "
-                    "from https://www.thetadata.net/."
-                )
-        else:
-            optionsource_class = None
-            use_other_option_source = False
+            raise NotImplementedError(
+                "Multi-provider datasource routing (dict with 'STOCK'/'OPTION' keys) is not supported "
+                "in this equity-only build. Pass a single datasource class directly."
+            )
+        optionsource_class = None
+        use_other_option_source = False
 
         # Make a string with 6 random numbers/letters (upper and lowercase) to avoid overwriting
-        random_string = _random_suffix()
+        random_string = "".join(random.choices(string.ascii_letters + string.digits, k=6))
 
         datestring = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
         base_filename = f"{name + '_' if name is not None else ''}{datestring}_{random_string}"
@@ -3332,9 +1944,23 @@ class _Strategy:
         if use_other_option_source and not isinstance(optionsource_class, type):
             raise ValueError(f"`optionsource_class` must be a class. You passed in {optionsource_class}")
 
+        self.verify_backtest_inputs(backtesting_start, backtesting_end)
+
+        alpaca_api_key = kwargs.get('alpaca_api_key', None) if kwargs.get('alpaca_api_key', None) is not None else ALPACA_CONFIG["API_KEY"]
+        alpaca_secret_key = kwargs.get('alpaca_secret_key', None) if kwargs.get('alpaca_secret_key', None) is not None else ALPACA_CONFIG["API_SECRET"]
+        if datasource_class == AlpacaBacktesting and (alpaca_api_key is None and alpaca_secret_key is None):
+            raise ValueError(
+                "Please set `ALPACA_API_KEY`, `ALPACA_API_SECRET`, and `ALPACA_IS_PAPER` to your API key from alpaca.markets "
+                "as an environment variable if you are using AlpacaBacktesting. If you don't have one, you can get a free API key "
+                "from https://alpaca.markets/."
+            )            
+        if not self.IS_BACKTESTABLE:
+            get_logger(__name__).warning(f"Strategy {name + ' ' if name is not None else ''}cannot be " f"backtested at the moment")
+            return None
+
         try:
-            backtesting_start = self._normalize_backtest_datetime(backtesting_start)
-            backtesting_end = self._normalize_backtest_datetime(backtesting_end)
+            backtesting_start = to_datetime_aware(backtesting_start)
+            backtesting_end = to_datetime_aware(backtesting_end)
         except AttributeError:
             get_logger(__name__).error(
                 "`backtesting_start` and `backtesting_end` must be datetime objects. \n"
@@ -3345,167 +1971,131 @@ class _Strategy:
 
         backtesting_start, backtesting_end = self.verify_backtest_inputs(backtesting_start, backtesting_end)
 
-        quiet_logs_env = os.environ.get("BACKTESTING_QUIET_LOGS")
-        if quiet_logs_env is not None:
-            quiet_logs = quiet_logs_env.strip().lower() in ("true", "1", "yes", "on")
+        get_logger(__name__).info("Backtest start = %s", backtesting_start)
+        get_logger(__name__).info("Backtest end = %s", backtesting_end)
 
-        show_progress_env = os.environ.get("BACKTESTING_SHOW_PROGRESS_BAR")
-        if show_progress_env is not None:
-            show_progress_bar = default_show_progress_bar
+        if not self.IS_BACKTESTABLE:
+            get_logger(__name__).warning(f"Strategy {name + ' ' if name is not None else ''}cannot be " f"backtested at the moment")
+            return None
 
-        previous_backtesting_env = {
-            "IS_BACKTESTING": os.environ.get("IS_BACKTESTING"),
-            "BACKTESTING_QUIET_LOGS": os.environ.get("BACKTESTING_QUIET_LOGS"),
-            "BACKTESTING_SHOW_PROGRESS_BAR": os.environ.get("BACKTESTING_SHOW_PROGRESS_BAR"),
-        }
-        os.environ["IS_BACKTESTING"] = "true"
-        os.environ["BACKTESTING_QUIET_LOGS"] = "true" if quiet_logs else "false"
-        os.environ["BACKTESTING_SHOW_PROGRESS_BAR"] = "true" if show_progress_bar else "false"
+        if BACKTESTING_QUIET_LOGS is not None:
+            quiet_logs = BACKTESTING_QUIET_LOGS
 
-        try:
-            logger = get_logger(__name__)
-            logger.info("Backtest start = %s", backtesting_start)
-            logger.info("Backtest end = %s", backtesting_end)
+        if BACKTESTING_SHOW_PROGRESS_BAR is not None:
+            show_progress_bar = BACKTESTING_SHOW_PROGRESS_BAR
 
-            if not self.IS_BACKTESTABLE:
-                logger.warning(f"Strategy {name + ' ' if name is not None else ''}cannot be " f"backtested at the moment")
-                return None
+        self._trader = trader_class(logfile=logfile, backtest=True, quiet_logs=quiet_logs)
 
-            self._trader = trader_class(logfile=logfile, backtest=True, quiet_logs=quiet_logs)
-            BacktestingBroker = _get_backtesting_class("BacktestingBroker")
-            InteractiveBrokersRESTBacktesting = _get_backtesting_class("InteractiveBrokersRESTBacktesting")
-            ThetaDataBacktestingPandas = _get_backtesting_class("ThetaDataBacktestingPandas")
-
-            if datasource_class.__name__ == 'PolygonDataBacktesting':
-                data_source = datasource_class(
-                    backtesting_start,
-                    backtesting_end,
-                    config=config,
-                    auto_adjust=auto_adjust,
-                    api_key=polygon_api_key,
-                    pandas_data=pandas_data,
-                    show_progress_bar=show_progress_bar,
-                    max_memory=default_polygon_max_memory_bytes,
-                    log_backtest_progress_to_file=default_log_backtest_progress_to_file,
-                    **kwargs,
-                )
-            elif issubclass(datasource_class, ThetaDataBacktestingPandas) or (
-                optionsource_class and issubclass(optionsource_class, ThetaDataBacktestingPandas)
-            ):
-                data_source = datasource_class(
-                    backtesting_start,
-                    backtesting_end,
-                    config=config,
-                    auto_adjust=auto_adjust,
-                    username=thetadata_username,
-                    password=thetadata_password,
-                    pandas_data=pandas_data,
-                    use_quote_data=use_quote_data,
-                    show_progress_bar=show_progress_bar,
-                    log_backtest_progress_to_file=default_log_backtest_progress_to_file,
-                    **kwargs,
-                )
-            elif datasource_class == InteractiveBrokersRESTBacktesting:
-                data_source = datasource_class(
-                    backtesting_start,
-                    backtesting_end,
-                    config=config,
-                    auto_adjust=auto_adjust,
-                    pandas_data=pandas_data,
-                    show_progress_bar=show_progress_bar,
-                    log_backtest_progress_to_file=default_log_backtest_progress_to_file,
-                    **kwargs,
-                )
+        if datasource_class == AlpacaBacktesting:
+            if all(k in kwargs.keys() for k in ["alpaca_api_key", "alpaca_secret_key"]):
+                api_key = kwargs.pop('alpaca_api_key')
+                secret_key =  kwargs.pop("alpaca_secret_key")
             else:
-                data_source = datasource_class(
-                    datetime_start=backtesting_start,
-                    datetime_end=backtesting_end,
-                    config=config,
-                    auto_adjust=auto_adjust,
-                    pandas_data=pandas_data,
-                    show_progress_bar=show_progress_bar,
-                    log_backtest_progress_to_file=default_log_backtest_progress_to_file,
-                    **kwargs,
-                )
+                api_key = ALPACA_CONFIG['API_KEY']
+                secret_key = ALPACA_CONFIG['API_SECRET']
 
-            if not use_other_option_source:
-                backtesting_broker = BacktestingBroker(data_source)
-            else:
-                options_source = optionsource_class(
-                    backtesting_start,
-                    backtesting_end,
-                    config=config,
-                    auto_adjust=auto_adjust,
-                    username=thetadata_username,
-                    password=thetadata_password,
-                    pandas_data=pandas_data,
-                    show_progress_bar=show_progress_bar,
-                    **kwargs,
-                )
-                backtesting_broker = BacktestingBroker(data_source, options_source)
-
-            strategy = self(
-                backtesting_broker,
-                minutes_before_closing=minutes_before_closing,
-                minutes_before_opening=minutes_before_opening,
-                sleeptime=sleeptime,
-                risk_free_rate=risk_free_rate,
-                stats_file=stats_file,
-                benchmark_asset=benchmark_asset,
-                analyze_backtest=analyze_backtest,
-                backtesting_start=backtesting_start,
-                backtesting_end=backtesting_end,
+            data_source = datasource_class(
+                backtesting_start,
+                backtesting_end,
+                config=config,
+                alpaca_api_key=api_key,
+                alpaca_secret_key=secret_key,
+                auto_adjust=auto_adjust,
+                show_progress_bar=show_progress_bar,
                 pandas_data=pandas_data,
-                quote_asset=quote_asset,
-                starting_positions=starting_positions,
-                name=name,
-                budget=budget,
-                parameters=parameters,
-                buy_trading_fees=buy_trading_fees,
-                sell_trading_fees=sell_trading_fees,
-                buy_trading_slippages=buy_trading_slippages,
-                sell_trading_slippages=sell_trading_slippages,
-                save_logfile=save_logfile,
-                include_cash_positions=include_cash_positions,
+                max_memory=ALPACA_MAX_MEMORY_BYTES,
+                **kwargs
+            )
+        elif datasource_class == InteractiveBrokersRESTBacktesting:
+            data_source = datasource_class(
+                backtesting_start,
+                backtesting_end,
+                config=config,
+                auto_adjust=auto_adjust,
+                pandas_data=pandas_data,
+                show_progress_bar=show_progress_bar,
+                log_backtest_progress_to_file=LOG_BACKTEST_PROGRESS_TO_FILE,
                 **kwargs,
             )
-            self._trader.add_strategy(strategy)
-
-            self.logger.info("Starting backtest...")
-            try:
-                strategy._backtest_time_start_monotonic = time.monotonic()
-            except Exception:
-                pass
-            start = datetime.datetime.now()
-
-            result = self._trader.run_all(
-                show_plot=show_plot,
-                show_tearsheet=show_tearsheet,
-                save_tearsheet=save_tearsheet,
-                show_indicators=show_indicators,
-                plot_file_html=plot_file_html,
-                trades_file=trades_file,
-                settings_file=settings_file,
-                indicators_file=indicators_file,
-                tearsheet_file=tearsheet_file,
-                tearsheet_metrics_file=tearsheet_metrics_file,
-                base_filename=base_filename,
+        else:
+            data_source = datasource_class(
+                datetime_start=backtesting_start,
+                datetime_end=backtesting_end,
+                config=config,
+                auto_adjust=auto_adjust,
+                pandas_data=pandas_data,
+                show_progress_bar=show_progress_bar,
+                log_backtest_progress_to_file=LOG_BACKTEST_PROGRESS_TO_FILE,
+                **kwargs,
             )
 
-            end = datetime.datetime.now()
-            backtesting_length = backtesting_end - backtesting_start
-            backtesting_run_time = end - start
-            self.logger.info(
-                f"Backtest took {backtesting_run_time} for a speed of {backtesting_run_time / backtesting_length:,.3f}"
+        if not use_other_option_source:
+            backtesting_broker = BacktestingBroker(data_source)
+        else:
+            options_source = optionsource_class(
+                backtesting_start,
+                backtesting_end,
+                config=config,
+                auto_adjust=auto_adjust,
+                pandas_data=pandas_data,
+                show_progress_bar=show_progress_bar,
+                **kwargs,
             )
+            backtesting_broker = BacktestingBroker(data_source, options_source)
 
-            return result[name], strategy
-        finally:
-            for key, previous_value in previous_backtesting_env.items():
-                if previous_value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = previous_value
+        strategy = self(
+            backtesting_broker,
+            minutes_before_closing=minutes_before_closing,
+            minutes_before_opening=minutes_before_opening,
+            sleeptime=sleeptime,
+            risk_free_rate=risk_free_rate,
+            stats_file=stats_file,
+            benchmark_asset=benchmark_asset,
+            analyze_backtest=analyze_backtest,
+            backtesting_start=backtesting_start,
+            backtesting_end=backtesting_end,
+            pandas_data=pandas_data,
+            quote_asset=quote_asset,
+            starting_positions=starting_positions,
+            name=name,
+            budget=budget,
+            parameters=parameters,
+            buy_trading_fees=buy_trading_fees,
+            sell_trading_fees=sell_trading_fees,
+            buy_trading_slippages=buy_trading_slippages,
+            sell_trading_slippages=sell_trading_slippages,
+            save_logfile=save_logfile,
+            include_cash_positions=include_cash_positions,
+            **kwargs,
+        )
+        self._trader.add_strategy(strategy)
+
+        self.logger.info("Starting backtest...")
+        try:
+            strategy._backtest_time_start_monotonic = time.monotonic()
+        except Exception:
+            pass
+        start = datetime.datetime.now()
+
+        result = self._trader.run_all(
+            show_plot=show_plot,
+            show_tearsheet=show_tearsheet,
+            save_tearsheet=save_tearsheet,
+            show_indicators=show_indicators,
+            tearsheet_file=tearsheet_file,
+            base_filename=base_filename,
+            resample_rule=resample_rule,  # Pass the resample_rule parameter
+            bar_type=bar_type,  # Pass the bar_type parameter for HFT tearsheet
+        )
+
+        end = datetime.datetime.now()
+        backtesting_length = backtesting_end - backtesting_start
+        backtesting_run_time = end - start
+        self.logger.info(
+            f"Backtest took {backtesting_run_time} for a speed of {backtesting_run_time / backtesting_length:,.3f}"
+        )
+
+        return result[name], strategy
 
     def write_backtest_settings(self, settings_file):
         """
@@ -3527,8 +2117,9 @@ class _Strategy:
         settings_file=None,
         indicators_file=None,
         tearsheet_csv_file=None,
-        tearsheet_metrics_file=None,
-        base_filename=None
+        base_filename=None,
+        resample_rule=None,  # Add resample_rule parameter
+        bar_type="volume",  # Bar type for HFT tearsheet: 'volume', 'dollar', 'imbalance', 'runs', 'time', 'auto'
     ):
         if not self._analyze_backtest:
             return
@@ -3557,9 +2148,12 @@ class _Strategy:
             indicators_file = f"{logdir}/{base_filename}_indicators.html"
         if not tearsheet_csv_file:
             tearsheet_csv_file = f"{logdir}/{base_filename}_tearsheet.csv"
-        if not tearsheet_metrics_file:
-            tearsheet_metrics_file = f"{logdir}/{base_filename}_tearsheet_metrics.json"
 
+        # Create the directory if it doesn't exist
+        if not os.path.exists(logdir):
+            os.makedirs(logdir)
+
+        # Write the backtest settings
         try:
             start_ts = getattr(self, "_backtest_time_start_monotonic", None)
             if start_ts is not None:
@@ -3572,18 +2166,16 @@ class _Strategy:
 
         backtesting_broker = self.broker
         backtesting_broker.export_trade_events_to_csv(trade_events_file)
-        # Legacy fallback: export trade events to the trades CSV path as well when plots
-        # are disabled, in case downstream tooling reads the events-style format.
-        # Note: plot_returns() now always writes the simplified trades CSV/parquet
-        # regardless of show_plot, so this is a secondary export for compatibility.
+        # Preserve legacy behavior: if plots are disabled, the simplified `_trades.csv` won't be
+        # generated by `plot_returns()`, so export the events there too.
         if not show_plot:
             backtesting_broker.export_trade_events_to_csv(trades_file)
         self.plot_returns_vs_benchmark(
-            plot_file_html=plot_file_html,
-            trades_file=trades_file,
-            trades_df=backtesting_broker._trade_event_log_df,
+            plot_file_html,
+            backtesting_broker._trade_event_log_df,
             show_plot=show_plot,
         )
+        
         # Create chart lines dataframe
         chart_lines_df = pd.DataFrame(self._chart_lines_list)
         # Create chart OHLC dataframe
@@ -3591,22 +2183,28 @@ class _Strategy:
         # Create chart markers dataframe
         chart_markers_df = pd.DataFrame(self._chart_markers_list)
 
-        # Check if we have at least one indicator to plot
-        if chart_markers_df is not None and chart_lines_df is not None:
+        # Always call plot_indicators when show_indicators; it handles empty data via trade-derived markers + baseline
+        if show_indicators:
             plot_indicators(
-                indicators_file,
-                chart_markers_df,
-                chart_lines_df,
-                chart_ohlc_df,
-                f"{self._log_strat_name()}Strategy Indicators",
-                show_indicators=show_indicators,
+                plot_file_html=indicators_file,
+                chart_markers_df=chart_markers_df,
+                chart_lines_df=chart_lines_df,
+                chart_ohlc_df=chart_ohlc_df,
+                strategy_name=f"{self._log_strat_name()}Strategy Indicators",
+                show_indicators=True,
+                trades_df=backtesting_broker._trade_event_log_df,
+                strategy_df=self._strategy_returns_df,
+                initial_budget=getattr(self, "_initial_budget", 1.0),
+                benchmark_df=getattr(self, "_benchmark_returns_df", None),
+                benchmark_name=str(self._benchmark_asset) if getattr(self, "_benchmark_asset", None) else None,
             )
 
         tearsheet_result = self.tearsheet(
             save_tearsheet=save_tearsheet,
             tearsheet_file=tearsheet_file,
             show_tearsheet=show_tearsheet,
-            tearsheet_metrics_file=tearsheet_metrics_file,
+            resample_rule=resample_rule,  # Pass the resample_rule parameter
+            bar_type=bar_type,  # Pass the bar_type parameter for HFT tearsheet
         )
 
         # Save the result to a csv file
@@ -3676,119 +2274,6 @@ class _Strategy:
 
         return start_dt, end_dt
 
-    @staticmethod
-    def _remember_sent_cash_event_id(self, event_id: str) -> None:
-        if not event_id:
-            return
-
-        sent_ids = getattr(self, "_cash_event_sent_ids", None)
-        sent_queue = getattr(self, "_cash_event_sent_id_order", None)
-        if sent_ids is None or sent_queue is None:
-            return
-
-        if event_id in sent_ids:
-            return
-
-        dedupe_capacity = int(getattr(self, "_cash_event_dedupe_capacity", 1000) or 1000)
-        while len(sent_queue) >= dedupe_capacity:
-            expired_event_id = sent_queue.popleft()
-            sent_ids.discard(expired_event_id)
-
-        sent_queue.append(event_id)
-        sent_ids.add(event_id)
-
-    @staticmethod
-    def _collect_cash_events_for_cloud(self) -> list[CashEvent]:
-        pending_events = list(getattr(self, "_cash_event_pending_for_cloud", []) or [])
-        emit_limit = int(getattr(self, "_cash_event_cloud_emit_limit", 50) or 50)
-        if pending_events:
-            return pending_events[:emit_limit]
-
-        broker = getattr(self, "broker", None)
-        get_cash_events = getattr(broker, "get_cash_events", None)
-        if not callable(get_cash_events):
-            return []
-
-        last_poll_at = getattr(self, "_cash_event_last_poll_at", None)
-        poll_interval_seconds = int(getattr(self, "_cash_event_poll_interval_seconds", 300) or 300)
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
-        if (
-            isinstance(last_poll_at, datetime.datetime)
-            and (now_utc - last_poll_at).total_seconds() < poll_interval_seconds
-        ):
-            return []
-
-        initial_history_loaded = bool(getattr(self, "_cash_event_initial_history_loaded", False))
-        if initial_history_loaded:
-            lookback_days = int(getattr(self, "_cash_event_poll_lookback_days", 7) or 7)
-            fetch_limit = int(getattr(self, "_cash_event_fetch_limit", 100) or 100)
-            fetch_since = now_utc - datetime.timedelta(days=lookback_days)
-        else:
-            initial_lookback_days = getattr(self, "_cash_event_initial_poll_lookback_days", None)
-            fetch_limit = int(getattr(self, "_cash_event_initial_fetch_limit", 5000) or 5000)
-            fetch_since = (
-                now_utc - datetime.timedelta(days=int(initial_lookback_days))
-                if initial_lookback_days
-                else None
-            )
-        self._cash_event_last_poll_at = now_utc
-
-        try:
-            fetched_events = get_cash_events(since=fetch_since, limit=fetch_limit)
-        except Exception as exc:
-            broker_name = getattr(broker, "name", None) or broker.__class__.__name__
-            self.logger.warning(
-                f"Failed to load broker cash events from {broker_name} "
-                f"({broker.__class__.__name__}): {exc}"
-            )
-            self.logger.debug(_format_exc())
-            return []
-        self._cash_event_initial_history_loaded = True
-
-        sent_ids = getattr(self, "_cash_event_sent_ids", set())
-        pending_ids = {
-            getattr(event, "event_id", None)
-            for event in getattr(self, "_cash_event_pending_for_cloud", []) or []
-        }
-
-        normalized_events = []
-        for event in fetched_events or []:
-            if not isinstance(event, _cash_event_class()):
-                continue
-            if event.event_id in sent_ids or event.event_id in pending_ids:
-                continue
-            normalized_events.append(event)
-
-        normalized_events.sort(key=lambda event: (event.occurred_at, event.event_id))
-        if normalized_events:
-            self.logger.debug(
-                "Loaded %s new cash events from broker '%s'",
-                len(normalized_events),
-                getattr(broker, "name", "unknown"),
-            )
-            self._cash_event_pending_for_cloud.extend(normalized_events)
-
-        pending_events = list(getattr(self, "_cash_event_pending_for_cloud", []) or [])
-        return pending_events[:emit_limit]
-
-    @staticmethod
-    def _mark_cash_events_sent(self, emitted_events: list[CashEvent]) -> None:
-        if not emitted_events:
-            return
-
-        emitted_event_ids = {event.event_id for event in emitted_events if getattr(event, "event_id", None)}
-        if not emitted_event_ids:
-            return
-
-        remaining_pending_events = []
-        for event in getattr(self, "_cash_event_pending_for_cloud", []) or []:
-            if getattr(event, "event_id", None) in emitted_event_ids:
-                _Strategy._remember_sent_cash_event_id(self, event.event_id)
-            else:
-                remaining_pending_events.append(event)
-
-        self._cash_event_pending_for_cloud = remaining_pending_events
-
     def send_update_to_cloud(self):
         """
         Sends an update to the LumiWealth cloud server with the current portfolio value, cash, positions, and any outstanding orders.
@@ -3814,48 +2299,26 @@ class _Strategy:
         # Log that we're starting to send data
         self.logger.debug(f"Starting cloud update for strategy '{self._name}' with API key: {self.lumiwealth_api_key[:10]}...")
 
-        # Refresh the broker account snapshot first. This prevents a failed
-        # broker read from being published as stale/default account values.
+        # Get the current portfolio value
         try:
-            balances_updated = self.update_broker_balances(force_update=True)
-        except Exception as e:
-            self.logger.error(f"Failed to refresh broker balances for cloud update: {e}")
-            self.logger.error(_format_exc())
-            return False
-        if not balances_updated:
-            self.logger.error("Skipping cloud update because broker balances could not be verified.")
-            return False
-
-        def _verified_number(value, field_name):
-            try:
-                numeric_value = float(value)
-            except (TypeError, ValueError) as e:
-                raise ValueError(f"{field_name} is not numeric: {value!r}") from e
-            if not math.isfinite(numeric_value):
-                raise ValueError(f"{field_name} is not finite: {value!r}")
-            return numeric_value
-
-        try:
-            portfolio_value = _verified_number(self._portfolio_value, "portfolio_value")
-            cash = _verified_number(self.get_cash(), "cash")
+            portfolio_value = self.get_portfolio_value()
             self.logger.debug(f"Portfolio value: {portfolio_value}")
+        except Exception as e:
+            self.logger.error(f"Failed to get portfolio value: {e}")
+            self.logger.error(traceback.format_exc())
+            return False
+
+        # Get the current cash
+        try:
+            cash = self.get_cash()
             self.logger.debug(f"Cash: {cash}")
         except Exception as e:
-            self.logger.error(f"Failed to build verified account snapshot: {e}")
-            self.logger.error(_format_exc())
+            self.logger.error(f"Failed to get cash: {e}")
+            self.logger.error(traceback.format_exc())
             return False
 
-        # Get the current positions. Cloud consumers treat an explicit
-        # positions=[] as "verified flat", so do not publish positions unless
-        # the broker/local position read actually succeeded.
-        positions = None
-        positions_snapshot_status = "verified"
-        positions_snapshot_source = "strategy_positions_cache"
+        # Get the current positions
         try:
-            sync_positions = getattr(self.broker, "sync_positions", None)
-            if callable(sync_positions):
-                sync_positions(self)
-                positions_snapshot_source = "broker_positions_refresh"
             positions = self.get_positions()
             self.logger.debug(f"Number of positions: {len(positions)}")
             # DEBUG: Log position details
@@ -3865,10 +2328,9 @@ class _Strategy:
                     attrs = {k: v for k, v in pos.__dict__.items() if not k.startswith('_')}
                     self.logger.debug(f"[DEBUG] Position attrs for {pos.symbol}: {list(attrs.keys())}")
         except Exception as e:
-            positions_snapshot_status = "unverified"
-            positions_snapshot_source = "positions_refresh_failed"
-            self.logger.error(f"Failed to refresh/get positions for cloud update; omitting positions snapshot: {e}")
-            self.logger.error(_format_exc())
+            self.logger.error(f"Failed to get positions: {e}")
+            self.logger.error(traceback.format_exc())
+            return False
 
         # Get the current orders
         try:
@@ -3876,11 +2338,8 @@ class _Strategy:
             self.logger.debug(f"Number of orders: {len(orders)}")
         except Exception as e:
             self.logger.error(f"Failed to get orders: {e}")
-            self.logger.error(_format_exc())
+            self.logger.error(traceback.format_exc())
             return False
-
-        cash_events = _Strategy._collect_cash_events_for_cloud(self)
-        self.logger.debug(f"Number of cash events: {len(cash_events)}")
 
         LUMIWEALTH_URL = "https://listener.lumiwealth.com/portfolio_events"
 
@@ -3889,28 +2348,20 @@ class _Strategy:
             "Content-Type": "application/json",
         }
 
+        # Create the data to send to the cloud
+        positions_data = [position.to_dict() for position in positions]
+
         data = {
             "data_type": "portfolio_event",
             "portfolio_value": portfolio_value,
             "cash": cash,
+            "positions": positions_data,
             "orders": [order.to_dict() for order in orders],
-            "cash_events": [event.to_dict() for event in cash_events],
             "strategy_name": self._name,
             "broker_name": self.broker.name,
-            "account_snapshot_status": "verified",
-            "account_snapshot_source": "broker_balance_refresh",
-            "account_snapshot_checked_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "positions_snapshot_status": positions_snapshot_status,
-            "positions_snapshot_source": positions_snapshot_source,
         }
-        if positions is not None:
-            data["positions"] = [position.to_dict() for position in positions]
 
-        self.logger.debug(
-            f"Preparing to send portfolio update: value={portfolio_value}, cash={cash}, "
-            f"positions={len(positions) if positions is not None else 'omitted'}, "
-            f"orders={len(orders)}, cash_events={len(cash_events)}"
-        )
+        self.logger.debug(f"Preparing to send portfolio update: value={portfolio_value}, cash={cash}, positions={len(positions)}, orders={len(orders)}")
 
         # Helper function to recursively replace NaN in dictionaries
         def replace_nan(value):
@@ -3928,7 +2379,7 @@ class _Strategy:
 
         try:
             # Send the data to the cloud
-            json_data = _json_dumps(data, default=str)
+            json_data = json.dumps(data, default=str)
             data_size_kb = len(json_data.encode('utf-8')) / 1024
             self.logger.debug(f"Sending {data_size_kb:.2f} KB of data to {LUMIWEALTH_URL}")
             self.logger.debug(f"Request headers: {headers}")
@@ -3948,12 +2399,11 @@ class _Strategy:
             return False
         except Exception as e:
             self.logger.error(f"Unexpected error when sending to cloud: {e}")
-            self.logger.error(_format_exc())
+            self.logger.error(traceback.format_exc())
             return False
 
         # Check if the message was sent successfully
         if response.status_code == 200:
-            _Strategy._mark_cash_events_sent(self, cash_events)
             self.logger.debug(f"Portfolio update sent successfully to cloud for strategy '{self._name}'")
             return True
         elif response.status_code == 401:
@@ -3973,23 +2423,6 @@ class _Strategy:
                 f"❌ Failed to send update to cloud. Status: {response.status_code}, Response: {response.text}"
             )
             return False
-
-    def notify(self, title, message=None, *, severity="info", enabled=None, **kwargs):
-        """Send a strategy notification through configured providers.
-
-        Backtests keep notifications disabled by default through
-        ``self.notifications`` unless explicitly enabled.
-        """
-        if message is None:
-            message = str(title)
-            title = "Lumibot notification"
-        return self.notifications.notify(
-            str(title),
-            str(message),
-            severity=severity,
-            enabled=enabled,
-            **kwargs,
-        )
 
     def should_send_account_summary_to_discord(self):
         # Check if db_connection_str has been set, if not, return False
@@ -4333,7 +2766,7 @@ class _Strategy:
         cash = self.get_cash()
 
         # # Get the datetime
-        now = pd.Timestamp(datetime.datetime.now()).tz_localize(_default_pytz())
+        now = pd.Timestamp(datetime.datetime.now()).tz_localize(LUMIBOT_DEFAULT_PYTZ)
 
         # Get the returns
         returns_text, stats_df = self.calculate_returns()
@@ -4345,8 +2778,6 @@ class _Strategy:
         self.send_result_text_to_discord(returns_text, portfolio_value, cash)
 
     def get_stats_from_database(self, stats_table_name, retries=5, delay=5):
-        from sqlalchemy.exc import OperationalError
-
         attempt = 0
         while attempt < retries:
             try:
@@ -4364,13 +2795,13 @@ class _Strategy:
                     self.logger.info(f"Table {stats_table_name} does not exist. Creating it now.")
 
                     # Get the current time in New York
-                    ny_tz = _default_pytz()
+                    ny_tz = LUMIBOT_DEFAULT_PYTZ
                     now = datetime.datetime.now(ny_tz)
 
                     # Create an empty stats dataframe
                     stats_new = pd.DataFrame(
                         {
-                            "id": [str(_uuid4())],
+                            "id": [str(uuid.uuid4())],
                             "datetime": [now],
                             "portfolio_value": [0.0],  # Default or initial value
                             "cash": [0.0],             # Default or initial value
@@ -4400,8 +2831,6 @@ class _Strategy:
                     raise
 
     def to_sql(self, stats_df, stats_table_name, if_exists='replace', index=True, retries=5, delay=5):
-        from sqlalchemy.exc import OperationalError
-
         attempt = 0
         while attempt < retries:
             try:
@@ -4418,120 +2847,8 @@ class _Strategy:
                     self.logger.error("Max retries reached for to_sql. Failing operation.")
                     raise
 
-    def _scheduled_state_enabled(self):
-        if self.is_backtesting:
-            return False
-        scheduled = str(os.environ.get("LUMIBOT_SCHEDULED_EXECUTION", "")).strip().lower()
-        if scheduled not in {"1", "true", "yes", "y", "on"}:
-            return False
-        if str(os.environ.get("LUMIBOT_SCHEDULED_STATE_BACKEND", "")).strip().lower() == "none":
-            return False
-        return bool(os.environ.get("LUMIBOT_SCHEDULED_STATE_FILE"))
-
-    @staticmethod
-    def _encode_variable_for_backup(value):
-        if isinstance(value, datetime.datetime):
-            return {"__lumibot_type__": "datetime", "value": value.isoformat()}
-        if isinstance(value, datetime.date):
-            return {"__lumibot_type__": "date", "value": value.isoformat()}
-        if isinstance(value, dict):
-            return {key: _Strategy._encode_variable_for_backup(nested) for key, nested in value.items()}
-        if isinstance(value, tuple):
-            return {
-                "__lumibot_type__": "tuple",
-                "value": [_Strategy._encode_variable_for_backup(nested) for nested in value],
-            }
-        if isinstance(value, list):
-            return [_Strategy._encode_variable_for_backup(nested) for nested in value]
-        return value
-
-    @staticmethod
-    def _decode_variable_from_backup(value):
-        if isinstance(value, dict):
-            if set(value.keys()) == {"__lumibot_type__", "value"}:
-                if value["__lumibot_type__"] == "datetime":
-                    return datetime.datetime.fromisoformat(value["value"])
-                if value["__lumibot_type__"] == "date":
-                    return datetime.datetime.strptime(value["value"], "%Y-%m-%d").date()
-                if value["__lumibot_type__"] == "tuple":
-                    return tuple(_Strategy._decode_variable_from_backup(nested) for nested in value["value"])
-            return {key: _Strategy._decode_variable_from_backup(nested) for key, nested in value.items()}
-        if isinstance(value, list):
-            return [_Strategy._decode_variable_from_backup(nested) for nested in value]
-        return value
-
-    @classmethod
-    def _serialize_variables_for_backup(cls, variables):
-        return _json_dumps(
-            cls._encode_variable_for_backup(variables),
-            sort_keys=True,
-            cls=_safe_json_encoder_class(),
-        )
-
-    @classmethod
-    def _deserialize_variables_from_backup(cls, json_data):
-        data = _json_loads(json_data)
-        if not isinstance(data, dict):
-            raise ValueError("Variables backup must contain a JSON object")
-        return {key: cls._decode_variable_from_backup(value) for key, value in data.items()}
-
-    def _load_variables_from_scheduled_state_file(self):
-        state_file = os.environ.get("LUMIBOT_SCHEDULED_STATE_FILE")
-        if not state_file:
-            return
-
-        try:
-            with open(state_file, "r", encoding="utf-8") as f:
-                data = self._deserialize_variables_from_backup(f.read())
-        except FileNotFoundError:
-            self.logger.info("Scheduled state file does not exist yet. Not restoring variables.")
-            return
-
-        for key, value in data.items():
-            self.vars.set(key, value)
-
-        self._last_backup_state = self._serialize_variables_for_backup(self.vars.all())
-        self.logger.info("Variables loaded successfully from scheduled state file")
-
-    def _backup_variables_to_scheduled_state_file(self):
-        state_file = os.environ.get("LUMIBOT_SCHEDULED_STATE_FILE")
-        if not state_file:
-            return
-
-        state_json = self._serialize_variables_for_backup(self.vars.all())
-        if state_json == self._last_backup_state:
-            self.logger.info("No variables changed. Not backing up scheduled state.")
-            return
-
-        state_dir = os.path.dirname(state_file)
-        if state_dir:
-            os.makedirs(state_dir, exist_ok=True)
-        tmp_path = f"{state_file}.{os.getpid()}.{_uuid4().hex}.tmp"
-        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(state_json)
-            os.replace(tmp_path, state_file)
-            os.chmod(state_file, 0o600)
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except FileNotFoundError:
-                pass
-            raise
-
-        self._last_backup_state = state_json
-        self.logger.info("Variables backed up successfully to scheduled state file")
-
     def backup_variables_to_db(self):
         if self.is_backtesting:
-            return
-
-        if self._scheduled_state_enabled():
-            try:
-                self._backup_variables_to_scheduled_state_file()
-            except Exception as e:
-                self.logger.error(f"Error backing up variables to scheduled state file: {e}", exc_info=True)
             return
 
         if not hasattr(self, "db_connection_str") or self.db_connection_str is None or self.db_connection_str == "" or not self.should_backup_variables_to_database:
@@ -4542,7 +2859,7 @@ class _Strategy:
             self.db_engine = create_engine(self.db_connection_str)
 
         # Get the current time in New York
-        ny_tz = _default_pytz()
+        ny_tz = LUMIBOT_DEFAULT_PYTZ
         now = datetime.datetime.now(ny_tz)
 
         if not inspect(self.db_engine).has_table(self.backup_table_name):
@@ -4552,7 +2869,7 @@ class _Strategy:
             # Create an empty stats dataframe
             stats_new = pd.DataFrame(
                 {
-                    "id": [str(_uuid4())],
+                    "id": [str(uuid.uuid4())],
                     "last_updated": [now],
                     "variables": ["INITIAL VALUE"],
                     "strategy_id": ["INITIAL VALUE"]
@@ -4565,7 +2882,7 @@ class _Strategy:
             # Create the table by saving this empty DataFrame to the database
             stats_new.to_sql(self.backup_table_name, self.db_engine, if_exists='replace', index=True)
 
-        current_state = _json_dumps(self.vars.all(), sort_keys=True, cls=_safe_json_encoder_class())
+        current_state = json.dumps(self.vars.all(), sort_keys=True, cls=SafeJSONEncoder)
         if current_state == self._last_backup_state:
             self.logger.info("No variables changed. Not backing up.")
             return
@@ -4573,7 +2890,7 @@ class _Strategy:
         try:
             data_to_save = self.vars.all()
             if data_to_save:
-                json_data_to_save = _json_dumps(data_to_save, cls=_safe_json_encoder_class())
+                json_data_to_save = json.dumps(data_to_save, cls=SafeJSONEncoder)
                 with self.db_engine.connect() as connection:
                     with connection.begin():
                         # Check if the row exists
@@ -4601,7 +2918,7 @@ class _Strategy:
                                 VALUES (:id, :last_updated, :variables, :strategy_id)
                             """)
                             connection.execute(insert_query, {
-                                'id': str(_uuid4()),
+                                'id': str(uuid.uuid4()),
                                 'last_updated': now,
                                 'variables': json_data_to_save,
                                 'strategy_id': self._name
@@ -4617,13 +2934,6 @@ class _Strategy:
 
     def load_variables_from_db(self):
         if self.is_backtesting:
-            return
-
-        if self._scheduled_state_enabled():
-            try:
-                self._load_variables_from_scheduled_state_file()
-            except Exception as e:
-                self.logger.error(f"Error loading variables from scheduled state file: {e}", exc_info=True)
             return
     
         if not hasattr(self, "db_connection_str") or self.db_connection_str is None or not self.should_backup_variables_to_database:
@@ -4652,16 +2962,16 @@ class _Strategy:
                 return
     
             json_data = df['variables'].iloc[0]
-
+    
             import re
-
+    
             iso_dt_re = re.compile(r"^\d{4}-\d{2}-\d{2}T")      # datetime prefix
             iso_date_re = re.compile(r"^\d{4}-\d{2}-\d{2}$")    # date only
-
+    
             def _coerce_value(v):
                 if not isinstance(v, str):
                     return v
-
+    
                 # ISO datetime (support trailing Z)
                 if iso_dt_re.match(v):
                     try:
@@ -4669,25 +2979,25 @@ class _Strategy:
                         return datetime.datetime.fromisoformat(v2)
                     except Exception:
                         return v
-
+    
                 # ISO date (YYYY-MM-DD)
                 if iso_date_re.match(v):
                     try:
                         return datetime.datetime.strptime(v, "%Y-%m-%d").date()
                     except Exception:
                         return v
-
+    
                 return v
-
+    
             # Decode any special types we stored using our SafeJSONEncoder,
             # but only parse strings that actually look like ISO dates/datetimes.
-            data = _json_loads(json_data, object_hook=lambda d: {k: _coerce_value(v) for k, v in d.items()})
+            data = json.loads(json_data, object_hook=lambda d: {k: _coerce_value(v) for k, v in d.items()})
     
             # Update self.vars dictionary
             for key, value in data.items():
                 self.vars.set(key, value)
     
-            current_state = _json_dumps(self.vars.all(), sort_keys=True, cls=_safe_json_encoder_class())
+            current_state = json.dumps(self.vars.all(), sort_keys=True, cls=SafeJSONEncoder)
             self._last_backup_state = current_state
     
             self.logger.info("Variables loaded successfully from database")
@@ -4703,7 +3013,7 @@ class _Strategy:
         # Calculate the return over the past 24 hours, 7 days, and 30 days using the stats dataframe
 
         # Get the current time in New York
-        ny_tz = _default_pytz()
+        ny_tz = LUMIBOT_DEFAULT_PYTZ
 
         # Get the datetime
         now = datetime.datetime.now(ny_tz)
@@ -4720,16 +3030,16 @@ class _Strategy:
         # Check if the datetime column is timezone-aware
         if stats_df['datetime'].dt.tz is None:
             # If the datetime is timezone-naive, directly localize it to "America/New_York"
-            stats_df["datetime"] = stats_df["datetime"].dt.tz_localize(_default_pytz(), ambiguous='infer')
+            stats_df["datetime"] = stats_df["datetime"].dt.tz_localize(LUMIBOT_DEFAULT_PYTZ, ambiguous='infer')
         else:
             # If the datetime is already timezone-aware, first remove timezone and then localize
             stats_df["datetime"] = stats_df["datetime"].dt.tz_localize(None)
-            stats_df["datetime"] = stats_df["datetime"].dt.tz_localize(_default_pytz(), ambiguous='infer')
+            stats_df["datetime"] = stats_df["datetime"].dt.tz_localize(LUMIBOT_DEFAULT_PYTZ, ambiguous='infer')
 
         # Get the stats
         stats_new = pd.DataFrame(
             {
-                "id": str(_uuid4()),
+                "id": str(uuid.uuid4()),
                 "datetime": [now],
                 "portfolio_value": [self.get_portfolio_value()],
                 "cash": [self.get_cash()],
@@ -4744,7 +3054,7 @@ class _Strategy:
         stats_df = pd.concat([stats_df, stats_new])
 
         # # Convert the datetime column to eastern time
-        stats_df["datetime"] = stats_df["datetime"].dt.tz_convert(_default_pytz())
+        stats_df["datetime"] = stats_df["datetime"].dt.tz_convert(LUMIBOT_DEFAULT_PYTZ)
 
         # Remove any duplicate rows
         stats_df = stats_df[~stats_df["datetime"].duplicated(keep="last")]
@@ -4757,7 +3067,7 @@ class _Strategy:
 
         # Index should be a uuid, fill the index with uuids
         stats_df.loc[pd.isna(stats_df["id"]), "id"] = [
-            str(_uuid4()) for _ in range(len(stats_df.loc[pd.isna(stats_df["id"])]))
+            str(uuid.uuid4()) for _ in range(len(stats_df.loc[pd.isna(stats_df["id"])]))
         ]
 
         # Set id as the index
@@ -4889,9 +3199,266 @@ class _Strategy:
         #     self._set_cash_position(0)
         #     quantity = 0
 
-        if isinstance(quantity, Decimal):
+        if type(quantity) is Decimal:
             quantity = float(quantity)
         elif quantity is None: # Ensure we return a float if cash position doesn't exist
             quantity = 0.0
 
         return quantity
+
+    def get_historical_trades(
+        self,
+        asset,
+        quote=None,
+        data_datetime_start=None,
+        data_datetime_end=None,
+    ):
+        """Get historical trades data for an asset or list of assets.
+        
+        Parameters
+        ----------
+        asset : Asset, str, or list of Asset/str
+            The asset(s) to get historical trades for. Pass a list for batch fetch
+            (parallel downloading when supported by the data source).
+        quote : Asset or str, optional
+            The quote asset for pricing. If None, uses the default quote asset.
+        data_datetime_start : datetime, optional
+            Start date of the data to retrieve.
+            If None, uses the default start date from the data source.
+        data_datetime_end : datetime, optional
+            End date of the data to retrieve (inclusive).
+            If None, uses the default end date from the data source.
+            
+        Returns
+        -------
+        pandas.DataFrame
+            - Single asset: DataFrame indexed by timestamp.
+            - List of assets: DataFrame with MultiIndex (symbol, timestamp).
+            
+        Notes
+        -----
+        This method fetches raw trades data for high-frequency trading or custom
+        feature engineering. It's the strategy's responsibility to process this data
+        appropriately for analysis or custom bar construction.
+        
+        Currently only supported for stock assets with certain data sources like AlpacaBacktesting.
+        """
+        asset = self._sanitize_user_asset(asset)
+        if quote is not None:
+            quote = self._sanitize_user_asset(quote)
+        
+        if hasattr(self.broker.data_source, "get_historical_trades_between_dates"):
+            # Auto-configure chunk size from strategy's sleeptime for efficient data fetching
+            # This aligns data download chunks with strategy iteration frequency
+            if hasattr(self.broker.data_source, "configure_from_sleeptime") and hasattr(self, "_sleeptime"):
+                self.broker.data_source.configure_from_sleeptime(self._sleeptime)
+            
+            result = self.broker.data_source.get_historical_trades_between_dates(
+                base_asset=asset,
+                quote_asset=quote,
+                data_datetime_start=data_datetime_start,
+                data_datetime_end=data_datetime_end,
+            )
+            return result
+        else:
+            self.logger.error(
+                "The data source does not support fetching historical trades data. "
+                "This feature is currently only available with certain data sources like AlpacaBacktesting."
+            )
+            return None
+
+    def get_realtime_trades(
+        self,
+        asset,
+        minutes: int = 5,
+    ):
+        """Get real-time trades data for an asset (for paper/live trading).
+        
+        This method uses WebSocket streaming to get real-time market trades.
+        Use this for paper trading and live trading scenarios.
+        
+        Parameters
+        ----------
+        asset : Asset or str
+            The asset to get real-time trades for.
+        minutes : int, default 5
+            Get last N minutes of trades from the stream buffer.
+            
+        Returns
+        -------
+        pandas.DataFrame
+            DataFrame containing real-time trades data indexed by timestamp.
+            Columns: price, size, exchange, trade_id, conditions, tape
+            
+        Raises
+        ------
+        RuntimeError
+            If real-time streaming is not enabled on the data source.
+            
+        Notes
+        -----
+        - This is for PAPER/LIVE trading only, not backtesting
+        - For backtesting, use get_historical_trades() instead
+        - Requires API key/secret (OAuth tokens don't support WebSocket)
+        - The first call will automatically start streaming for the symbol
+        
+        Examples
+        --------
+        >>> # In paper/live trading mode
+        >>> trades = self.get_realtime_trades("AAPL", minutes=5)
+        >>> if not trades.empty:
+        ...     latest_price = trades['price'].iloc[-1]
+        ...     volume = trades['size'].sum()
+        """
+        asset = self._sanitize_user_asset(asset)
+        symbol = asset.symbol if hasattr(asset, 'symbol') else str(asset)
+        
+        # Check if data source supports real-time streaming
+        if hasattr(self.broker.data_source, "get_realtime_trades"):
+            return self.broker.data_source.get_realtime_trades(symbol, minutes=minutes)
+        else:
+            self.logger.error(
+                "The data source does not support real-time trades streaming. "
+                "This feature requires AlpacaData with API key/secret authentication."
+            )
+            return None
+
+    def start_realtime_trades_streaming(self, symbols: list = None):
+        """Start real-time trades streaming for paper/live trading.
+        
+        This enables WebSocket-based real-time market data streaming.
+        Call this in your initialize() method for HFT strategies.
+        
+        Parameters
+        ----------
+        symbols : list, optional
+            List of symbols to stream. You can add more symbols later
+            by calling get_realtime_trades() with new symbols.
+            
+        Returns
+        -------
+        object
+            The streamer instance for advanced usage.
+            
+        Notes
+        -----
+        - Only works with AlpacaData using API key/secret
+        - OAuth tokens do not support WebSocket streaming
+        - The streamer runs in a background thread
+        
+        Examples
+        --------
+        >>> def initialize(self):
+        ...     # Start streaming for HFT
+        ...     self.start_realtime_trades_streaming(["AAPL", "TSLA"])
+        ...
+        >>> def on_trading_iteration(self):
+        ...     # Get real-time trades
+        ...     trades = self.get_realtime_trades("AAPL", minutes=1)
+        """
+        if hasattr(self.broker.data_source, "start_realtime_trades_streaming"):
+            return self.broker.data_source.start_realtime_trades_streaming(symbols or [])
+        else:
+            self.logger.error(
+                "The data source does not support real-time trades streaming. "
+                "This feature requires AlpacaData with API key/secret authentication."
+            )
+            return None
+
+    def stop_realtime_trades_streaming(self):
+        """Stop real-time trades streaming.
+        
+        Call this in your on_strategy_end() or when you no longer need
+        real-time data to free up resources.
+        """
+        if hasattr(self.broker.data_source, "stop_realtime_trades_streaming"):
+            self.broker.data_source.stop_realtime_trades_streaming()
+        else:
+            self.logger.warning("Data source does not support real-time streaming")
+
+    def get_trade_history(self):
+        """
+        Get the trade history for this strategy.
+        
+        Returns
+        -------
+        pandas.DataFrame or None
+            DataFrame containing trade history with P&L information, or None if no trades have been made
+        """
+        if not hasattr(self, '_trade_history') or not self._trade_history:
+            return None
+            
+        # Convert the trade history to a DataFrame
+        trade_df = pd.DataFrame(self._trade_history)
+        
+        # Set the datetime as the index
+        if 'datetime' in trade_df.columns:
+            trade_df = trade_df.set_index('datetime')
+            trade_df = trade_df.sort_index()
+            
+        return trade_df
+        
+    def analyze_trades(self):
+        """
+        Analyze the trade history and return trade performance metrics.
+        
+        Returns
+        -------
+        dict
+            Dictionary containing trade performance metrics
+        """
+        trade_df = self.get_trade_history()
+        
+        if trade_df is None or trade_df.empty:
+            return {
+                "trade_count": 0,
+                "win_rate": 0,
+                "profit_factor": 0,
+                "avg_profit_per_trade": 0,
+                "avg_profit_pct_per_trade": 0,
+                "total_profit": 0,
+                "max_profit": 0,
+                "max_loss": 0,
+                "avg_win": 0,
+                "avg_loss": 0
+            }
+            
+        # Calculate trade metrics
+        trade_count = len(trade_df)
+        winning_trades = trade_df[trade_df['pl'] > 0]
+        losing_trades = trade_df[trade_df['pl'] < 0]
+        
+        win_count = len(winning_trades)
+
+        win_rate = win_count / trade_count if trade_count > 0 else 0
+        
+        total_profit = trade_df['pl'].sum()
+        total_profit_winning = winning_trades['pl'].sum() if not winning_trades.empty else 0
+        total_loss_losing = abs(losing_trades['pl'].sum()) if not losing_trades.empty else 0
+        
+        profit_factor = total_profit_winning / total_loss_losing if total_loss_losing > 0 else float('inf')
+        
+        avg_profit_per_trade = total_profit / trade_count if trade_count > 0 else 0
+        avg_profit_pct_per_trade = trade_df['pl_pct'].mean() if 'pl_pct' in trade_df.columns else 0
+        
+        max_profit = trade_df['pl'].max() if not trade_df.empty else 0
+        max_loss = trade_df['pl'].min() if not trade_df.empty else 0
+        
+        avg_win = winning_trades['pl'].mean() if not winning_trades.empty else 0
+        avg_loss = losing_trades['pl'].mean() if not losing_trades.empty else 0
+        
+        # Create metrics dictionary
+        metrics = {
+            "trade_count": trade_count,
+            "win_rate": win_rate,
+            "profit_factor": profit_factor,
+            "avg_profit_per_trade": avg_profit_per_trade,
+            "avg_profit_pct_per_trade": avg_profit_pct_per_trade,
+            "total_profit": total_profit,
+            "max_profit": max_profit,
+            "max_loss": max_loss,
+            "avg_win": avg_win,
+            "avg_loss": avg_loss
+        }
+        
+        return metrics

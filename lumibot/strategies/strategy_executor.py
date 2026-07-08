@@ -20,7 +20,6 @@ from apscheduler.triggers.cron import CronTrigger
 from lumibot.constants import LUMIBOT_DEFAULT_PYTZ
 from lumibot.entities import Asset, Order
 from lumibot.entities import Asset
-from lumibot.strategies.scheduled_timing import ScheduledRunTiming
 from lumibot.tools import append_locals, get_trading_days, staticdecorator
 from lumibot.tools.smart_limit_utils import (
     build_price_ladder,
@@ -30,8 +29,6 @@ from lumibot.tools.smart_limit_utils import (
     infer_tick_size,
     round_to_tick,
 )
-
-SNAPSHOT_CAPTURE_THROTTLE_SECONDS = 1.9
 
 
 class StrategyExecutor(Thread):
@@ -57,8 +54,6 @@ class StrategyExecutor(Thread):
 
         # Store any exception that occurs during execution
         self.exception = None
-        self._run_once_requested = False
-        self._scheduled_timing = ScheduledRunTiming(logger=self.strategy.logger)
 
         # Create a dictionary of job stores. A job store is where the scheduler persists its jobs. In this case,
         # we create an in-memory job store for "default" and "On_Trading_Iteration" which is the job store we will
@@ -110,36 +105,6 @@ class StrategyExecutor(Thread):
             append_locals(self.strategy.on_trading_iteration)
             if self._capture_locals
             else self.strategy.on_trading_iteration
-        )
-
-    def _scheduled_now_utc(self):
-        return self._scheduled_timing.now_utc()
-
-    @staticmethod
-    def _scheduled_iso(value):
-        return ScheduledRunTiming.iso(value)
-
-    def _scheduled_record_timing(self, **fields):
-        self._scheduled_timing.record(**fields)
-
-    def _scheduled_write_timing(self):
-        self._scheduled_timing.write()
-
-    def _scheduled_wait_until_target(self):
-        return self._scheduled_timing.wait_until_target(
-            now_utc=self._scheduled_now_utc,
-            monotonic=time.monotonic,
-            sleep=time.sleep,
-            log_message=self.strategy.log_message,
-        )
-
-    def _scheduled_drain_after_iteration(self):
-        self._scheduled_timing.drain_after_iteration(
-            stop_event=self.stop_event,
-            process_queue=self.process_queue,
-            now_utc=self._scheduled_now_utc,
-            monotonic=time.monotonic,
-            sleep=time.sleep,
         )
 
     def _is_continuous_market(self, market_name):
@@ -233,79 +198,55 @@ class StrategyExecutor(Thread):
 
         if self.broker.IS_BACKTESTING_BROKER:
             self.process_queue()
-            update_payload = self._build_backtest_progress_payload()
-            self.broker._update_datetime(sleeptime, **update_payload)
+
+            # PERF: Serializing positions/orders every bar is expensive and becomes a major cost in
+            # long intraday backtests. The progress CSV is only written every ~2s (wall clock), so
+            # only materialize these payloads when we are likely to log a snapshot.
+            positions_minimal = None
+            orders_minimal = None
+            try:
+                data_source = getattr(self.broker, "data_source", None)
+                should_capture_progress_state = bool(getattr(data_source, "log_backtest_progress_to_file", False))
+                if should_capture_progress_state:
+                    last_logging_time = getattr(data_source, "_last_logging_time", None)
+                    # Mirror DataSourceBacktesting._update_datetime() throttling (~2s); use a small
+                    # cushion to avoid missing the boundary between two datetime.now() calls.
+                    now_wall = datetime.now()
+                    if last_logging_time is not None:
+                        should_capture_progress_state = (now_wall - last_logging_time).total_seconds() >= 1.9
+            except Exception:
+                should_capture_progress_state = True
+
+            if should_capture_progress_state:
+                positions = self.strategy.get_positions()
+                positions_minimal = [p.to_minimal_dict() for p in positions] if positions else None
+
+                active_orders = None
+                if hasattr(self.broker, "get_active_tracked_orders"):
+                    try:
+                        active_orders = self.broker.get_active_tracked_orders(strategy=self.strategy.name)
+                    except Exception:
+                        active_orders = None
+
+                if active_orders is None:
+                    orders = self.broker.get_tracked_orders(strategy=self.strategy.name)
+                    active_orders = [o for o in orders if o.is_active()] if orders else []
+                orders_minimal = [o.to_minimal_dict() for o in active_orders] if active_orders else None
+
+            # Get initial budget for return calculation
+            initial_budget = getattr(self.strategy, '_initial_budget', None)
+
+            self.broker._update_datetime(
+                sleeptime,
+                cash=self.strategy.cash,
+                portfolio_value=self.strategy.get_portfolio_value(),
+                positions=positions_minimal,
+                initial_budget=initial_budget,
+                orders=orders_minimal
+            )
         else:
             # live: actually sleep
             time.sleep(sleeptime)
-
-    def _build_backtest_progress_payload(self):
-        """Build the optional progress/logging payload for backtests.
-
-        Keep this work out of the main loop when both the progress bar and file logging are disabled.
-        When file logging is enabled, only serialize positions/orders near the logging boundary.
-        """
-        data_source = getattr(self.broker, "data_source", None)
-        if data_source is None:
-            return {}
-
-        show_progress = bool(getattr(data_source, "_show_progress_bar", False))
-        log_progress = bool(getattr(data_source, "log_backtest_progress_to_file", False))
-        if not show_progress and not log_progress:
-            return {}
-
-        payload = {
-            "cash": self.strategy.cash,
-            "portfolio_value": self.strategy.get_portfolio_value(),
-        }
-
-        should_capture_snapshot = log_progress
-        if should_capture_snapshot:
-            try:
-                last_logging_time = getattr(data_source, "_last_logging_time", None)
-                if last_logging_time is not None:
-                    # Stay just under the data-source ~2s logging cadence so we do not miss the boundary.
-                    should_capture_snapshot = (
-                        datetime.now() - last_logging_time
-                    ).total_seconds() >= SNAPSHOT_CAPTURE_THROTTLE_SECONDS
-            except Exception:
-                should_capture_snapshot = True
-
-        if not should_capture_snapshot:
-            return payload
-
-        payload["initial_budget"] = getattr(self.strategy, "_initial_budget", None)
-        payload["positions"] = None
-        payload["orders"] = None
-
-        def _safe_minimal_payload(items):
-            minimal_items = []
-            for item in items:
-                try:
-                    minimal_items.append(item.to_minimal_dict())
-                except Exception:
-                    continue
-            return minimal_items or None
-
-        try:
-            positions = self.strategy.get_positions()
-            payload["positions"] = _safe_minimal_payload(positions) if positions else None
-
-            active_orders = None
-            get_active = getattr(self.broker, "get_active_tracked_orders", None)
-            if callable(get_active):
-                try:
-                    active_orders = get_active(strategy=self.strategy.name)
-                except Exception:
-                    active_orders = None
-
-            if active_orders is None:
-                orders = self.broker.get_tracked_orders(strategy=self.strategy.name)
-                active_orders = [o for o in orders if o.is_active()] if orders else []
-            payload["orders"] = _safe_minimal_payload(active_orders) if active_orders else None
-        except Exception:
-            return payload
-        return payload
 
     def sync_broker(self):
         # Log that we are syncing the broker.
@@ -369,9 +310,9 @@ class StrategyExecutor(Thread):
                 else:
                     self.strategy.logger.info(
                         f"Unable to get the cash balance after {cash_broker_max_retries} "
-                        f"tries; leaving last known cash and portfolio values unchanged."
+                        f"tries, setting cash to zero."
                     )
-                    break
+                    broker_balances = 0
             else:
                 cash_balance = broker_balances[0]
                 portfolio_value = broker_balances[2]
@@ -396,29 +337,17 @@ class StrategyExecutor(Thread):
         orders_broker = self.broker._pull_all_orders(self.name, self.strategy)
         # Filter out None orders to prevent crashes
         orders_broker = [order for order in orders_broker if order is not None]
-        if len(orders_broker) > 0 or self.broker.get_all_orders():
+        if len(orders_broker) > 0:
             orders_lumi = self.broker.get_all_orders()
 
             # Check orders at the broker against those in lumibot.
             for order in orders_broker:
                 # Check against existing orders.
                 order_lumi = [ord_lumi for ord_lumi in orders_lumi if ord_lumi.identifier == order.identifier]
-                if len(order_lumi) > 1:
-                    self.strategy.logger.warning(
-                        f"Multiple orders found in lumibot with the same identifier {order.identifier}. "
-                        f"This should not happen and indicates a bug in the order tracking. This is manifesting as "
-                        f"a race condition with ProjectX where a 'new' order event is being added along with a 'fill' "
-                        f"and the 'new' queue never gets cleared causing duplicate orders to be added to lumibot. "
-                        f"Orders: {order_lumi}"
-                    )
-                    order_lumi = self.broker._clean_order_trackers(order)
-                else:
-                    order_lumi = order_lumi[0] if len(order_lumi) > 0 else None
+                order_lumi = order_lumi[0] if len(order_lumi) > 0 else None
 
                 if order_lumi:
                     # Compare the orders.
-                    if not order_lumi.equivalent_status(order.status):
-                        order_lumi.status = order.status
                     if order_lumi.quantity != order.quantity:
                         order_lumi.quantity = order.quantity
                     order_attrs = [
@@ -498,14 +427,9 @@ class StrategyExecutor(Thread):
                             self.broker._process_partially_filled_order(order, order.avg_fill_price, order.quantity)
                         elif order.status == Order.OrderStatus.NEW:
                             self.broker._process_new_order(order)
-                        elif order.status == Order.OrderStatus.ERROR:
-                            self.broker._process_new_order(order)
-                            self.broker._process_error_order(order, order.error_message)
                     else:
-                        # Some brokers return broad recent history from the order-list endpoint.
-                        # Do not promote old filled/canceled/error history into a fresh active order.
-                        if order.is_active():
-                            self.broker._process_new_order(order)
+                        # Add to order in lumibot.
+                        self.broker._process_new_order(order)
 
             broker_identifiers = self._get_all_order_identifiers(orders_broker)
             for order_lumi in orders_lumi:
@@ -537,18 +461,20 @@ class StrategyExecutor(Thread):
                                 )
                                 continue
                         
-                        self.broker._refresh_missing_active_order_from_broker(
-                            order_lumi,
-                            self.strategy.name,
-                            strategy_object=self.strategy,
-                            broker_order_count=len(orders_broker),
-                            logger_obj=self.strategy.logger,
-                            terminalize_missing=(
-                                order_lumi.order_type and order_lumi.order_type == Order.OrderType.MARKET
-                            ),
+                        # Check if it's a market order that might have filled instantly
+                        if order_lumi.order_type and order_lumi.order_type.lower() == "market":
+                            self.strategy.logger.info(
+                                f"Market order {order_lumi} (id={order_lumi.identifier}) not found in broker, "
+                                f"likely filled instantly - skipping cancel"
+                            )
+                            continue
+                        
+                        self.strategy.logger.info(
+                            f"Cannot find order {order_lumi} (id={order_lumi.identifier}) in broker "
+                            f"(bkr cnt={len(orders_broker)}), canceling."
                         )
+                        self.broker._process_trade_event(order_lumi, "canceled")
 
-        self.broker._invalidate_order_caches()
         self.broker._hold_trade_events = False
         self.broker.process_held_trades()
 
@@ -797,8 +723,6 @@ class StrategyExecutor(Thread):
 
                 target_type = "even" if abs(target_signed) < 1e-9 else ("debit" if target_signed > 0 else "credit")
                 target_price = abs(target_signed) if target_type != "even" else 0.0
-                if target_type == "even" and getattr(self.broker, "name", "").lower() == "tradier":
-                    target_price = None
 
                 current_type = state.get("multileg_order_type")
                 if current_type is None:
@@ -933,9 +857,6 @@ class StrategyExecutor(Thread):
             if getattr(self, "_capture_locals", False):
                 snapshot_before = self.strategy._copy_dict()
             result = func_input(self, *args, **kwargs)
-            if func_input.__name__ == "_on_trading_iteration":
-                self.strategy._apply_daily_cash_financing_if_needed()
-                self.strategy._update_portfolio_value()
             self._trace_stats(self._strategy_context, snapshot_before)
             return result
 
@@ -950,26 +871,6 @@ class StrategyExecutor(Thread):
         result["datetime"] = self.strategy.get_datetime()
         result["portfolio_value"] = self.strategy.portfolio_value  # Fast lookup for portfolio value
         result["cash"] = self.strategy.cash
-        result["cash_deposits_total"] = float(getattr(self.strategy, "_cash_deposits_total", 0.0))
-        result["cash_withdrawals_total"] = float(getattr(self.strategy, "_cash_withdrawals_total", 0.0))
-        result["cash_adjustments_net_total"] = float(getattr(self.strategy, "_cash_adjustments_net_total", 0.0))
-        result["cash_financing_enabled"] = bool(getattr(self.strategy, "_cash_financing_enabled", False))
-        result["cash_financing_account_mode"] = str(getattr(self.strategy, "_cash_financing_account_mode", "margin"))
-        result["cash_financing_credit_total"] = float(getattr(self.strategy, "_cash_financing_credit_total", 0.0))
-        result["cash_financing_debit_total"] = float(getattr(self.strategy, "_cash_financing_debit_total", 0.0))
-        result["cash_financing_net_total"] = float(getattr(self.strategy, "_cash_financing_net_total", 0.0))
-        result["cash_financing_days_accrued"] = int(getattr(self.strategy, "_cash_financing_days_accrued", 0))
-        result["cash_financing_events"] = int(getattr(self.strategy, "_cash_financing_events", 0))
-        result["cash_financing_last_credit_rate_used"] = getattr(
-            self.strategy,
-            "_cash_financing_last_credit_rate_used",
-            None,
-        )
-        result["cash_financing_last_debit_rate_used"] = getattr(
-            self.strategy,
-            "_cash_financing_last_debit_rate_used",
-            None,
-        )
 
         # Add positions column
         positions_list = []
@@ -1008,7 +909,7 @@ class StrategyExecutor(Thread):
     @lifecycle_method
     def _initialize(self):
         self.strategy.log_message(f"Strategy {self.strategy._name} is initializing", color="green")
-        self.strategy.logger.debug("Executing the initialize lifecycle method")
+        self.strategy.log_message("Executing the initialize lifecycle method")
 
         # Do this for backwards compatibility.
         initialize_argspecs = inspect.getfullargspec(self.strategy.initialize)
@@ -1019,36 +920,16 @@ class StrategyExecutor(Thread):
                 safe_params_to_pass[arg] = self.strategy.parameters[arg]
         self.strategy.initialize(**safe_params_to_pass)
 
-        # Backtesting perf guard:
-        # For daily-cadence strategies (e.g. sleeptime="1D"), prime the data source cadence so
-        # the very first price/quote lookup does not force an expensive minute-history prefetch.
-        #
-        # This is especially important for routed providers (IBKR stock/index paths) where minute
-        # prefetch across long windows can dominate runtime before the strategy requests any daily bars.
-        if self.strategy.is_backtesting:
-            try:
-                sleep_value = str(getattr(self.strategy, "sleeptime", "") or "").strip().lower()
-                if sleep_value.endswith("d"):
-                    data_source = getattr(self.broker, "data_source", None)
-                    if data_source is not None:
-                        setattr(data_source, "_timestep", "day")
-                        if hasattr(data_source, "_effective_day_mode"):
-                            setattr(data_source, "_effective_day_mode", True)
-                        if hasattr(data_source, "_observed_intraday_cadence"):
-                            setattr(data_source, "_observed_intraday_cadence", False)
-            except Exception:
-                pass
-
     @lifecycle_method
     @trace_stats
     def _before_market_opens(self):
-        self.strategy.logger.debug("Executing the before_market_opens lifecycle method")
+        self.strategy.log_message("Executing the before_market_opens lifecycle method")
         self.strategy.before_market_opens()
 
     @lifecycle_method
     @trace_stats
     def _before_starting_trading(self):
-        self.strategy.logger.debug("Executing the before_starting_trading lifecycle method")
+        self.strategy.log_message("Executing the before_starting_trading lifecycle method")
         self.strategy.before_starting_trading()
 
     @lifecycle_method
@@ -1079,7 +960,9 @@ class StrategyExecutor(Thread):
         self.sync_broker()
 
         # Check if we are in market hours.
-        if not self.broker.is_market_open():
+        # Pure Pandas daily backtests iterate over day-aligned bars (often midnight timestamps).
+        # Treat each bar as an executable session regardless of clock time.
+        if not self._is_pandas_daily_data_source() and not self.broker.is_market_open():
             if not self._market_closed_logged:
                 self.strategy.log_message("The market is not currently open, skipping this trading iteration", color="blue")
                 self._market_closed_logged = True
@@ -1108,8 +991,7 @@ class StrategyExecutor(Thread):
         # Time-consuming
         try:
             # Variable Restore
-            if not self._run_once_requested:
-                self.strategy.load_variables_from_db()
+            self.strategy.load_variables_from_db()
             on_trading_iteration()
 
             self.strategy._first_iteration = False
@@ -1164,28 +1046,24 @@ class StrategyExecutor(Thread):
             # Log the traceback
             self.strategy.log_message(traceback.format_exc(), color="red")
 
-            if self._run_once_requested:
-                self.exception = e
-                raise
-
             self._on_bot_crash(e)
 
     @lifecycle_method
     @trace_stats
     def _before_market_closes(self):
-        self.strategy.logger.debug("Executing the before_market_closes lifecycle method")
+        self.strategy.log_message("Executing the before_market_closes lifecycle method")
         self.strategy.before_market_closes()
 
     @lifecycle_method
     @trace_stats
     def _after_market_closes(self):
-        self.strategy.logger.debug("Executing the after_market_closes lifecycle method")
+        self.strategy.log_message("Executing the after_market_closes lifecycle method")
         self.strategy.after_market_closes()
 
     @lifecycle_method
     @trace_stats
     def _on_strategy_end(self):
-        self.strategy.logger.debug("Executing the on_strategy_end lifecycle method")
+        self.strategy.log_message("Executing the on_strategy_end lifecycle method")
         self.strategy.on_strategy_end()
         self.strategy._dump_stats()
 
@@ -1330,17 +1208,69 @@ class StrategyExecutor(Thread):
             # Send the message to Discord
             self.strategy.send_discord_message(message, silent=False)
 
+        # Track trade P&L for HFT strategies
+        # Calculate and store trade P&L
+        if order.is_sell_order():
+            # Calculate profit/loss for this specific trade
+            if hasattr(position, 'entry_price') and position.entry_price is not None:
+                trade_pl = (price - position.entry_price) * quantity * multiplier
+                trade_pl_pct = (price / position.entry_price - 1) * 100 if position.entry_price > 0 else 0
+                
+                # Store the trade info in the strategy
+                if not hasattr(self.strategy, '_trade_history'):
+                    self.strategy._trade_history = []
+                    
+                trade_info = {
+                    'datetime': self.strategy.get_datetime(),
+                    'asset': position.asset,
+                    'entry_price': position.entry_price,
+                    'exit_price': price,
+                    'quantity': quantity,
+                    'pl': trade_pl,
+                    'pl_pct': trade_pl_pct
+                }
+                self.strategy._trade_history.append(trade_info)
+                
+                # Log the trade P&L
+                self.strategy.log_message(
+                    f"Trade P&L: {trade_pl:.2f} ({trade_pl_pct:.2f}%) - {position.asset} - {quantity} shares",
+                    color="green" if trade_pl > 0 else "red"
+                )
+
         # Let our listener know that an order has been filled (set in the callback)
         if hasattr(self.strategy, "_filled_order_callback") and callable(self.strategy._filled_order_callback):
             self.strategy._filled_order_callback(self, position, order, price, quantity, multiplier)
 
     @event_method
-    def _on_error_order(self, order, error=None):                 # <--- new handler
+    def _on_error_order(self, order, error=None):
         """
         Use this lifecycle event to execute code
         when an order error is reported
+        
+        Parameters
+        ----------
+        order : Order
+            The order that encountered an error
+        error : str or Exception, optional
+            The error message or exception
         """
-        self.strategy.log_message("Executing the on_error_order event method", color="red")
+        # Check if this is an HFT position safety error
+        is_hft_position_error = (
+            error is not None and 
+            isinstance(error, str) and 
+            ("Insufficient position" in error or "negative position" in error)
+        )
+        
+        # For HFT position errors, use a warning level instead of error
+        if is_hft_position_error:
+            self.strategy.log_message(
+                f"HFT position safety triggered: {error}. Order {order.identifier} rejected.", 
+                color="yellow"
+            )
+        else:
+            self.strategy.log_message("Executing the on_error_order event method", color="red")
+            
+        # Call user-defined handler if it exists
         if hasattr(self.strategy, "on_error_order"):
             try:
                 self.strategy.on_error_order(order, error)
@@ -1349,9 +1279,12 @@ class StrategyExecutor(Thread):
                     self.strategy.on_error_order(order)
                 except Exception:
                     self.strategy.logger.error("Error in on_error_order handler", exc_info=True)
-        else:
-            # no user handler defined—just log the error
+        elif not is_hft_position_error:
+            # Only log as error for non-HFT position errors if no handler exists
             self.strategy.logger.error(f"Unhandled order error: {order}, error: {error}")
+            
+        # Ensure backtesting continues by returning quickly
+        return
 
     @staticmethod
     def _sleeptime_to_seconds(sleeptime):
@@ -1561,7 +1494,6 @@ class StrategyExecutor(Thread):
         # Check if this is a continuous market using actual calendar data
         market_name = getattr(self.broker, "market", None)
         is_continuous_market = market_name and self._is_continuous_market(market_name)
-        time_to_close = None
 
         # Set the sleeptime to close.
         if is_continuous_market and self.strategy.is_backtesting:
@@ -1570,10 +1502,12 @@ class StrategyExecutor(Thread):
         else:
             # For traditional markets or live trading, check actual market close times
             # TODO: next line speed implication: v high (2233 microseconds) get_time_to_close()
-            time_to_close = self.broker.get_time_to_close()
+            result = self.broker.get_time_to_close()
 
-            if time_to_close is None:
+            if result is None:
                 time_to_close = 0
+            else:
+                time_to_close = result
 
             time_to_before_closing = time_to_close - self.strategy.minutes_before_closing * 60
 
@@ -1624,6 +1558,9 @@ class StrategyExecutor(Thread):
 
         # Run process orders at the market close time first (if not continuous market)
         if not is_continuous_market:
+            # Get the time to close.
+            time_to_close = self.broker.get_time_to_close()
+
             # If strategy sleep time is greater than the time to close, process expired option contracts.
             if strategy_sleeptime > time_to_close:
                 # Sleep until the market closes.
@@ -1639,7 +1576,7 @@ class StrategyExecutor(Thread):
                 # of the backtesting loop. The main loop will then call _advance_to_next_trading_day()
                 # to move to the next trading day.
                 #
-                # IMPORTANT: Skip this ONLY for pure PandasDataBacktesting sources (not Polygon
+                # IMPORTANT: Skip this ONLY for pure PandasDataBacktesting sources (not Alpaca
                 # which inherits from PandasData) to maintain backward compatibility with existing
                 # tests that expect pandas daily data to process multiple days in a single call.
                 is_pure_pandas_data = (hasattr(self.broker, 'data_source') and
@@ -1659,16 +1596,16 @@ class StrategyExecutor(Thread):
     # ======Helper methods for _run_trading_session ====================
 
     def _is_pandas_daily_data_source(self):
-        """Return True only for *pure* Pandas daily backtests (not Polygon/ThetaData).
+        """Return True only for *pure* Pandas daily backtests.
 
         This route exists to support user-supplied `PandasDataBacktesting` runs where the
         strategy should iterate over the provided DataFrame index (`_date_index`).
 
         IMPORTANT: Do not apply this optimization to providers that *inherit* from
-        PandasData (e.g., PolygonDataBacktesting, ThetaDataBacktestingPandas). Those
-        providers manage their own market calendars and can switch `_timestep` to `"day"`
-        for daily-cadence strategies; treating them as "pure pandas daily" can cause the
-        backtest to terminate after a single bar.
+        PandasData (e.g., AlpacaBacktesting, IBRESTBacktesting). Those providers manage
+        their own market calendars and can switch `_timestep` to `"day"` for daily-cadence
+        strategies; treating them as "pure pandas daily" can cause the backtest to terminate
+        after a single bar.
         """
         data_source = getattr(self.broker, "data_source", None)
         if not self.strategy.is_backtesting or data_source is None:
@@ -1704,15 +1641,42 @@ class StrategyExecutor(Thread):
             return
 
         dt = self.broker.data_source._date_index[self.broker.data_source._iter_count]
-        update_payload = self._build_backtest_progress_payload()
-        self.broker._update_datetime(dt, **update_payload)
+
+        # Get positions and serialize to minimal format for progress logging
+        positions = self.strategy.get_positions()
+        positions_minimal = [p.to_minimal_dict() for p in positions] if positions else None
+
+        # Get ACTIVE (open) orders only and serialize to minimal format for progress logging
+        # Filter to is_active() to avoid serializing thousands of filled orders
+        # which can exceed CSV field size limits in high-frequency strategies
+        orders = self.broker.get_tracked_orders(strategy=self.strategy.name)
+        active_orders = [o for o in orders if o.is_active()] if orders else []
+        orders_minimal = [o.to_minimal_dict() for o in active_orders] if active_orders else None
+
+        # Get initial budget for return calculation
+        initial_budget = getattr(self.strategy, '_initial_budget', None)
+
+        self.broker._update_datetime(
+            dt,
+            cash=self.strategy.cash,
+            portfolio_value=self.strategy.get_portfolio_value(),
+            positions=positions_minimal,
+            initial_budget=initial_budget,
+            orders=orders_minimal
+        )
         self.strategy._update_cash_with_dividends()
 
         self._on_trading_iteration()
 
         if self.broker.IS_BACKTESTING_BROKER:
             self.broker.process_pending_orders(strategy=self.strategy)
-
+            # Process the event queue to ensure cash is updated from filled orders
+            # before recalculating portfolio value
+            self.process_queue()
+            # Recalculate portfolio value AFTER orders are filled and cash is updated
+            # This ensures the progress bar shows accurate portfolio value
+            self.strategy._update_portfolio_value()
+    
     def _should_continue_trading_loop(self, jobs, is_continuous_market, should_we_stop):
         """Determine if the trading loop should continue based on various conditions"""
         if not jobs:
@@ -1810,8 +1774,6 @@ class StrategyExecutor(Thread):
 
     def _setup_market_session(self, has_data_source):
         """Set up the market session for non-24/7 markets"""
-        self._send_startup_cloud_update()
-
         # Set date to the start date, but account for minutes_before_opening
         self.strategy.await_market_to_open()  # set new time and bar length. Check if hit bar max or date max.
 
@@ -1835,21 +1797,6 @@ class StrategyExecutor(Thread):
         self.lifecycle_last_date['before_starting_trading'] = self.strategy.get_datetime().date()
 
         return True
-
-    def _send_startup_cloud_update(self):
-        """Publish one live account snapshot before a live runner waits for market open."""
-        if self.strategy.is_backtesting:
-            return
-
-        try:
-            sent = self.strategy.send_update_to_cloud()
-        except Exception as e:
-            self.strategy.logger.warning(f"Could not send startup cloud update: {e}")
-            self.strategy.logger.debug(traceback.format_exc())
-            return
-
-        if sent:
-            self._last_updated_cloud = datetime.now()
 
     def _run_backtesting_loop(self, is_continuous_market, time_to_close):
         """Execute the main backtesting iteration loop"""
@@ -1880,6 +1827,12 @@ class StrategyExecutor(Thread):
 
             if self.broker.IS_BACKTESTING_BROKER:
                 self.broker.process_pending_orders(strategy=self.strategy)
+                # Process the event queue to ensure cash is updated from filled orders
+                # before recalculating portfolio value
+                self.process_queue()
+                # Recalculate portfolio value AFTER orders are filled and cash is updated
+                # This ensures the progress bar shows accurate portfolio value
+                self.strategy._update_portfolio_value()
 
             # Sleep until the next trading iteration
             sleep_result = self._strategy_sleep()
@@ -2048,79 +2001,6 @@ class StrategyExecutor(Thread):
 
         return next_run_time
 
-    def _run_live_once(self):
-        """Run exactly one live trading iteration without starting APScheduler."""
-        if self.strategy.is_backtesting:
-            raise RuntimeError("run_once is only supported for live trading strategies")
-
-        # Scheduled one-shot runs must restore state before any lifecycle hook can read or mutate self.vars.
-        self.strategy.load_variables_from_db()
-        self.strategy.log_message("Running one live trading iteration", color="blue")
-        market_open = self.broker.is_market_open()
-        if market_open:
-            # Each scheduled run is a fresh live session, so the per-session hook runs every tick.
-            self._before_starting_trading()
-            self.lifecycle_last_date["before_starting_trading"] = self.strategy.get_datetime().date()
-
-        self.cron_count_target = 1
-        self.cron_count = 0
-        if not self._scheduled_wait_until_target():
-            return False
-        try:
-            self._scheduled_record_timing(
-                iteration_started_at=self._scheduled_iso(self._scheduled_now_utc()),
-                status="iteration_started",
-            )
-            self._on_trading_iteration()
-            self._scheduled_record_timing(
-                iteration_finished_at=self._scheduled_iso(self._scheduled_now_utc()),
-                status="iteration_finished",
-            )
-            self.process_queue()
-            self._scheduled_drain_after_iteration()
-            self._scheduled_record_timing(
-                status="completed",
-                exact_timing_verified=True,
-            )
-            return True
-        finally:
-            self._in_trading_iteration = False
-
-    def run_once(self):
-        self._run_once_requested = True
-        try:
-            # Set the strategy name at the broker
-            self.broker.set_strategy_name(self.strategy._name)
-
-            self._initialize()
-            self.broker.initialize_market_calendars(get_trading_days(self.broker.market))
-            self._scheduled_record_timing(
-                strategy_initialized_at=self._scheduled_iso(self._scheduled_now_utc()),
-                status="strategy_initialized",
-            )
-            iteration_ran = self._run_live_once()
-            if iteration_ran:
-                self._on_strategy_end()
-
-            self.result = self.strategy._analysis
-            self.gracefully_exit()
-            return bool(iteration_ran)
-        except Exception as e:
-            try:
-                self.strategy.logger.error(e)
-                self.strategy.logger.error(traceback.format_exc())
-                try:
-                    self._on_bot_crash(e)
-                except Exception as e1:
-                    self.strategy.logger.error(e1)
-                    self.strategy.logger.error(traceback.format_exc())
-            finally:
-                self.exception = e
-                self.result = self.strategy._analysis if hasattr(self.strategy, '_analysis') else {}
-            return False
-        finally:
-            self._run_once_requested = False
-
     def run(self):
         try:
             # Only overload the broker sleep method when backtesting
@@ -2141,11 +2021,11 @@ class StrategyExecutor(Thread):
             # StrategyExecutor can run on timestamps that exist in the supplied DataFrames
             # (including daily bars where market_open == market_close).
             #
-            # IMPORTANT: do NOT apply this to PolygonDataBacktesting (or other providers that
+            # IMPORTANT: do NOT apply this to AlpacaBacktesting (or other providers that
             # inherit from PandasData) because their _date_index is typically empty at startup.
             # In that case, get_trading_days_pandas() returns a "full-day open" dummy calendar
             # (00:00–23:59:59), which can skip lifecycle hooks like before_market_opens() and
-            # breaks legacy backtests (e.g. tests/backtest/test_polygon.py).
+            # breaks legacy daily backtests that rely on exchange calendars.
             data_source = getattr(self.broker, "data_source", None)
             is_pure_pandas_data_source = (
                 self.strategy.is_backtesting
