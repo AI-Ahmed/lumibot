@@ -9,7 +9,7 @@
 import os
 import sys
 
-from .brokers import Alpaca, Ccxt, InteractiveBrokers, InteractiveBrokersREST, Tradier, Tradovate, Schwab, Bitunix, ProjectX
+from .brokers import Alpaca, InteractiveBrokers, InteractiveBrokersREST
 from dotenv import load_dotenv
 import termcolor
 from dateutil import parser
@@ -100,7 +100,7 @@ if backtesting_end:
     BACKTESTING_END = parser.parse(backtesting_end)
 
 # Get the backtesting data source
-BACKTESTING_DATA_SOURCE = os.environ.get("BACKTESTING_DATA_SOURCE", "ThetaData")
+BACKTESTING_DATA_SOURCE = os.environ.get("BACKTESTING_DATA_SOURCE", "yahoo")
 
 # Check if we should hide trades
 hide_trades = os.environ.get("HIDE_TRADES")
@@ -242,45 +242,6 @@ ALPACA_TEST_CONFIG = {  # Paper trading!
     "PAPER": True
 }
 
-# Tradier Configuration
-TRADIER_CONFIG = {
-    # Add TRADIER_ACCESS_TOKEN, TRADIER_ACCOUNT_NUMBER, and TRADIER_IS_PAPER to your .env file or set them as secrets
-    "ACCESS_TOKEN": os.environ.get("TRADIER_ACCESS_TOKEN"),
-    "ACCOUNT_NUMBER": os.environ.get("TRADIER_ACCOUNT_NUMBER"),
-    "PAPER": os.environ.get("TRADIER_IS_PAPER").lower() == "true"
-    if os.environ.get("TRADIER_IS_PAPER")
-    else True,
-}
-
-# Tradier test configuration for unit tests
-TRADIER_TEST_CONFIG = {
-    # Add TRADIER_TEST_ACCESS_TOKEN and TRADIER_TEST_ACCOUNT_NUMBER to your .env file or set them as secrets
-    "ACCESS_TOKEN": os.environ.get("TRADIER_TEST_ACCESS_TOKEN"),
-    "ACCOUNT_NUMBER": os.environ.get("TRADIER_TEST_ACCOUNT_NUMBER"),
-    "PAPER": True
-}
-
-# Kraken Configuration
-KRAKEN_CONFIG = {
-    # Add KRAKEN_API_KEY and KRAKEN_API_SECRET to your .env file or set them as secrets
-    "exchange_id": "kraken",
-    "apiKey": os.environ.get("KRAKEN_API_KEY"),
-    "secret": os.environ.get("KRAKEN_API_SECRET"),
-    "margin": True,
-    "sandbox": False,
-}
-
-# Coinbase Configuration
-COINBASE_CONFIG = {
-    # Add COINBASE_API_KEY and COINBASE_API_SECRET to your .env file or set them as secrets
-    "exchange_id": "coinbase",
-    "apiKey": os.environ.get("COINBASE_API_KEY_NAME"),   # API key name/identifier
-    "secret": os.environ.get("COINBASE_PRIVATE_KEY"),      # Your private key goes here
-    "password": os.environ.get("COINBASE_API_PASSPHRASE"),   # Passphrase if required
-    "margin": False,
-    "sandbox": os.environ.get("COINBASE_SANDBOX", "false").lower() == "true",
-}
-
 # Interactive Brokers Configuration
 INTERACTIVE_BROKERS_CONFIG = {
     "SOCKET_PORT": int(os.environ.get("INTERACTIVE_BROKERS_PORT")) if os.environ.get("INTERACTIVE_BROKERS_PORT") else None,
@@ -298,130 +259,6 @@ INTERACTIVE_BROKERS_REST_CONFIG = {
     "RUNNING_ON_SERVER": os.environ.get("RUNNING_ON_SERVER")
 }
 
-# Tradovate Configuration
-TRADOVATE_CONFIG = {
-    "USERNAME": os.environ.get("TRADOVATE_USERNAME"),
-    "DEDICATED_PASSWORD": os.environ.get("TRADOVATE_DEDICATED_PASSWORD"),
-    "APP_ID": os.environ.get("TRADOVATE_APP_ID", "Lumibot"),
-    "APP_VERSION": os.environ.get("TRADOVATE_APP_VERSION", "1.0"),
-    "CID": os.environ.get("TRADOVATE_CID"),
-    "SECRET": os.environ.get("TRADOVATE_SECRET"),
-    "IS_PAPER": os.environ.get("TRADOVATE_IS_PAPER", "true").lower() == "true",
-    "MD_URL": os.environ.get("TRADOVATE_MD_URL", "https://md.tradovateapi.com/v1"),
-}
-
-# Schwab Configuration
-SCHWAB_CONFIG = {
-    # Only these three matter
-    "SCHWAB_TOKEN":          os.getenv("SCHWAB_TOKEN"),          # optional
-    "SCHWAB_ACCOUNT_NUMBER": os.getenv("SCHWAB_ACCOUNT_NUMBER"), # required
-    "SCHWAB_APP_KEY":        os.getenv("SCHWAB_APP_KEY"),        # required, loaded from env
-    "SCHWAB_APP_SECRET":     os.getenv("SCHWAB_APP_SECRET"),     # required, loaded from env
-    "SCHWAB_BACKEND_CALLBACK_URL": os.getenv("SCHWAB_BACKEND_CALLBACK_URL"), # required for auth flow
-}
-
-# Bitunix Configuration
-BITUNIX_CONFIG = {
-    "API_KEY": os.environ.get("BITUNIX_API_KEY"),
-    "API_SECRET": os.environ.get("BITUNIX_API_SECRET"),
-    "TRADING_MODE": os.environ.get("BITUNIX_TRADING_MODE", "FUTURES"), # Add TRADING_MODE, default to FUTURES
-}
-
-# ProjectX URL mappings - REST API base URLs (v2 gateway URLs preferred)
-PROJECTX_BASE_URLS = {
-    "topstepx": "https://api.topstepx.com/",
-    "topone": "https://api.toponefutures.projectx.com/",  # Top One Futures
-    "tickticktrader": "https://api.tickticktrader.projectx.com/",
-    "alphaticks": "https://api.alphaticks.projectx.com/",
-    "aquafutures": "https://api.aquafutures.projectx.com/",
-    "blueguardianfutures": "https://api.blueguardianfutures.projectx.com/",
-    "blusky": "https://api.blusky.projectx.com/",
-    "bulenox": "https://api.bulenox.projectx.com/",
-    "e8x": "https://api.e8.projectx.com/",  # E8X uses "e8" not "e8x"
-    "fundingfutures": "https://api.fundingfutures.projectx.com/",
-    "thefuturesdesk": "https://api.thefuturesdesk.projectx.com/",
-    "futureselite": "https://api.futureselite.projectx.com/",
-    "fxifyfutures": "https://api.fxifyfutures.projectx.com/",
-    "goatfundedfutures": "https://api.goatfundedfutures.projectx.com/",
-    "holaprime": "https://api.holaprime.projectx.com/",
-    "nexgen": "https://api.nexgen.projectx.com/",
-    "tx3funding": "https://api.tx3funding.projectx.com/",
-    "demo": "https://gateway-api-demo.s2f.projectx.com/",  # Demo still uses old pattern
-    "daytraders": "https://api.daytraders.projectx.com/",
-}
-
-# ProjectX SignalR streaming URL mappings
-PROJECTX_STREAMING_URLS = {
-    "topstepx": "https://rtc.topstepx.com/",
-    "topone": "https://rtc.toponefutures.projectx.com/",  # Top One Futures
-    "tickticktrader": "https://rtc.tickticktrader.projectx.com/",
-    "alphaticks": "https://rtc.alphaticks.projectx.com/",
-    "aquafutures": "https://rtc.aquafutures.projectx.com/",
-    "blueguardianfutures": "https://rtc.blueguardianfutures.projectx.com/",
-    "blusky": "https://rtc.blusky.projectx.com/",
-    "bulenox": "https://rtc.bulenox.projectx.com/",
-    "e8x": "https://rtc.e8.projectx.com/",
-    "fundingfutures": "https://rtc.fundingfutures.projectx.com/",
-    "thefuturesdesk": "https://rtc.thefuturesdesk.projectx.com/",
-    "futureselite": "https://rtc.futureselite.projectx.com/",
-    "fxifyfutures": "https://rtc.fxifyfutures.projectx.com/",
-    "goatfundedfutures": "https://rtc.goatfundedfutures.projectx.com/",
-    "holaprime": "https://rtc.holaprime.projectx.com/",
-    "nexgen": "https://rtc.nexgen.projectx.com/",
-    "tx3funding": "https://rtc.tx3funding.projectx.com/",
-    "demo": "https://gateway-rtc-demo.s2f.projectx.com/",
-    "daytraders": "https://rtc.daytraders.projectx.com/",
-}
-
-# ProjectX Configuration - Multi-firm support
-def get_projectx_config(firm: str = None) -> dict:
-    """Get ProjectX configuration for a specific firm with automatic URL resolution"""
-    # If no firm specified, try to get from environment
-    if firm is None:
-        firm = os.environ.get("PROJECTX_FIRM")
-    
-    if not firm:
-        # Try to auto-detect available firm
-        available_firms = get_available_projectx_firms()
-        if available_firms:
-            firm = available_firms[0]  # Use first available
-    
-    if not firm:
-        return {}
-    
-    firm_lower = firm.lower()
-    firm_upper = firm.upper()
-    
-    # Get URLs: Environment override OR built-in mapping
-    base_url = (os.environ.get(f"PROJECTX_{firm_upper}_BASE_URL") or 
-                PROJECTX_BASE_URLS.get(firm_lower))
-    
-    streaming_url = (os.environ.get(f"PROJECTX_{firm_upper}_STREAMING_BASE_URL") or 
-                     PROJECTX_STREAMING_URLS.get(firm_lower))
-    
-    return {
-        "firm": firm_upper,
-        "api_key": os.environ.get(f"PROJECTX_{firm_upper}_API_KEY"),
-        "username": os.environ.get(f"PROJECTX_{firm_upper}_USERNAME"),
-        "base_url": base_url,
-        "preferred_account_name": os.environ.get(f"PROJECTX_{firm_upper}_PREFERRED_ACCOUNT_NAME"),
-        "streaming_base_url": streaming_url,
-    }
-
-def get_available_projectx_firms() -> list:
-    """Get list of firms that have ProjectX configuration available"""
-    firms = []
-    for key in os.environ.keys():
-        if key.startswith("PROJECTX_") and key.endswith("_API_KEY"):
-            # Extract firm name from PROJECTX_FIRMNAME_API_KEY
-            firm_name = key[9:-8]  # Remove "PROJECTX_" and "_API_KEY"
-            if firm_name:
-                firms.append(firm_name)
-    return firms
-
-# Default ProjectX config (for backwards compatibility and auto-detection)
-PROJECTX_CONFIG = get_projectx_config()
-
 LUMIWEALTH_API_KEY = os.environ.get("LUMIWEALTH_API_KEY")
 
 # Get TRADING_BROKER and DATA_SOURCE from environment variables
@@ -438,239 +275,59 @@ if not is_backtesting or is_backtesting.lower() == "false":
     
     # Determine which trading broker to use based on TRADING_BROKER environment variable or available configs
     if trading_broker_name:
-        # Create broker instance based on explicitly specified name
-        if trading_broker_name.lower() == "alpaca":
+        name = trading_broker_name.lower()
+        if name == "alpaca":
             broker = Alpaca(ALPACA_CONFIG)
-        elif trading_broker_name.lower() == "tradier":
-            broker = Tradier(TRADIER_CONFIG)
-        elif trading_broker_name.lower() == "ccxt":
-            broker = Ccxt(COINBASE_CONFIG)
-        elif trading_broker_name.lower() == "coinbase":
-            broker = Ccxt(COINBASE_CONFIG)
-        elif trading_broker_name.lower() == "kraken":
-            broker = Ccxt(KRAKEN_CONFIG)
-        elif trading_broker_name.lower() == "ib" or trading_broker_name.lower() == "interactivebrokers":
+        elif name in ("ib", "interactivebrokers"):
             broker = InteractiveBrokers(INTERACTIVE_BROKERS_CONFIG)
-        elif trading_broker_name.lower() == "ibrest" or trading_broker_name.lower() == "interactivebrokersrest":
+        elif name in ("ibrest", "interactivebrokersrest"):
             broker = InteractiveBrokersREST(INTERACTIVE_BROKERS_REST_CONFIG)
-        elif trading_broker_name.lower() == "tradovate":
-            broker = Tradovate(TRADOVATE_CONFIG)
-        elif trading_broker_name.lower() == "schwab":
-            broker = Schwab(SCHWAB_CONFIG)
-        elif trading_broker_name.lower() == "bitunix":
-            broker = Bitunix(BITUNIX_CONFIG)
-        elif trading_broker_name.lower() == "projectx":
-            try:
-                # Get specified firm or use auto-detection
-                firm = os.environ.get("PROJECTX_FIRM")
-                config = get_projectx_config(firm)
-                
-                if not config or not config.get("api_key"):
-                    raise ValueError("No valid ProjectX configuration found. Please set environment variables for at least one firm.")
-                
-                from .data_sources import ProjectXData
-                data_source = ProjectXData(config)
-                broker = ProjectX(config, data_source=data_source)
-            except Exception as e:
-                colored_message = termcolor.colored(f"Failed to initialize ProjectX broker: {e}", "red")
-                logger.error(colored_message)
-        elif trading_broker_name.lower().startswith("projectx-"):
-            try:
-                # Extract firm name from broker name (e.g., "projectx-topone" -> "topone")
-                firm_suffix = trading_broker_name.lower()[9:]  # Remove "projectx-" prefix
-                
-                # Map broker suffixes to firm names (must match Node.js mapping)
-                suffix_to_firm_mapping = {
-                    'topstepx': 'TOPSTEPX',
-                    'topone': 'TOPONE', 
-                    'tickticktrader': 'TICKTICKTRADER',
-                    'alphaticks': 'ALPHATICKS',
-                    'aquafutures': 'AQUAFUTURES',
-                    'blueguardianfutures': 'BLUEGUARDIANFUTURES',
-                    'blusky': 'BLUSKY',
-                    'bulenox': 'BULENOX',
-                    'e8x': 'E8X',
-                    'fundingfutures': 'FUNDINGFUTURES',
-                    'thefuturesdesk': 'THEFUTURESDESK',
-                    'futureselite': 'FUTURESELITE',
-                    'fxifyfutures': 'FXIFYFUTURES',
-                    'goatfundedfutures': 'GOATFUNDEDFUTURES',
-                    'holaprime': 'HOLAPRIME',
-                    'nexgen': 'NEXGEN',
-                    'tx3funding': 'TX3FUNDING',
-                    'daytraders': 'DAYTRADERS',
-                    'demo': 'DEMO',
-                    # Legacy brokers for backward compatibility
-                    'earn2trade': 'EARN2TRADE',
-                    'uprofit': 'UPROFIT'
-                }
-                
-                if firm_suffix not in suffix_to_firm_mapping:
-                    raise ValueError(f"Unknown ProjectX firm: {firm_suffix}. Supported firms: {list(suffix_to_firm_mapping.keys())}")
-                
-                firm = suffix_to_firm_mapping[firm_suffix]
-                config = get_projectx_config(firm)
-                
-                if not config or not config.get("api_key"):
-                    raise ValueError(f"No valid ProjectX configuration found for firm {firm}. Please set environment variables.")
-                
-                from .data_sources import ProjectXData
-                data_source = ProjectXData(config)
-                broker = ProjectX(config, data_source=data_source)
-            except Exception as e:
-                colored_message = termcolor.colored(f"Failed to initialize ProjectX broker {trading_broker_name}: {e}", "red")
-                logger.error(colored_message)
         else:
-            colored_message = termcolor.colored(f"Unknown trading broker name: {trading_broker_name}. Please check your environment variables.", "red")
+            colored_message = termcolor.colored(
+                f"Unknown or unsupported trading broker: {trading_broker_name}. "
+                "This fork supports Alpaca and Interactive Brokers only.",
+                "red",
+            )
             logger.error(colored_message)
     else:
-        # Auto-detect broker based on available credentials if not explicitly specified
         if ALPACA_CONFIG["API_KEY"] or ALPACA_CONFIG["OAUTH_TOKEN"]:
             try:
                 broker = Alpaca(ALPACA_CONFIG)
             except ValueError as e:
-                # If Alpaca initialization fails due to missing credentials, skip it
-                if "Either OAuth token or API key/secret must be provided" in str(e):
-                    pass
-                else:
-                    raise e
-        elif TRADIER_CONFIG["ACCESS_TOKEN"]:
-            broker = Tradier(TRADIER_CONFIG)
+                if "Either OAuth token or API key/secret must be provided" not in str(e):
+                    raise
         elif INTERACTIVE_BROKERS_CONFIG["CLIENT_ID"]:
             broker = InteractiveBrokers(INTERACTIVE_BROKERS_CONFIG)
         elif INTERACTIVE_BROKERS_REST_CONFIG["IB_USERNAME"]:
             broker = InteractiveBrokersREST(INTERACTIVE_BROKERS_REST_CONFIG)
-        elif TRADOVATE_CONFIG["USERNAME"]:
-            try:
-                broker = Tradovate(TRADOVATE_CONFIG)
-            except Exception as e:
-                # Handle rate limiting and other connection errors gracefully
-                error_str = str(e)
-                if "rate limited" in error_str.lower() or "429" in error_str:
-                    message = (
-                        "Tradovate connection blocked due to rate limiting. "
-                        "Too many requests were made. Wait 5-10 minutes and try again."
-                    )
-                    logger.error(termcolor.colored(message, "red"))
-                    raise RuntimeError(message) from e
-                else:
-                    logger.error(termcolor.colored(f"Could not initialize Tradovate broker: {e}", "red"))
-                    raise
-        # Only check for SCHWAB_ACCOUNT_NUMBER to select Schwab
-        elif SCHWAB_CONFIG.get("SCHWAB_ACCOUNT_NUMBER"):
-            broker = Schwab(SCHWAB_CONFIG)
-        elif COINBASE_CONFIG["apiKey"]:
-            broker = Ccxt(COINBASE_CONFIG)
-        elif KRAKEN_CONFIG["apiKey"]:
-            broker = Ccxt(KRAKEN_CONFIG)
-        elif BITUNIX_CONFIG["API_KEY"] and BITUNIX_CONFIG["API_SECRET"]:
-            broker = Bitunix(BITUNIX_CONFIG)
-        elif get_available_projectx_firms():
-            try:
-                # Use first available ProjectX firm
-                available_firms = get_available_projectx_firms()
-                config = get_projectx_config(available_firms[0])
-                
-                if config.get("api_key") and config.get("username"):
-                    from .data_sources import ProjectXData
-                    data_source = ProjectXData(config)
-                    broker = ProjectX(config, data_source=data_source)
-            except Exception as e:
-                colored_message = termcolor.colored(f"Failed to initialize ProjectX broker: {e}", "red")
-                logger.error(colored_message)
     
     # Determine if we should use a custom data source based on DATA_SOURCE environment variable
     if data_source_name:
         try:
-            # Import necessary data source classes
-            if data_source_name.lower() == "alpaca":
+            name = data_source_name.lower()
+            if name == "alpaca":
                 from .data_sources import AlpacaData
                 data_source = AlpacaData(ALPACA_CONFIG)
-            elif data_source_name.lower() == "tradier":
-                from .data_sources import TradierData
-                data_source = TradierData(TRADIER_CONFIG)
-            elif data_source_name.lower() == "ccxt":
-                from .data_sources import CcxtData
-                data_source = CcxtData(COINBASE_CONFIG)
-            elif data_source_name.lower() == "coinbase":
-                from .data_sources import CcxtData
-                data_source = CcxtData(COINBASE_CONFIG)
-            elif data_source_name.lower() == "kraken":
-                from .data_sources import CcxtData
-                data_source = CcxtData(KRAKEN_CONFIG)
-            elif data_source_name.lower() == "ib" or data_source_name.lower() == "interactivebrokers":
+            elif name in ("ib", "interactivebrokers"):
                 from .data_sources import InteractiveBrokersData
                 data_source = InteractiveBrokersData(INTERACTIVE_BROKERS_CONFIG)
-            elif data_source_name.lower() == "ibrest" or data_source_name.lower() == "interactivebrokersrest":
+            elif name in ("ibrest", "interactivebrokersrest"):
                 from .data_sources import InteractiveBrokersRESTData
                 data_source = InteractiveBrokersRESTData(INTERACTIVE_BROKERS_REST_CONFIG)
-            elif data_source_name.lower() == "polygon":
-                from .data_sources import PolygonData
-                data_source = PolygonData(api_key=POLYGON_API_KEY)
-            elif data_source_name.lower() == "yahoo":
+            elif name == "yahoo":
                 from .data_sources import YahooData
-                
-                # Initialize YahooData without explicitly passing dates
-                # The class will handle defaults internally
                 data_source = YahooData()
-                
-                # Only set dates if they're explicitly provided in environment variables
                 if BACKTESTING_START and BACKTESTING_END:
                     data_source._update_datetime_limits(BACKTESTING_START, BACKTESTING_END)
-            elif data_source_name.lower() == "schwab":
-                from .data_sources import SchwabData
-                # Only pass account_number, never api_key/secret
-                data_source = SchwabData(
-                    account_number=SCHWAB_CONFIG["SCHWAB_ACCOUNT_NUMBER"]
-                )
-                # If broker is also Schwab, share the client
-                if broker and broker.name.lower() == "schwab" and hasattr(broker, "client"):
-                    data_source.set_client(broker.client)
-            elif data_source_name.lower() == "thetadata":
-                # Check if we have ThetaData configuration
-                if THETADATA_CONFIG["THETADATA_USERNAME"] and THETADATA_CONFIG["THETADATA_PASSWORD"]:
-                    from .data_sources import ThetaData
-                    data_source = ThetaData(
-                        username=THETADATA_CONFIG["THETADATA_USERNAME"],
-                        password=THETADATA_CONFIG["THETADATA_PASSWORD"]
-                    )
-                else:
-                    colored_message = termcolor.colored("Missing ThetaData credentials. Please set THETADATA_USERNAME and THETADATA_PASSWORD environment variables.", "red")
-                    logger.error(colored_message)
-            elif data_source_name.lower() == "databento":
-                # Check if we have DataBento configuration
-                if DATABENTO_CONFIG["API_KEY"]:
-                    from .data_sources import DataBentoData
-                    data_source = DataBentoData(
-                        api_key=DATABENTO_CONFIG["API_KEY"],
-                        timeout=DATABENTO_CONFIG["TIMEOUT"],
-                        max_retries=DATABENTO_CONFIG["MAX_RETRIES"]
-                    )
-                else:
-                    colored_message = termcolor.colored("Missing DataBento credentials. Please set DATABENTO_API_KEY environment variable.", "red")
-                    logger.error(colored_message)
-            elif data_source_name.lower() == "bitunix":
-                from .data_sources import BitunixData
-                data_source = BitunixData(BITUNIX_CONFIG)
-                # If broker is also Bitunix, share the same client instance
-                if broker and broker.name.lower() == "bitunix" and hasattr(broker, "api"):
-                    data_source.client = broker.api
-            elif data_source_name.lower() == "projectx":
-                from .data_sources import ProjectXData
-                # Get specified firm or use auto-detection
-                firm = os.environ.get("PROJECTX_FIRM")
-                config = get_projectx_config(firm)
-                
-                if not config or not config.get("api_key"):
-                    colored_message = termcolor.colored("No valid ProjectX configuration found for data source. Please set environment variables for at least one firm.", "red")
-                    logger.error(colored_message)
-                else:
-                    data_source = ProjectXData(config)
-                    # If broker is also ProjectX, share the same client instance
-                    if broker and broker.name.lower().startswith("projectx") and hasattr(broker, "client"):
-                        data_source.client = broker.client
+            elif name in ("alpha_vantage", "alphavantage"):
+                from .data_sources import AlphaVantageData
+                data_source = AlphaVantageData()
             else:
-                colored_message = termcolor.colored(f"Unknown data source name: {data_source_name}. Please check your environment variables.", "red")
+                colored_message = termcolor.colored(
+                    f"Unknown or unsupported data source: {data_source_name}. "
+                    "This fork supports yahoo, alpaca, ib, ibrest, alpha_vantage.",
+                    "red",
+                )
                 logger.error(colored_message)
         except ImportError as e:
             colored_message = termcolor.colored(f"Could not import data source {data_source_name}: {str(e)}", "red")

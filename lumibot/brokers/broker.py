@@ -35,7 +35,6 @@ from lumibot.tools.parquet_utils import (
 from lumibot.tools.symbol_normalization import normalize_symbol_for_broker, normalize_symbol_for_internal
 from ..data_sources import DataSource
 from ..entities import Asset, Order, Position, Quote
-from ..entities.chains import normalize_option_chains
 from ..trading_builtins import SafeList, SafeOrderDict
 
 logger = get_logger(__name__)
@@ -891,116 +890,7 @@ class Broker(ABC):
                 return cached
 
         raw_chains = self.data_source.get_chains(asset)
-        normalized_chains = normalize_option_chains(raw_chains)
-
-        # PERF: ThetaData historical chains can contain hundreds of expirations. Eagerly fetching
-        # strike lists for each expiration (option/list/strikes fanout) makes cold backtests
-        # unusably slow. For ThetaData backtests, enable lazy strike loading so we only fetch
-        # strikes for the expirations a strategy actually accesses.
-        if (
-            getattr(self, "IS_BACKTESTING_BROKER", False)
-            and isinstance(raw_chains, dict)
-            and raw_chains.get("_chain_cache_version") is not None
-        ):
-            try:
-                from datetime import date as _date, datetime as _dt
-
-                from lumibot.tools import thetadata_helper
-
-                underlying_symbol = getattr(asset, "symbol", None) or normalized_chains.underlying_symbol or str(asset)
-                symbol_upper = str(underlying_symbol).upper()
-
-                # If this underlying has future splits relative to the chain's as-of date, Theta's
-                # strike lists can be on the pre-split scale. Reuse the same per-strike selection
-                # heuristic as build_historical_chain so strategies continue to see split-adjusted
-                # strikes when using lazy strike loading.
-                strike_normalizer = None
-                try:
-                    is_stock_underlying = str(getattr(asset, "asset_type", "")).lower() == "stock"
-                    as_of_date = self.data_source.get_datetime().date()
-                except Exception:
-                    is_stock_underlying = False
-                    as_of_date = None
-
-                if is_stock_underlying and isinstance(as_of_date, _date):
-                    try:
-                        splits = thetadata_helper._get_theta_splits(asset, as_of_date, _date.today())
-                        if splits is not None and not splits.empty and "event_date" in splits.columns:
-                            import math
-                            import pandas as _pd
-
-                            as_of_datetime = _pd.Timestamp(as_of_date)
-                            if splits["event_date"].dtype != "datetime64[ns]":
-                                splits["event_date"] = _pd.to_datetime(splits["event_date"])
-                            future_splits = splits[splits["event_date"] > as_of_datetime]
-                            if not future_splits.empty:
-                                cumulative_split_factor = float(future_splits["ratio"].prod())
-                                if cumulative_split_factor != 1.0:
-                                    reference_price = None
-                                    try:
-                                        ref_asset = Asset(asset.symbol, asset_type="stock")
-                                        ref_dt = _dt(as_of_date.year, as_of_date.month, as_of_date.day)
-                                        ref_df = thetadata_helper.get_price_data(
-                                            asset=ref_asset,
-                                            start=ref_dt,
-                                            end=ref_dt,
-                                            timespan="day",
-                                            datastyle="ohlc",
-                                            include_after_hours=False,
-                                        )
-                                        if ref_df is not None and not ref_df.empty:
-                                            for col in ("close", "Close", "adj_close", "Adj Close"):
-                                                if col in ref_df.columns:
-                                                    reference_price = float(ref_df[col].iloc[-1])
-                                                    break
-                                    except Exception:
-                                        reference_price = None
-
-                                    def _select_normalized_strike(raw_strike: float) -> float:
-                                        adjusted = raw_strike / cumulative_split_factor
-                                        if reference_price and reference_price > 0:
-                                            try:
-                                                raw_score = abs(math.log(raw_strike / reference_price))
-                                                adjusted_score = abs(math.log(adjusted / reference_price))
-                                            except (ValueError, ZeroDivisionError):
-                                                return adjusted
-                                            return adjusted if adjusted_score < raw_score else raw_strike
-                                        return adjusted
-
-                                    strike_normalizer = _select_normalized_strike
-                    except Exception:
-                        strike_normalizer = None
-
-                def _load_strikes(expiry_key: str) -> list[float]:
-                    try:
-                        exp_date = _dt.strptime(str(expiry_key), "%Y-%m-%d").date()
-                    except Exception:
-                        return []
-
-                    strike_symbol = str(underlying_symbol)
-                    if symbol_upper == "SPX":
-                        strike_symbol = "SPX" if thetadata_helper._is_third_friday(exp_date) else "SPXW"
-
-                    try:
-                        strikes = thetadata_helper.get_strikes(strike_symbol, _dt.combine(exp_date, _dt.min.time()))
-                        if strike_normalizer is not None and strikes:
-                            normalized = {
-                                round(float(strike_normalizer(float(s))), 5)
-                                for s in strikes
-                                if s is not None
-                            }
-                            return sorted(normalized)
-                        return strikes
-                    except Exception:
-                        return []
-
-                # NOTE: Lazy strike fetching can trigger `option/list/strikes` fanout. In
-                # backtesting/CI acceptance runs we enforce a strict warm-cache invariant (no
-                # downloader queue submissions), so never enable lazy strike hydration there.
-                if not bool(getattr(self, "IS_BACKTESTING_BROKER", False)):
-                    normalized_chains.enable_lazy_strikes(_load_strikes)
-            except Exception:
-                pass
+        normalized_chains = raw_chains or {}
 
         if not normalized_chains:
             logger.warning(
@@ -1888,8 +1778,31 @@ class Broker(ABC):
         from collections import namedtuple
         ValidationResult = namedtuple('ValidationResult', ['is_valid', 'message', 'error_code'])
         
+        side = order.side
+
+        # Cover/close orders require an existing short position — validate before the general buy bypass.
+        if side in (Order.OrderSide.BUY_TO_COVER, Order.OrderSide.BUY_TO_CLOSE):
+            position = self.get_tracked_position(strategy_name, order.asset)
+            current_quantity = position.quantity if position else 0
+            if current_quantity >= 0:
+                error_msg = (
+                    f"Insufficient short position for {order.asset.symbol}: "
+                    f"attempted to cover {order.quantity}, available short {max(-current_quantity, 0)}"
+                )
+                return ValidationResult(False, error_msg, "insufficient_position")
+            if abs(current_quantity) < order.quantity:
+                error_msg = (
+                    f"Insufficient short position for {order.asset.symbol}: "
+                    f"attempted to cover {order.quantity}, available short {abs(current_quantity)}"
+                )
+                return ValidationResult(False, error_msg, "insufficient_position")
+            return ValidationResult(True, "Short cover validation passed", None)
+
         if not order.is_sell_order():
             return ValidationResult(True, "Buy orders do not require position validation", None)
+
+        if side in (Order.OrderSide.SELL_SHORT, Order.OrderSide.SELL_TO_OPEN):
+            return ValidationResult(True, "Short sales do not require an existing long position", None)
             
         # Get current position using broker's tracking system (single source of truth)
         position = self.get_tracked_position(strategy_name, order.asset)

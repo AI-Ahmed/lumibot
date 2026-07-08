@@ -22,11 +22,6 @@ from lumibot.tools.smart_limit_utils import build_price_ladder, compute_final_pr
 from lumibot.tools.lumibot_logger import get_logger
 from lumibot.trading_builtins import CustomStream
 
-try:
-    from lumibot.backtesting.thetadata_backtesting_pandas import ThetaDataBacktestingPandas
-except Exception:  # pragma: no cover - optional dependency
-    ThetaDataBacktestingPandas = None
-
 logger = get_logger(__name__)
 
 
@@ -2130,8 +2125,8 @@ class BacktestingBroker(Broker):
         
         # Determine timeshift based on data source
         data_source_name = self.data_source.SOURCE.upper()
-        if data_source_name in ["CCXT", "ALPACA"]:
-            # CCXT and Alpaca don't need timeshift - fill at current bar's open
+        if data_source_name == "ALPACA":
+            # Alpaca minute bars align with the backtest clock; no timeshift needed.
             timeshift = None
         elif data_source_name == "YAHOO":
             # Yahoo requires negative timedelta to get current day
@@ -2235,8 +2230,8 @@ class BacktestingBroker(Broker):
         
         # Determine timeshift based on data source
         data_source_name = self.data_source.SOURCE.upper()
-        if data_source_name in ["CCXT", "ALPACA"]:
-            # CCXT and Alpaca don't need timeshift - fill at current bar's open
+        if data_source_name == "ALPACA":
+            # Alpaca minute bars align with the backtest clock; no timeshift needed.
             timeshift = None
         elif data_source_name == "YAHOO":
             # Yahoo requires negative timedelta to get current day
@@ -2340,8 +2335,8 @@ class BacktestingBroker(Broker):
         
         # Determine timeshift based on data source
         data_source_name = self.data_source.SOURCE.upper()
-        if data_source_name in ["CCXT", "ALPACA"]:
-            # CCXT and Alpaca don't need timeshift - fill at current bar's open
+        if data_source_name == "ALPACA":
+            # Alpaca minute bars align with the backtest clock; no timeshift needed.
             timeshift = None
         elif data_source_name == "YAHOO":
             # Yahoo requires negative timedelta to get current day
@@ -2694,29 +2689,6 @@ class BacktestingBroker(Broker):
                     ask = None
 
                 snap = None
-                # ThetaData daily-cadence backtests frequently return day-aligned option quotes without
-                # NBBO (bid/ask). For execution (especially MARKET exits), prefer a point-in-time
-                # quote snapshot so we can fill against realistic bid/ask instead of falling through
-                # to sparse trade-only OHLC (which can leave orders unfilled and canceled at EOD).
-                if (
-                    (bid is None or ask is None)
-                    and getattr(order.asset, "asset_type", None) == Asset.AssetType.OPTION
-                    and self.data_source is not None
-                    and self.data_source.__class__.__name__ == "ThetaDataBacktestingPandas"
-                ):
-                    try:
-                        snap = self.data_source.get_quote(order.asset, quote=order.quote, snapshot_only=True)
-                    except TypeError:
-                        snap = None
-                    except Exception:
-                        snap = None
-                    if snap is not None:
-                        snap_bid = self._coerce_price(getattr(snap, "bid", None))
-                        snap_ask = self._coerce_price(getattr(snap, "ask", None))
-                        if bid is None and snap_bid is not None and not self._is_invalid_price(snap_bid):
-                            bid = snap_bid
-                        if ask is None and snap_ask is not None and not self._is_invalid_price(snap_ask):
-                            ask = snap_ask
 
                 is_buy = order.is_buy_order()
 
@@ -2817,17 +2789,13 @@ class BacktestingBroker(Broker):
             # Get OHLCV data for the asset
             #############################
 
-            # Get the OHLCV data for the asset if we're using the YAHOO, CCXT data source
-            if data_source_name in ["CCXT", "YAHOO", "ALPACA", "DATABENTO", "DATABENTO_POLARS"]:
+            # Get the OHLCV data for Yahoo/Alpaca equity data sources.
+            if data_source_name in ["YAHOO", "ALPACA"]:
                 # Negative deltas here are intentional: _pull_source_symbol_bars subtracts the offset, so
                 # passing -1 minute yields an effective +1 minute guard that keeps us on the previously
                 # completed bar. See tests/*_lookahead for regression coverage.
                 timeshift = timedelta(minutes=-1)
-                if data_source_name in {"DATABENTO", "DATABENTO_POLARS"}:
-                    # DataBento feeds can skip minutes around maintenance windows. Giving it a two-minute
-                    # cushion mirrors the legacy Polygon behaviour and avoids falling through gaps.
-                    timeshift = timedelta(minutes=-2)
-                elif data_source_name == "YAHOO":
+                if data_source_name == "YAHOO":
                     # Yahoo daily bars are stamped at the close (16:00). A one-day backstep keeps fills on
                     # the previous session so we never peek at the in-progress bar.
                     timeshift = timedelta(days=-1)
@@ -2962,10 +2930,8 @@ class BacktestingBroker(Broker):
                                 )
                                 continue
 
-                # This is a hack to get around the fact that we need to get the previous day's data to prevent lookahead bias.
-                # Multileg parent orders are placeholders and often have no backing OHLC stream
-                # (especially for ThetaData where multileg assets are unsupported). For package
-                # SMART_LIMIT orders, we fill from the child legs' quotes instead of attempting
+                # Multileg parent orders are placeholders and often have no backing OHLC stream.
+                # For package SMART_LIMIT orders, we fill from the child legs' quotes instead of attempting
                 # to fetch OHLC for the parent.
                 if (
                     order.order_class is Order.OrderClass.MULTILEG
@@ -2994,8 +2960,8 @@ class BacktestingBroker(Broker):
                         timeshift=timeshift,
                         timestep=timestep,
                     )
-                    # ThetaData daily bars are timestamped at the end of the trading session (e.g.
-                    # 16:00 NY / 21:00 UTC). At intraday times (or midnight), PandasData slicing
+                    # Daily bars are often timestamped at the end of the trading session (e.g.
+                    # 16:00 NY). At intraday times (or midnight), PandasData slicing
                     # (Data.get_iter_count) returns the *previous* session as "last bar <= now",
                     # which can cause fills to incorrectly use yesterday's open.
                     #
@@ -3666,11 +3632,6 @@ class BacktestingBroker(Broker):
         timestep = getattr(self.data_source, "_timestep", None)
         return timestep == "day"
 
-    def _is_thetadata_source(self) -> bool:
-        if ThetaDataBacktestingPandas is None:
-            return False
-        return isinstance(self.data_source, ThetaDataBacktestingPandas)
-
     def _get_spread_limit(self, strategy, key: str) -> Optional[float]:
         if strategy is None or not key:
             return None
@@ -3858,10 +3819,6 @@ class BacktestingBroker(Broker):
             if snap is not None:
                 fields.update(self._audit_quote_fields("submit.asset_quote.snapshot", snap))
 
-            # For ThetaData backtests, the most useful execution-time NBBO is often only available
-            # via the data source's `snapshot_only` fast-path. The generic Broker.get_quote() call
-            # can return trade-derived prices without bid/ask, which isn't sufficient for audits.
-            #
             # Best-effort: if the underlying data source supports `snapshot_only=True`, capture it.
             source = getattr(self, "data_source", None)
             if source is not None and asset is not None and hasattr(source, "get_quote"):
@@ -3916,20 +3873,7 @@ class BacktestingBroker(Broker):
             return None
 
         try:
-            quote_kwargs = {}
-            # ThetaData option NBBO is stored as intraday snapshot data. In daily-cadence backtests,
-            # requesting full-day minute quotes per option can explode runtime. Use snapshot mode
-            # (minimal window around `self.datetime`) so market/limit orders can still fill on
-            # actionable quotes without downloading an entire session.
-            if self._is_thetadata_source() and self._is_option_asset(order.asset) and getattr(self.data_source, "_timestep", None) == "day":
-                # NOTE: `Broker.get_quote()` does not accept extra kwargs; call the data source
-                # directly so we can pass `snapshot_only` and other backtesting-specific controls.
-                quote_kwargs["snapshot_only"] = True
-                quote = self.data_source.get_quote(order.asset, quote=order.quote, exchange=None, **quote_kwargs)
-            else:
-                # Default: preserve legacy broker behavior (and acceptance baselines) by using the
-                # broker-level `get_quote()` path without backtesting-only kwargs.
-                quote = self.get_quote(order.asset, quote=order.quote)
+            quote = self.get_quote(order.asset, quote=order.quote)
         except Exception as exc:  # pragma: no cover - defensive log for unexpected broker states
             self.logger.debug("Quote lookup failed for %s: %s", getattr(order.asset, "symbol", order.asset), exc)
             return None

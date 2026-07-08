@@ -208,38 +208,8 @@ class DataSourceBacktesting(DataSource, ABC):
                 continue
 
     def _write_progress_heartbeat_if_downloading(self) -> bool:
-        """Write `logs/progress.csv` while a ThetaData download is active.
-
-        Backtests can spend long stretches blocked inside data download calls, during which the
-        simulation datetime does not advance. The UI reads progress from `progress.csv`, so without
-        a heartbeat it looks "stuck". This method preserves the last known percent/metrics while
-        updating the download_status column via `thetadata_helper.get_download_status()`.
-        """
-        if not self.log_backtest_progress_to_file:
-            return False
-        if not self._progress_heartbeat_enabled:
-            return False
-
-        try:
-            from lumibot.tools.thetadata_helper import get_download_status
-        except ImportError:
-            return False
-
-        status = get_download_status()
-        if not status.get("active"):
-            return False
-
-        now_wall = dt.datetime.now()
-        if self._last_logging_time is not None:
-            if (now_wall - self._last_logging_time).total_seconds() < self._progress_heartbeat_interval_seconds:
-                return False
-
-        with self._progress_snapshot_lock:
-            snapshot = dict(self._last_progress_snapshot)
-
-        self._last_logging_time = now_wall
-        self.log_backtest_progress_to_csv(**snapshot)
-        return True
+        """No-op in equity-only fork (ThetaData download heartbeat removed)."""
+        return False
 
     @staticmethod
     def estimate_requested_length(length=None, start_date=None, end_date=None, timestep="minute"):
@@ -478,20 +448,7 @@ class DataSourceBacktesting(DataSource, ABC):
 
         current_time = dt.datetime.now().isoformat()
 
-        # Get download status from ThetaData helper (if available)
         download_status_json = "{}"
-        try:
-            from lumibot.tools.thetadata_helper import get_download_status
-            download_status = get_download_status()
-            if download_status.get("active"):
-                import json
-                download_status_json = json.dumps(download_status)
-        except ImportError:
-            # ThetaData helper not available, skip download status
-            pass
-        except Exception:
-            # Any other error, skip download status
-            pass
 
         # Build row with all columns
         row = [

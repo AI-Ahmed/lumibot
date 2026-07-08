@@ -31,6 +31,18 @@ from requests import exceptions as requests_exceptions
 
 logger = logging.getLogger(__name__)
 
+
+def _update_download_status_queue_info(**kwargs) -> None:
+    """Best-effort progress UI hook (ThetaData helper removed in equity-only fork)."""
+    try:
+        from lumibot.tools.thetadata_helper import update_download_status_queue_info
+    except ImportError:
+        return
+    try:
+        update_download_status_queue_info(**kwargs)
+    except Exception:
+        pass
+
 # Lightweight, non-secret telemetry for backtest audit/debugging.
 #
 # These counters are intended to be recorded into `*_settings.json` at the end of a backtest
@@ -625,9 +637,7 @@ class QueueClient:
         )
         # Best-effort: surface request_id into the progress UI so a "stall" is diagnosable.
         try:  # pragma: no cover - UI plumbing
-            from lumibot.tools.thetadata_helper import update_download_status_queue_info
-
-            update_download_status_queue_info(
+            _update_download_status_queue_info(
                 request_id=request_id,
                 correlation_id=correlation_id,
                 queue_status=status,
@@ -671,9 +681,7 @@ class QueueClient:
                     info.last_checked = time.time()
                     # Best-effort: surface queue status into the progress UI.
                     try:  # pragma: no cover - UI plumbing
-                        from lumibot.tools.thetadata_helper import update_download_status_queue_info
-
-                        update_download_status_queue_info(
+                        _update_download_status_queue_info(
                             request_id=info.request_id,
                             correlation_id=info.correlation_id,
                             queue_status=info.status,
@@ -965,9 +973,7 @@ class QueueClient:
                     # Best-effort: surface the failure into the backtest status payload so the UI
                     # can show what we're stuck on.
                     try:  # pragma: no cover - UI plumbing
-                        from lumibot.tools.thetadata_helper import update_download_status_queue_info
-
-                        update_download_status_queue_info(
+                        _update_download_status_queue_info(
                             request_id=request_id,
                             correlation_id=correlation_override or base_correlation_id,
                             last_error=str(exc),

@@ -432,13 +432,39 @@ class DriftOrderLogic:
                 else:
                     quantity = quantity.quantize(Decimal('1'), rounding=ROUND_DOWN)
 
-                if (0 < quantity < row["current_quantity"]) or (quantity > 0 and self.shorting):
-                    # If we are not shorting, we can only sell what we have.
+                if quantity <= 0:
+                    continue
+
+                current_qty = row["current_quantity"]
+
+                # Close an existing long before opening/increasing short exposure.
+                if current_qty > 0:
+                    close_qty = min(quantity, current_qty)
+                    if close_qty > 0:
+                        order = self.place_order(
+                            base_asset=base_asset,
+                            quantity=close_qty,
+                            limit_price=limit_price,
+                            side="sell",
+                        )
+                        sell_orders.append(order)
+                    quantity -= close_qty
+
+                if quantity > 0 and self.shorting:
                     order = self.place_order(
                         base_asset=base_asset,
                         quantity=quantity,
                         limit_price=limit_price,
-                        side="sell"
+                        side="sell",
+                    )
+                    sell_orders.append(order)
+                elif quantity > 0 and current_qty > 0:
+                    # Trim-only path when shorting is disabled.
+                    order = self.place_order(
+                        base_asset=base_asset,
+                        quantity=quantity,
+                        limit_price=limit_price,
+                        side="sell",
                     )
                     sell_orders.append(order)
 

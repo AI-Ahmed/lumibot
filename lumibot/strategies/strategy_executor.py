@@ -723,8 +723,6 @@ class StrategyExecutor(Thread):
 
                 target_type = "even" if abs(target_signed) < 1e-9 else ("debit" if target_signed > 0 else "credit")
                 target_price = abs(target_signed) if target_type != "even" else 0.0
-                if target_type == "even" and getattr(self.broker, "name", "").lower() == "tradier":
-                    target_price = None
 
                 current_type = state.get("multileg_order_type")
                 if current_type is None:
@@ -962,7 +960,9 @@ class StrategyExecutor(Thread):
         self.sync_broker()
 
         # Check if we are in market hours.
-        if not self.broker.is_market_open():
+        # Pure Pandas daily backtests iterate over day-aligned bars (often midnight timestamps).
+        # Treat each bar as an executable session regardless of clock time.
+        if not self._is_pandas_daily_data_source() and not self.broker.is_market_open():
             if not self._market_closed_logged:
                 self.strategy.log_message("The market is not currently open, skipping this trading iteration", color="blue")
                 self._market_closed_logged = True
@@ -1576,7 +1576,7 @@ class StrategyExecutor(Thread):
                 # of the backtesting loop. The main loop will then call _advance_to_next_trading_day()
                 # to move to the next trading day.
                 #
-                # IMPORTANT: Skip this ONLY for pure PandasDataBacktesting sources (not Polygon
+                # IMPORTANT: Skip this ONLY for pure PandasDataBacktesting sources (not Alpaca
                 # which inherits from PandasData) to maintain backward compatibility with existing
                 # tests that expect pandas daily data to process multiple days in a single call.
                 is_pure_pandas_data = (hasattr(self.broker, 'data_source') and
@@ -1596,16 +1596,16 @@ class StrategyExecutor(Thread):
     # ======Helper methods for _run_trading_session ====================
 
     def _is_pandas_daily_data_source(self):
-        """Return True only for *pure* Pandas daily backtests (not Polygon/ThetaData).
+        """Return True only for *pure* Pandas daily backtests.
 
         This route exists to support user-supplied `PandasDataBacktesting` runs where the
         strategy should iterate over the provided DataFrame index (`_date_index`).
 
         IMPORTANT: Do not apply this optimization to providers that *inherit* from
-        PandasData (e.g., PolygonDataBacktesting, ThetaDataBacktestingPandas). Those
-        providers manage their own market calendars and can switch `_timestep` to `"day"`
-        for daily-cadence strategies; treating them as "pure pandas daily" can cause the
-        backtest to terminate after a single bar.
+        PandasData (e.g., AlpacaBacktesting, IBRESTBacktesting). Those providers manage
+        their own market calendars and can switch `_timestep` to `"day"` for daily-cadence
+        strategies; treating them as "pure pandas daily" can cause the backtest to terminate
+        after a single bar.
         """
         data_source = getattr(self.broker, "data_source", None)
         if not self.strategy.is_backtesting or data_source is None:
@@ -2021,11 +2021,11 @@ class StrategyExecutor(Thread):
             # StrategyExecutor can run on timestamps that exist in the supplied DataFrames
             # (including daily bars where market_open == market_close).
             #
-            # IMPORTANT: do NOT apply this to PolygonDataBacktesting (or other providers that
+            # IMPORTANT: do NOT apply this to AlpacaBacktesting (or other providers that
             # inherit from PandasData) because their _date_index is typically empty at startup.
             # In that case, get_trading_days_pandas() returns a "full-day open" dummy calendar
             # (00:00–23:59:59), which can skip lifecycle hooks like before_market_opens() and
-            # breaks legacy backtests (e.g. tests/backtest/test_polygon.py).
+            # breaks legacy daily backtests that rely on exchange calendars.
             data_source = getattr(self.broker, "data_source", None)
             is_pure_pandas_data_source = (
                 self.strategy.is_backtesting

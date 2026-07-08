@@ -1,4 +1,4 @@
-# TODO: Using * is really bad and leads to random circular imports (especially in polygon_helper and indicators)
+# TODO: Using * is really bad and leads to random circular imports (especially in indicators)
 # TODO: When using *, you have to ensure that the underlying module does not import ANYTHING from the lumibot package
 # TODO: This tools module is a bad place to auto import as a helper to the code because all of the modules and functions
 # TODO: are not related to each other. It's just a collection of random functions and classes and it is unclear what
@@ -30,8 +30,6 @@ from .hft_indicators import create_tearsheet
 from .pandas import *
 from .types import *
 from .yahoo_helper import YahooHelper
-from .ccxt_data_store import CcxtCacheDB
-from .schwab_helper import SchwabHelper
 
 # Unified logging system
 from .lumibot_logger import (

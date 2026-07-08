@@ -3,7 +3,6 @@ from .bar import Bar
 
 # Import base implementations
 from .bars import Bars as _BarsBase
-from .chains import Chains
 from .data import Data as _DataBase
 from .data_polars import DataPolars
 from .dataline import Dataline
@@ -22,7 +21,6 @@ __all__ = [
     "AssetsMapping",
     "Bar",
     "Bars",
-    "Chains",
     "Data",
     "DataPolars",
     "Dataline",

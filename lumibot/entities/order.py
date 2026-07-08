@@ -120,17 +120,17 @@ STATUS_ALIAS_MAP = {
     "cancelled": "canceled",
     "cancel": "canceled",
     "cash": "cash_settled",
-    "expired": "expired",  # Alpaca/Tradier status
-    "filled": "fill",  # IBKR/Alpaca/Tradier status
-    "partially_filled": "partial_filled",  # Alpaca/Tradier status
-    "pending": "open",  # Tradier status
+    "expired": "expired",  # Alpaca status
+    "filled": "fill",  # IBKR/Alpaca status
+    "partially_filled": "partial_filled",  # Alpaca status
+    "pending": "open",
     "presubmitted": "new",  # IBKR status
     "apicancelled": "canceled",  # IBKR status
     "pendingcancel": "cancelling",  # IBKR status
     "inactive": "error",  # IBKR status
     "pendingsubmit": "new",  # IBKR status
     "apipending": "new",  # IBKR status
-    "rejected": "error",  # Tradier status
+    "rejected": "error",
     "submit": "submitted",
     "done_for_day": "canceled",  # Alpaca status
     "replaced": "canceled",  # Alpaca status
@@ -1270,7 +1270,7 @@ class Order:
         elif self.status.lower() in [status.lower(), STATUS_ALIAS_MAP.get(status.lower(), "")]:
             return True
         # Treat active "acknowledged" statuses as equivalent across brokers.
-        # WHY: Some brokers (notably Tradier) can report an active order as "submitted" for extended
+        # WHY: Some brokers can report an active order as "submitted" for extended
         # periods or flip between "open" and "submitted". Treating these as distinct can cause polling
         # streams to emit repeated NEW events in long-running workers.
         elif {self.status.lower(), status.lower()}.issubset({"open", "new", "submitted"}):

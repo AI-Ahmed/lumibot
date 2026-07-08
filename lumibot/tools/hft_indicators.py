@@ -54,10 +54,25 @@ def _infer_entries_per_year(returns, trading_days_per_year=365):
     if not hasattr(idx, 'to_series'):
         return float(trading_days_per_year)
 
-    # Calculate calendar span in days
+    if hasattr(idx, "normalize"):
+        unique_days = idx.normalize().nunique()
+    else:
+        unique_days = None
+
     delta = idx[-1] - idx[0]
-    span_days = delta.total_seconds() / 86400 if hasattr(delta, 'total_seconds') else getattr(delta, 'days', 1)
-    span_days = max(span_days, 1e-9)  # Avoid division by zero
+    if hasattr(delta, "total_seconds"):
+        calendar_span_days = max(delta.total_seconds() / 86400, 1.0)
+    else:
+        calendar_span_days = max(float(getattr(delta, "days", 1) or 1), 1.0)
+
+    if unique_days and unique_days >= 2:
+        bars_per_day = len(returns) / unique_days
+        if bars_per_day > 4:
+            span_days = max(float(unique_days), 1.0)
+        else:
+            span_days = calendar_span_days
+    else:
+        span_days = calendar_span_days
 
     # Data-driven: observed bars per calendar day, scaled to trading year
     bars_per_calendar_day = len(returns) / span_days

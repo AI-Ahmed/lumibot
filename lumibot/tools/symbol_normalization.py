@@ -13,8 +13,6 @@ _CLASS_SHARE_PATTERNS = {
 
 # Broker-native preferred separators for class-share stock symbols.
 _BROKER_CLASS_SHARE_SEPARATORS = {
-    "tradier": "/",
-    "schwab": "/",
     "interactive_brokers": " ",
     "ibkr": " ",
     "alpaca": ".",

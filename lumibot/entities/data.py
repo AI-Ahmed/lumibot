@@ -427,15 +427,44 @@ class Data:
     def repair_times_and_fill(self, idx):
         # Trim the global index so that it is within the local data.
         # PERF: Use searchsorted when idx is a DatetimeIndex (avoids expensive boolean indexing).
+        start = self.datetime_start
+        end = self.datetime_end
         if isinstance(idx, pd.DatetimeIndex) and len(idx) > 0:
+            idx_tz = idx.tz
+            start_ts = pd.Timestamp(start)
+            end_ts = pd.Timestamp(end)
+            if idx_tz is not None:
+                if start_ts.tzinfo is None:
+                    start_ts = start_ts.tz_localize(idx_tz)
+                else:
+                    start_ts = start_ts.tz_convert(idx_tz)
+                if end_ts.tzinfo is None:
+                    end_ts = end_ts.tz_localize(idx_tz)
+                else:
+                    end_ts = end_ts.tz_convert(idx_tz)
+            else:
+                if start_ts.tzinfo is not None:
+                    start_ts = start_ts.tz_localize(None)
+                if end_ts.tzinfo is not None:
+                    end_ts = end_ts.tz_localize(None)
             try:
-                start_pos = idx.searchsorted(self.datetime_start, side="left")
-                end_pos = idx.searchsorted(self.datetime_end, side="right")
+                start_pos = idx.searchsorted(start_ts, side="left")
+                end_pos = idx.searchsorted(end_ts, side="right")
                 idx = idx[start_pos:end_pos]
             except (TypeError, ValueError):
-                idx = idx[(idx >= self.datetime_start) & (idx <= self.datetime_end)]
+                idx = idx[(idx >= start_ts) & (idx <= end_ts)]
         else:
-            idx = idx[(idx >= self.datetime_start) & (idx <= self.datetime_end)]
+            idx = idx[(idx >= start) & (idx <= end)]
+
+        if isinstance(self.df.index, pd.DatetimeIndex) and isinstance(idx, pd.DatetimeIndex) and len(idx) > 0:
+            df_tz = self.df.index.tz
+            idx_tz = idx.tz
+            if df_tz is not None and idx_tz is None:
+                idx = idx.tz_localize(df_tz)
+            elif df_tz is None and idx_tz is not None:
+                idx = idx.tz_localize(None)
+            elif df_tz is not None and idx_tz is not None and str(df_tz) != str(idx_tz):
+                idx = idx.tz_convert(df_tz)
 
         # Ensure that the DataFrame's index is unique by dropping duplicate timestamps.
         has_dups = getattr(self.df.index, "has_duplicates", None)
@@ -915,11 +944,30 @@ class Data:
                 f"The data object for {self.asset} does not have the necessary columns to get the quote. Please make sure that the data object has at least the following columns: open, high, low, close, and volume. This could be an issue with the data source or the data itself, consider changing the data source you are using or check that the data you are looking for exists in the data source."
             )
         
-        # Require at least bid and ask for quote; other quote fields (bid_size, ask_size, etc.) are optional.
+        # When bid/ask columns are absent, still return OHLCV with bid/ask set to None.
         if "bid" not in self.datalines or "ask" not in self.datalines:
-            raise ValueError(
-                f"The data object for {self.asset} does not have the necessary columns to get the quote. Please make sure that the data object has at least the following columns: bid and ask. This could be an issue with the data source or the data itself, consider changing the data source you are using or check that the data you are looking for exists in the data source. For example, Polygon does not provide bid and ask data."
-            )
+            iter_count = self.get_iter_count(dt)
+
+            def _get_optional_value(column: str, round_digits: Optional[int]):
+                if column not in self.datalines:
+                    return None
+                value = self.datalines[column].dataline[iter_count]
+                try:
+                    if pd.isna(value):
+                        return None
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    if round_digits is None:
+                        return value
+                    return round(value, round_digits)
+                except TypeError:
+                    return None
+
+            return {
+                name: _get_optional_value(column, digits)
+                for name, (column, digits) in _DATA_QUOTE_FIELDS.items()
+            }
 
         iter_count = self.get_iter_count(dt)
 

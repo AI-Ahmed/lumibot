@@ -33,13 +33,7 @@ from lumibot.tools.parquet_utils import (
 from ..backtesting import (
     AlpacaBacktesting,
     BacktestingBroker,
-    CcxtBacktesting,
-    DataBentoDataBacktesting,
     InteractiveBrokersRESTBacktesting,
-    PolygonDataBacktesting,
-    RoutedBacktestingPandas,
-    ThetaDataBacktesting,
-    ThetaDataBacktestingPandas,
     YahooDataBacktesting,
 )
 from ..credentials import (
@@ -59,13 +53,10 @@ from ..credentials import (
     LOG_BACKTEST_PROGRESS_TO_FILE,
     LUMIWEALTH_API_KEY,
     MARKET,
-    POLYGON_API_KEY,
-    POLYGON_MAX_MEMORY_BYTES,
     SHOW_INDICATORS,
     SHOW_PLOT,
     SHOW_TEARSHEET,
     STRATEGY_NAME,
-    THETADATA_CONFIG,
 )
 from ..entities import Asset, Bars, Data, Order, Position
 from ..tools import (
@@ -929,117 +920,13 @@ class _Strategy:
         if source is None:
             return None
 
-        snapshot_price = None
         timestep_hint = None
-        base_asset = asset[0] if isinstance(asset, tuple) else asset
-        base_asset_type = getattr(base_asset, "asset_type", None)
-        is_option_asset = base_asset_type in ("option", Asset.AssetType.OPTION)
-        is_thetadata_option_backtest = (
-            self.is_backtesting
-            and is_option_asset
-            and isinstance(source, ThetaDataBacktestingPandas)
-        )
-
-        def _thetadata_quote_mark(quote_obj):
-            if quote_obj is None:
-                return None
-            bid = getattr(quote_obj, "bid", None)
-            ask = getattr(quote_obj, "ask", None)
-            price = getattr(quote_obj, "price", None)
-
-            def _coerce(val):
-                try:
-                    numeric = float(val)
-                except (TypeError, ValueError):
-                    return None
-                if math.isnan(numeric) or numeric <= 0:
-                    return None
-                return numeric
-
-            bid_val = _coerce(bid)
-            ask_val = _coerce(ask)
-            if bid_val is not None and ask_val is not None:
-                return (bid_val + ask_val) / 2
-            if bid_val is not None:
-                return bid_val
-            if ask_val is not None:
-                return ask_val
-            return _coerce(price)
-
-        # Determine if this strategy is effectively daily cadence.
         try:
             cadence_seconds = self._get_sleeptime_seconds()
             if cadence_seconds is not None and cadence_seconds >= 20 * 3600:
                 timestep_hint = "day"
         except Exception:
             timestep_hint = None
-
-        # ThetaData backtesting: for options, mark-to-market should be quote-driven (NBBO mark) and
-        # extremely fast. Calling `get_price_snapshot()` first causes an extra `_update_pandas_data()`
-        # pass per asset (and often still falls back to `get_quote()`), which is the dominant cost in
-        # long, option-heavy intraday backtests.
-        if is_thetadata_option_backtest:
-            try:
-                get_quote = getattr(source, "get_quote", None)
-                if callable(get_quote):
-                    quote_asset = getattr(self, "_quote_asset", None)
-                    # ThetaData backtesting option MTM should be quote-driven when available.
-                    # Prefer the normal quote path first (usually day/EOD for daily cadence),
-                    # then fall back to a minimal intraday NBBO snapshot when day/EOD pricing
-                    # is missing (ThetaData can return 472/no-data for option EOD history even
-                    # when intraday quote history exists).
-                    if quote_asset is not None:
-                        quote = get_quote(base_asset, quote=quote_asset, timestep=timestep_hint or "minute")
-                    else:
-                        quote = get_quote(base_asset, timestep=timestep_hint or "minute")
-                    quote_mark = _thetadata_quote_mark(quote)
-                    day_quote_mark = quote_mark
-                    if timestep_hint != "day":
-                        if quote_mark is not None:
-                            return quote_mark
-
-                    # Daily-cadence fallback: intraday quote snapshots are the most robust source
-                    # of option marks. Even when day quotes exist, they can be stale in some
-                    # provider/cache states; prefer snapshot mark when available.
-                    if timestep_hint == "day":
-                        # Only attempt snapshot-only lookup when it's safe to do so.
-                        #
-                        # Some unit tests (and custom sources) override `get_quote()` at the class
-                        # level and treat repeated calls as an error (or always return the same
-                        # quote object regardless of timestep). For bound methods, only the real
-                        # ThetaDataBacktestingPandas implementation is guaranteed to understand
-                        # `snapshot_only`. For non-bound callables (e.g., instance-level stubs used
-                        # by tests), allow the fallback.
-                        can_try_snapshot = True
-                        func = getattr(get_quote, "__func__", None)
-                        if func is not None and func is not ThetaDataBacktestingPandas.get_quote:
-                            can_try_snapshot = False
-                        if can_try_snapshot:
-                            quote_kwargs = {"timestep": "minute", "snapshot_only": True}
-                            if quote_asset is not None:
-                                quote = get_quote(base_asset, quote=quote_asset, **quote_kwargs)
-                            else:
-                                quote = get_quote(base_asset, **quote_kwargs)
-                            quote_mark = _thetadata_quote_mark(quote)
-                            if quote_mark is not None:
-                                return quote_mark
-
-                        # If snapshot probing failed, avoid forcing day-quote marks for established
-                        # positions when we already have a prior valid mark to forward-fill from.
-                        # This prevents stale day quotes from creating artificial intraday MTM cliffs.
-                        has_last_known_price = False
-                        try:
-                            has_last_known_price = base_asset in getattr(self, "_last_known_prices", {})
-                        except Exception:
-                            has_last_known_price = False
-
-                        if day_quote_mark is not None:
-                            if has_last_known_price:
-                                return None
-                            return day_quote_mark
-            except Exception as e:
-                self.logger.debug("ThetaData quote-mark lookup failed for %s: %s", base_asset, e)
-            return None
 
         if hasattr(source, "get_price_snapshot"):
             try:
@@ -1054,15 +941,9 @@ class _Strategy:
                     type(source).__name__,
                 )
             else:
-                # ThetaData backtests: options often have no prints, but NBBO quotes exist.
-                # Portfolio mark-to-market should use mark (mid) when bid/ask are available.
-                if is_thetadata_option_backtest:
-                    snapshot_price = self._pick_thetadata_option_mark_price(base_asset, snapshot)
-                else:
-                    snapshot_price = self._pick_snapshot_price(asset, snapshot)
-
-        if snapshot_price is not None:
-            return snapshot_price
+                snapshot_price = self._pick_snapshot_price(asset, snapshot)
+                if snapshot_price is not None:
+                    return snapshot_price
 
         get_last_price = getattr(source, "get_last_price", None)
         if callable(get_last_price):
@@ -1070,89 +951,11 @@ class _Strategy:
             if price is not None:
                 return price
 
-        # Quote fallback for options when OHLC is missing.
-        # Options often have sparse OHLC data (LEAPS may not trade for days),
-        # but bid/ask quotes from market makers are typically available.
-        # This calls get_quote() which loads minute-level quote data.
-        if hasattr(base_asset, 'asset_type') and base_asset.asset_type == 'option':
-            try:
-                get_quote = getattr(source, 'get_quote', None)
-                if callable(get_quote):
-                    quote = get_quote(base_asset, timestep=timestep_hint or "minute")
-                    if quote is not None:
-                        bid = getattr(quote, 'bid', None)
-                        ask = getattr(quote, 'ask', None)
-                        try:
-                            bid_val = float(bid) if bid is not None else None
-                            ask_val = float(ask) if ask is not None else None
-                        except (TypeError, ValueError):
-                            bid_val = None
-                            ask_val = None
-
-                        # IMPORTANT: Treat 0/negative bid/ask as "no actionable quote".
-                        # Returning 0 here causes positions to be valued at $0 and breaks
-                        # the forward-fill MTM fallback, producing sawtooth equity curves.
-                        if bid_val is None or ask_val is None:
-                            return None
-                        if bid_val <= 0 or ask_val <= 0:
-                            return None
-
-                        mid_price = (bid_val + ask_val) / 2
-                        if mid_price > 0:
-                            self.logger.debug(
-                                "Using quote mid-price %.4f for %s (bid=%.4f, ask=%.4f)",
-                                mid_price, base_asset, bid_val, ask_val
-                            )
-                            return mid_price
-            except Exception as e:
-                self.logger.debug("Quote fallback failed for %s: %s", base_asset, e)
-
         self.logger.warning(
             "Data source %s for asset %s does not provide get_last_price; returning None.",
             type(source).__name__,
             asset,
         )
-        return None
-
-    def _pick_thetadata_option_mark_price(self, option_asset: Asset, snapshot):
-        """ThetaData backtests: prefer mark (NBBO mid) for option MTM when available."""
-        if not snapshot:
-            return None
-
-        def _positive(value):
-            value = self._coerce_snapshot_price(value)
-            if value is None:
-                return None
-            try:
-                numeric = float(value)
-            except (TypeError, ValueError):
-                return None
-            if math.isnan(numeric) or numeric <= 0:
-                return None
-            return numeric
-
-        bid = _positive(snapshot.get("bid"))
-        ask = _positive(snapshot.get("ask"))
-        close = _positive(snapshot.get("close"))
-
-        if bid is not None and ask is not None:
-            return (bid + ask) / 2.0
-        if bid is not None:
-            return bid
-        if ask is not None:
-            return ask
-        if close is not None:
-            return close
-
-        expiry = getattr(option_asset, "expiration", None)
-        now_dt = getattr(self.broker, "datetime", None)
-        if expiry is not None and now_dt is not None:
-            try:
-                if now_dt.date() >= expiry:
-                    return 0.0
-            except Exception:
-                pass
-
         return None
 
     def _pick_snapshot_price(self, asset, snapshot):
@@ -1259,7 +1062,7 @@ class _Strategy:
     @staticmethod
     def _snapshot_stale_threshold_seconds():
         try:
-            return int(os.environ.get("THETADATA_MTM_STALE_SECONDS", "120"))
+            return int(os.environ.get("LUMIBOT_MTM_STALE_SECONDS", "120"))
         except (TypeError, ValueError):
             return 120
 
@@ -1480,86 +1283,12 @@ class _Strategy:
             # is at the start of the day, so the graph cuts short. This may be needed
             # for other timeframes as well
             backtesting_end_adjusted = self._backtesting_end
-            try:
-                from lumibot.backtesting.routed_backtesting import RoutedBacktestingPandas
-            except Exception:
-                RoutedBacktestingPandas = None  # type: ignore[misc,assignment]
-
-            # If we are using the polgon data source, then get the benchmark returns from polygon
-            if type(self.broker.data_source) == PolygonDataBacktesting:
-                benchmark_asset = self._benchmark_asset
-                # If the benchmark asset is a string, then convert it to an Asset object
-                if isinstance(benchmark_asset, str):
-                    benchmark_asset = Asset(benchmark_asset)
-
-                timestep = "minute"
-                # If the strategy sleeptime is in days then use daily data, eg. "1D"
-                if "D" in str(self._sleeptime).upper():
-                    timestep = "day"
-                elif "H" in str(self._sleeptime).upper():
-                    timestep = "hour"
-
-                bars = self.broker.data_source.get_historical_prices_between_dates(
-                    benchmark_asset,
-                    timestep,
-                    start_date=self._backtesting_start,
-                    end_date=backtesting_end_adjusted,
-                    quote=self._quote_asset,
-                )
-    
-                if isinstance(bars, (Data, Bars)):
-                    df = bars.df
-                else:
-                    df = bars
-
-                # Add returns column
-                if hasattr(df, 'select'):  # Polars DataFrame
-                    df = df.with_columns(pl.col("close").pct_change().alias("return"))
-                    # Add the symbol_cumprod column for polars
-                    df = df.with_columns((1 + pl.col("return")).cum_prod().alias("symbol_cumprod"))
-                else:  # Pandas DataFrame
-                    df["return"] = df["close"].pct_change(fill_method=None)
-                    # Add the symbol_cumprod column for pandas
-                    df["symbol_cumprod"] = (1 + df["return"]).cumprod()
-
-                self._benchmark_returns_df = df
-
-            # For data sources of type CCXT, benchmark_asset gets bechmark_asset from the CCXT backtest data source.
-            elif self.broker.data_source.SOURCE.upper() == "CCXT":
-                benchmark_asset = self._benchmark_asset
-                # If the benchmark asset is a string, then convert it to an Asset object
-                if isinstance(benchmark_asset, str):
-                    asset_quote = benchmark_asset.split("/")
-                    if len(asset_quote) == 2:
-                        benchmark_asset = (Asset(symbol=asset_quote[0], asset_type="crypto"),
-                                           Asset(symbol=asset_quote[1], asset_type="crypto"))
-                    else:
-                        benchmark_asset = Asset(symbol=benchmark_asset, asset_type="crypto")
-
-                timestep = "minute"
-                # If the strategy sleeptime is in days then use daily data, eg. "1D"
-                if "D" in str(self._sleeptime).upper():
-                    timestep = "day"
-
-                bars = self.broker.data_source.get_historical_prices_between_dates(
-                    benchmark_asset,
-                    timestep,
-                    start_date=self._backtesting_start,
-                    end_date=backtesting_end_adjusted,
-                    quote=self._quote_asset,
-                )
-                df = bars.df
-
-                # Add the symbol_cumprod column
-                df["symbol_cumprod"] = (1 + df["return"]).cumprod()
-
-                self._benchmark_returns_df = df
 
             # IBKR backtests:
             # - For crypto benchmarks, prefer the IBKR data source (Yahoo crypto tickers are inconsistent).
             # - For equity benchmarks (e.g., SPY), prefer Yahoo to avoid IBKR history flakiness impacting
             #   tearsheet generation (benchmark is cosmetic; strategy stats are authoritative).
-            elif str(getattr(self.broker.data_source, "SOURCE", "") or "").upper() == "INTERACTIVEBROKERSREST":
+            if str(getattr(self.broker.data_source, "SOURCE", "") or "").upper() == "INTERACTIVEBROKERSREST":
                 def _fallback_benchmark_from_strategy() -> None:
                     """Fallback: use the strategy equity curve as a benchmark so tearsheets remain available."""
                     try:
@@ -1631,71 +1360,6 @@ class _Strategy:
                 df = bars.df
                 if df is None or df.empty or "close" not in df.columns:
                     self.logger.error(f"IBKR benchmark bars empty/invalid: {benchmark_asset}")
-                    _fallback_benchmark_from_strategy()
-                    return
-                df = df.copy()
-                df["return"] = df["close"].pct_change(fill_method=None)
-                df["symbol_cumprod"] = (1 + df["return"]).cumprod()
-                self._benchmark_returns_df = df
-
-            # Router backtests (prod-like Theta+IBKR routing):
-            # Prefer the routed data source over Yahoo so benchmarks remain cacheable and don't
-            # require external network access (Yahoo can be rate-limited and slow).
-            elif RoutedBacktestingPandas is not None and isinstance(self.broker.data_source, RoutedBacktestingPandas):
-                def _fallback_benchmark_from_strategy() -> None:
-                    """Fallback: use the strategy equity curve as a benchmark so tearsheets remain available."""
-                    try:
-                        if self._strategy_returns_df is None or self._strategy_returns_df.empty:
-                            return
-                        if "portfolio_value" not in self._strategy_returns_df.columns:
-                            return
-                        series = self._strategy_returns_df["portfolio_value"].astype(float).copy()
-                        first = float(series.dropna().iloc[0]) if not series.dropna().empty else None
-                        if first is None or first == 0:
-                            return
-                        bench = pd.DataFrame(index=self._strategy_returns_df.index)
-                        bench["return"] = series.pct_change(fill_method=None)
-                        bench["symbol_cumprod"] = (1 + bench["return"]).cumprod()
-                        self._benchmark_returns_df = bench
-                        self.logger.warning(
-                            "Router benchmark bars unavailable; using strategy equity curve as benchmark for tearsheet generation."
-                        )
-                    except Exception:
-                        return
-
-                benchmark_asset = self._benchmark_asset
-                if isinstance(benchmark_asset, str):
-                    parts = [p.strip() for p in benchmark_asset.split("/") if p.strip()]
-                    if len(parts) == 2:
-                        benchmark_asset = (
-                            Asset(symbol=parts[0], asset_type="crypto"),
-                            Asset(symbol=parts[1], asset_type="forex"),
-                        )
-                    else:
-                        # Keep behavior consistent with Yahoo benchmarks: use daily series.
-                        benchmark_asset = Asset(symbol=benchmark_asset, asset_type="stock")
-
-                # Use daily bars for benchmark across intraday strategies to keep tearsheet cost bounded.
-                timestep = "day"
-
-                try:
-                    bars = self.broker.data_source.get_historical_prices_between_dates(
-                        benchmark_asset,
-                        timestep,
-                        start_date=self._backtesting_start,
-                        end_date=backtesting_end_adjusted,
-                        quote=self._quote_asset,
-                    )
-                except Exception:
-                    bars = None
-
-                if bars is None or getattr(bars, "df", None) is None:
-                    self.logger.error(f"Couldn't get benchmark bars from Router data source: {benchmark_asset}")
-                    _fallback_benchmark_from_strategy()
-                    return
-                df = bars.df
-                if df is None or df.empty or "close" not in df.columns:
-                    self.logger.error(f"Router benchmark bars empty/invalid: {benchmark_asset}")
                     _fallback_benchmark_from_strategy()
                     return
                 df = df.copy()
@@ -2198,42 +1862,26 @@ class _Strategy:
         # datasource_class argument was provided.
         env_override_raw = os.environ.get("BACKTESTING_DATA_SOURCE")
         env_override_name = None
-        env_override_routing = None
 
         if env_override_raw is not None:
             trimmed = env_override_raw.strip()
             if trimmed and trimmed.lower() != "none":
-                if trimmed.startswith("{") and trimmed.endswith("}"):
-                    try:
-                        parsed = json.loads(trimmed)
-                    except Exception:
-                        parsed = None
-                    if isinstance(parsed, dict):
-                        env_override_name = "router"
-                        env_override_routing = parsed
-                    else:
-                        env_override_name = trimmed.lower()
-                else:
-                    env_override_name = trimmed.lower()
+                if trimmed.startswith("{"):
+                    raise ValueError(
+                        "JSON routing maps are not supported in this equity-only build. "
+                        "Set BACKTESTING_DATA_SOURCE to one of: 'yahoo', 'alpaca', 'ibkr'."
+                    )
+                env_override_name = trimmed.lower()
         elif datasource_class is None:
-            # No override provided and no class in code – fall back to the default
-            # configured in credentials (ThetaData unless the project overrides it).
             env_override_name = _DEFAULT_BACKTESTING_DATA_SOURCE.lower()
 
         if env_override_name is not None:
             datasource_map = {
-                "polygon": PolygonDataBacktesting,
-                "thetadata": ThetaDataBacktesting,
                 "yahoo": YahooDataBacktesting,
                 "alpaca": AlpacaBacktesting,
-                "ccxt": CcxtBacktesting,
-                "databento": DataBentoDataBacktesting,
                 "ibkr": InteractiveBrokersRESTBacktesting,
                 "interactivebrokersrest": InteractiveBrokersRESTBacktesting,
                 "interactive_brokers_rest": InteractiveBrokersRESTBacktesting,
-                "router": RoutedBacktestingPandas,
-                "thetadata_ibkr": RoutedBacktestingPandas,
-                "theta_ibkr": RoutedBacktestingPandas,
             }
 
             if env_override_name not in datasource_map:
@@ -2244,19 +1892,6 @@ class _Strategy:
                 )
 
             datasource_class = datasource_map[env_override_name]
-
-            if env_override_routing is not None:
-                if config is None:
-                    config = {}
-                if isinstance(config, dict):
-                    merged = dict(config)
-                    merged["backtesting_data_routing"] = env_override_routing
-                    config = merged
-                else:
-                    try:
-                        setattr(config, "backtesting_data_routing", env_override_routing)
-                    except Exception:
-                        pass
 
             label = env_override_raw or _DEFAULT_BACKTESTING_DATA_SOURCE
             get_logger(__name__).info(colored(
@@ -2269,49 +1904,14 @@ class _Strategy:
                 "or pass datasource_class when calling backtest()."
             )
 
-        # Make sure polygon_api_key is set if using PolygonDataBacktesting
-        polygon_api_key = polygon_api_key if polygon_api_key is not None else POLYGON_API_KEY
-        if datasource_class.__name__ == 'PolygonDataBacktesting' and polygon_api_key is None:
-            raise ValueError(
-                "Please set `POLYGON_API_KEY` to your API key from polygon.io as an environment variable if "
-                "you are using PolygonDataBacktesting. If you don't have one, you can get a free API key "
-                "from https://polygon.io/."
-            )
-
-        # Make sure thetadata_username and thetadata_password are set if using ThetaDataBacktesting
-        if thetadata_username is None or thetadata_password is None:
-            # Try getting the Theta Data credentials from credentials
-            thetadata_username = THETADATA_CONFIG.get('THETADATA_USERNAME')
-            thetadata_password = THETADATA_CONFIG.get('THETADATA_PASSWORD')
-
-            # Check again if theta data username and pass are set (before checking dict)
-            if datasource_class.__name__ == 'ThetaDataBacktesting' and (thetadata_username is None or thetadata_password is None):
-                raise ValueError(
-                    "Please set `thetadata_username` and `thetadata_password` in the backtest() function if "
-                    "you are using ThetaDataBacktesting. If you don't have one, you can do registeration "
-                    "from https://www.thetadata.net/."
-                )
-
-        # check if datasource_class is a class or a dictionary
+        # dict-based multi-provider routing (options/stock split) is not supported
         if isinstance(datasource_class, dict):
-            optionsource_class = datasource_class["OPTION"]
-            datasource_class = datasource_class["STOCK"]
-            # check if optionsource_class and datasource_class are the same type of class
-            if optionsource_class == datasource_class:
-                use_other_option_source = False
-            else:
-                use_other_option_source = True
-
-            # Check ThetaData credentials for optionsource_class after dict extraction
-            if optionsource_class.__name__ == 'ThetaDataBacktesting' and (thetadata_username is None or thetadata_password is None):
-                raise ValueError(
-                    "Please set `thetadata_username` and `thetadata_password` in the backtest() function if "
-                    "you are using ThetaDataBacktesting. If you don't have one, you can do registeration "
-                    "from https://www.thetadata.net/."
-                )
-        else:
-            optionsource_class = None
-            use_other_option_source = False
+            raise NotImplementedError(
+                "Multi-provider datasource routing (dict with 'STOCK'/'OPTION' keys) is not supported "
+                "in this equity-only build. Pass a single datasource class directly."
+            )
+        optionsource_class = None
+        use_other_option_source = False
 
         # Make a string with 6 random numbers/letters (upper and lowercase) to avoid overwriting
         random_string = "".join(random.choices(string.ascii_letters + string.digits, k=6))
@@ -2346,15 +1946,6 @@ class _Strategy:
 
         self.verify_backtest_inputs(backtesting_start, backtesting_end)
 
-        # Make sure polygon_api_key is set if using PolygonDataBacktesting
-        polygon_api_key = polygon_api_key if polygon_api_key is not None else POLYGON_API_KEY
-        if datasource_class == PolygonDataBacktesting and polygon_api_key is None:
-            raise ValueError(
-                "Please set `POLYGON_API_KEY` to your API key from polygon.io as an environment variable if "
-                "you are using PolygonDataBacktesting. If you don't have one, you can get a free API key "
-                "from https://polygon.io/."
-            )
-
         alpaca_api_key = kwargs.get('alpaca_api_key', None) if kwargs.get('alpaca_api_key', None) is not None else ALPACA_CONFIG["API_KEY"]
         alpaca_secret_key = kwargs.get('alpaca_secret_key', None) if kwargs.get('alpaca_secret_key', None) is not None else ALPACA_CONFIG["API_SECRET"]
         if datasource_class == AlpacaBacktesting and (alpaca_api_key is None and alpaca_secret_key is None):
@@ -2363,20 +1954,6 @@ class _Strategy:
                 "as an environment variable if you are using AlpacaBacktesting. If you don't have one, you can get a free API key "
                 "from https://alpaca.markets/."
             )            
-        # Make sure thetadata_username and thetadata_password are set if using ThetaDataBacktesting
-        if thetadata_username is None or thetadata_password is None:
-            # Try getting the Theta Data credentials from credentials
-            thetadata_username = THETADATA_CONFIG.get('THETADATA_USERNAME')
-            thetadata_password = THETADATA_CONFIG.get('THETADATA_PASSWORD')
-            
-            # Check again if theta data username and pass are set
-            if (thetadata_username is None or thetadata_password is None) and (datasource_class == ThetaDataBacktesting or optionsource_class == ThetaDataBacktesting):
-                raise ValueError(
-                    "Please set `thetadata_username` and `thetadata_password` in the backtest() function if "
-                    "you are using ThetaDataBacktesting. If you don't have one, you can do registeration "
-                    "from https://www.thetadata.net/."
-                )
-
         if not self.IS_BACKTESTABLE:
             get_logger(__name__).warning(f"Strategy {name + ' ' if name is not None else ''}cannot be " f"backtested at the moment")
             return None
@@ -2409,20 +1986,7 @@ class _Strategy:
 
         self._trader = trader_class(logfile=logfile, backtest=True, quiet_logs=quiet_logs)
 
-        if datasource_class.__name__ == 'PolygonDataBacktesting':
-            data_source = datasource_class(
-                backtesting_start,
-                backtesting_end,
-                config=config,
-                auto_adjust=auto_adjust,
-                api_key=polygon_api_key,
-                pandas_data=pandas_data,
-                show_progress_bar=show_progress_bar,
-                max_memory=POLYGON_MAX_MEMORY_BYTES,
-                log_backtest_progress_to_file=LOG_BACKTEST_PROGRESS_TO_FILE,
-                **kwargs,
-            )
-        elif datasource_class == AlpacaBacktesting:
+        if datasource_class == AlpacaBacktesting:
             if all(k in kwargs.keys() for k in ["alpaca_api_key", "alpaca_secret_key"]):
                 api_key = kwargs.pop('alpaca_api_key')
                 secret_key =  kwargs.pop("alpaca_secret_key")
@@ -2441,22 +2005,6 @@ class _Strategy:
                 pandas_data=pandas_data,
                 max_memory=ALPACA_MAX_MEMORY_BYTES,
                 **kwargs
-            )
-        elif issubclass(datasource_class, ThetaDataBacktestingPandas) or (
-            optionsource_class and issubclass(optionsource_class, ThetaDataBacktestingPandas)
-        ):
-            data_source = datasource_class(
-                backtesting_start,
-                backtesting_end,
-                config=config,
-                auto_adjust=auto_adjust,
-                username=thetadata_username,
-                password=thetadata_password,
-                pandas_data=pandas_data,
-                use_quote_data=use_quote_data,
-                show_progress_bar=show_progress_bar,
-                log_backtest_progress_to_file=LOG_BACKTEST_PROGRESS_TO_FILE,
-                **kwargs,
             )
         elif datasource_class == InteractiveBrokersRESTBacktesting:
             data_source = datasource_class(
@@ -2489,8 +2037,6 @@ class _Strategy:
                 backtesting_end,
                 config=config,
                 auto_adjust=auto_adjust,
-                username=thetadata_username,
-                password=thetadata_password,
                 pandas_data=pandas_data,
                 show_progress_bar=show_progress_bar,
                 **kwargs,

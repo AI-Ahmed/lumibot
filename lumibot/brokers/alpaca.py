@@ -660,7 +660,7 @@ class Alpaca(Broker):
         Submit a multi-leg (MLeg) options order to Alpaca.
 
         Note:
-        - Tradier uses "credit" for net credit (receive premium) and "debit" for net debit (pay premium).
+        - Alpaca uses net credit/debit semantics for certain multi-leg order types.
         - Alpaca only supports "market" and "limit" for multi-leg orders.
         - We convert "credit", "debit", and "even" to "limit" for Alpaca, as both are limit orders in Alpaca's API.
         - The sign of the limit price (positive/negative) is not used by Alpaca to distinguish credit/debit.
@@ -668,7 +668,7 @@ class Alpaca(Broker):
         """
         requested_multileg_type = order_type if order_type in ("credit", "debit", "even") else None
 
-        # Convert Tradier-specific order types to Alpaca-supported types
+        # Convert broker-specific order types to Alpaca-supported types
         if requested_multileg_type is not None:
             order_type = "limit"
         # All legs must have the same underlying symbol
@@ -1193,7 +1193,7 @@ class Alpaca(Broker):
         """
         This function is called every polling_interval for OAuth-only configurations.
         It checks for new orders and dispatches them to the stream for processing.
-        Similar to Tradier's polling implementation.
+        Similar to other brokers' polling implementations.
         """
         try:
             # Get the strategy from the broker's registered strategies
@@ -1367,7 +1367,7 @@ class Alpaca(Broker):
         """Run the broker stream - either polling or WebSocket streaming depending on authentication method"""
 
         if self.is_oauth_only:
-            # For OAuth-only, use polling approach like Tradier
+            # For OAuth-only, use polling instead of streaming.
             self._stream_established()
             try:
                 self.stream._run()
