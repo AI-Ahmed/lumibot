@@ -1,5 +1,17 @@
 # Changelog
 
+## 4.4.55 - 2026-07-08
+
+### Added
+- Tier 1 upstream cherry-picks: `replay_cache.py`, `runtime.py` (agents), `_lazy_imports.py`, BACKTESTING_START/END env override warnings, IBKR asset coercion, broker subscriber fix, order `to_dict()` identifier/avg_fill_price fields, daily last-price optimization scoped to IBKR.
+
+### Changed
+- `get_last_price()` daily-bar shortcut now gated by `_supports_daily_last_price_optimization()` (IBKR only in this fork).
+
+### Fixed
+- Restored equity-only `_strategy.py` / `strategy_executor.py` after cherry-pick conflict resolution accidentally pulled upstream forbidden-provider code.
+- Skipped upstream-only Tier 1 hunks that require full agents package or lazy-import `_strategy.py` refactor (not applicable to equity fork direct-import layout).
+
 ## 4.4.54 - 2026-07-08
 
 ### Added

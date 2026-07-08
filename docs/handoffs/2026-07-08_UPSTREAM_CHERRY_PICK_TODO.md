@@ -3,7 +3,7 @@
 One-line description: Actionable checklist and commit manifest for porting equity-safe upstream `Lumiwealth/lumibot` patches into this fork.
 
 Last Updated: 2026-07-08  
-Status: **OPEN** — 0/15 Tier 1, 0/17 Tier 2 applied  
+Status: **TIER 1 DONE** (with fork adaptations) — 0/17 Tier 2 applied  
 Audience: Contributors syncing from upstream  
 
 ## Overview
@@ -45,21 +45,21 @@ Apply in **chronological order** (oldest first). All files are equity-safe.
 
 | # | SHA | Subject | Files | Status |
 |---|-----|---------|-------|--------|
-| 1 | `82aa9bea` | fix: scope daily last-price optimization by datasource | `strategy.py` | ☐ |
-| 2 | `85f5b1db` | fix: sort imports in `_strategy.py` for ruff CI compliance | `_strategy.py` | ☐ |
-| 3 | `f61c19a5` | fix: add `replay_cache.py` (was excluded by `*cache*` gitignore) | `components/agents/replay_cache.py` | ☐ |
-| 4 | `f4ce122f` | fix: ruff import sort order for agents import in `_strategy.py` | `_strategy.py` | ☐ |
-| 5 | `0cf578fd` | Fix CI lint regression on hotfix branch | `_strategy.py` | ☐ |
-| 6 | `e3cb48fe` | fix(order): emit identifier and avg_fill_price in `to_dict()` | `entities/order.py` | ☐ |
-| 7 | `847fcbd9` | fix(strategy): warn loudly on BACKTESTING_START/END env override | `strategy.py` | ☐ |
-| 8 | `6375ad5f` | fix(ibkr): coerce bare-string asset to Asset in `get_price_data` | `tools/ibkr_helper.py` | ☐ |
-| 9 | `37469128` | feat(agents): suppress LiteLLM cosmetic provider-lookup banner | `components/agents/runtime.py` | ☐ |
-| 10 | `2917361e` | resolve subscriber | `brokers/broker.py` | ☐ |
-| 11 | `eeb7eb54` | fix: support asyncio timeout errors on py310 | `components/agents/runtime.py` | ☐ |
-| 12 | `8d67a579` | Tighten DeepSeek context pruning | `components/agents/runtime.py` | ☐ |
-| 13 | `2e37023c` | Collapse older DeepSeek tool history | `components/agents/runtime.py` | ☐ |
-| 14 | `8c6d6c08` | Remove unused scheduled timing adapter | `strategy_executor.py` | ☐ |
-| 15 | `588bb03c` | perf: reduce lazy class proxy overhead | `_lazy_imports.py`, `_strategy.py` | ☐ |
+| 1 | `82aa9bea` | fix: scope daily last-price optimization by datasource | `strategy.py` | ☑ (IBKR-only gate) |
+| 2 | `85f5b1db` | fix: sort imports in `_strategy.py` for ruff CI compliance | `_strategy.py` | ⊘ N/A (no AgentManager in fork) |
+| 3 | `f61c19a5` | fix: add `replay_cache.py` (was excluded by `*cache*` gitignore) | `components/agents/replay_cache.py` | ☑ |
+| 4 | `f4ce122f` | fix: ruff import sort order for agents import in `_strategy.py` | `_strategy.py` | ⊘ N/A |
+| 5 | `0cf578fd` | Fix CI lint regression on hotfix branch | `_strategy.py` | ⊘ N/A |
+| 6 | `e3cb48fe` | fix(order): emit identifier and avg_fill_price in `to_dict()` | `entities/order.py` | ☑ |
+| 7 | `847fcbd9` | fix(strategy): warn loudly on BACKTESTING_START/END env override | `strategy.py` | ☑ |
+| 8 | `6375ad5f` | fix(ibkr): coerce bare-string asset to Asset in `get_price_data` | `tools/ibkr_helper.py` | ☑ |
+| 9 | `37469128` | feat(agents): suppress LiteLLM cosmetic provider-lookup banner | `components/agents/runtime.py` | ☑ |
+| 10 | `2917361e` | resolve subscriber | `brokers/broker.py` | ☑ |
+| 11 | `eeb7eb54` | fix: support asyncio timeout errors on py310 | `components/agents/runtime.py` | ☑ |
+| 12 | `8d67a579` | Tighten DeepSeek context pruning | `components/agents/runtime.py` | ☑ |
+| 13 | `2e37023c` | Collapse older DeepSeek tool history | `components/agents/runtime.py` | ☑ |
+| 14 | `8c6d6c08` | Remove unused scheduled timing adapter | `strategy_executor.py` | ⊘ N/A (method absent in fork) |
+| 15 | `588bb03c` | perf: reduce lazy class proxy overhead | `_lazy_imports.py`, `_strategy.py` | ☑ partial (`_lazy_imports.py` only; fork uses direct imports) |
 
 ### Tier 1 blockers
 
@@ -126,11 +126,11 @@ git checkout <sha> -- lumibot/tools/ibkr_helper.py
 
 | Milestone | Target | Done |
 |-----------|--------|------|
-| Tier 1 complete | 15/15 cherry-picks | 0/15 |
+| Tier 1 complete | 15/15 cherry-picks | 11 applied, 4 N/A/partial (fork layout) |
 | Tier 2 P0 complete | 12/12 ports | 0/12 |
 | Tier 2 P1 complete | 5/5 ports | 0/5 |
-| Equity pytest subset green | 0 failures | — |
-| Handoff status → DONE | all boxes checked | — |
+| Equity pytest subset green | 0 failures | 40 passed (subset) |
+| Handoff status → DONE | all boxes checked | Tier 1 only |
 
 ---
 
