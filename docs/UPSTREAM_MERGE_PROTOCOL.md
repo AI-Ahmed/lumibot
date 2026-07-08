@@ -38,7 +38,8 @@ git rev-list --count HEAD..upstream/dev
 Read:
 1. `BROKER_DATA_SOURCE_INVENTORY.md`
 2. `docs/handoffs/2026-07-08_UPSTREAM_MERGE_EQUITY_FILTER.md`
-3. `.cursor/rules/equity-only-fork.mdc`
+3. `docs/handoffs/2026-07-08_UPSTREAM_CHERRY_PICK_TODO.md` — Tier 1/2 commit manifest
+4. `.cursor/rules/equity-only-fork.mdc`
 
 ---
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## 4.4.54 - 2026-07-08
+
+### Added
+- `docs/handoffs/2026-07-08_UPSTREAM_CHERRY_PICK_TODO.md` — Tier 1 (15 ACCEPT) and Tier 2 (17 REVIEW) upstream commit manifest with per-file port/skip guidance.
+- `scripts/upstream_cherry_pick_todo.sh` — CLI tool to list, status-check, and batch cherry-pick equity-safe upstream commits (`status`, `list`, `show`, `cherry-pick tier1`).
+
+### Changed
+- Documented upstream sync gap: fork is 735 commits behind `upstream/dev` (v4.5.74); 15 pure ACCEPT and 17 high-value REVIEW patches identified for porting per equity-only rules.
+
 ## 4.4.53 - 2026-07-08
 
 ### Removed
