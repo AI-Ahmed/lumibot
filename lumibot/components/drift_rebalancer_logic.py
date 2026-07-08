@@ -458,15 +458,8 @@ class DriftOrderLogic:
                         side="sell",
                     )
                     sell_orders.append(order)
-                elif quantity > 0 and current_qty > 0:
-                    # Trim-only path when shorting is disabled.
-                    order = self.place_order(
-                        base_asset=base_asset,
-                        quantity=quantity,
-                        limit_price=limit_price,
-                        side="sell",
-                    )
-                    sell_orders.append(order)
+                # When shorting is disabled and quantity > 0 remains after closing
+                # the long, we have no inventory left to sell — skip silently.
 
         if not self.strategy.is_backtesting:
             # Sleep to allow sell orders to fill
