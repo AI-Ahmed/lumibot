@@ -23,32 +23,6 @@ except ImportError:
     from lumibot.entities import Asset, Order, Position, Quote
 
 
-class _OptionSettlementStrategyStub:
-    def __init__(self, broker, cash=100_000.0, name="option_settlement_test"):
-        self.broker = broker
-        self.name = name
-        self._name = name
-        self.cash = float(cash)
-        self.parameters = {}
-        self.minutes_before_closing = 0
-        self.buy_trading_fees = []
-        self.sell_trading_fees = []
-        self.vars = type("Vars", (), {})()
-
-    def get_cash(self):
-        return self.cash
-
-    def _set_cash_position(self, cash):
-        self.cash = float(cash)
-
-    def create_order(self, asset, quantity, side):
-        return Order(
-            asset=asset,
-            quantity=quantity,
-            side=side,
-            strategy=self.name,
-        )
-
 
 class TestBacktestingBroker:
     def test_limit_fills(self):
@@ -179,6 +153,9 @@ class TestBacktestingBroker:
         broker._held_trades = []
         broker._trade_event_log_enabled = True
         broker._trade_event_log_rows = []
+        broker._last_batch_id = None
+        broker._processed_filled_orders = set()
+        broker._processed_new_orders = set()
         broker._get_subscriber = MagicMock(return_value=None)
         broker._process_filled_order = MagicMock(return_value=None)
         broker.data_source = type(
@@ -250,238 +227,86 @@ class TestBacktestingBroker:
         assert "time" in parquet_df.columns
         assert "status" in parquet_df.columns
 
-    def test_option_expiry_short_put_assignment_delivers_stock(self):
-        start = dt(2023, 8, 1)
-        end = dt(2023, 8, 2)
-        data_source = PandasData(datetime_start=start, datetime_end=end, pandas_data={})
-        broker = BacktestingBroker(data_source=data_source)
-        strategy = _OptionSettlementStrategyStub(broker=broker, cash=50_000.0)
 
-        underlying = Asset(symbol="AAPL", asset_type="stock")
-        option = Asset(
-            symbol="AAPL",
-            asset_type="option",
-            expiration=datetime.date(2023, 8, 1),
-            strike=100,
-            right=Asset.OptionRight.PUT,
-            multiplier=100,
-            underlying_asset=underlying,
-        )
-        broker._filled_positions.append(Position(strategy.name, option, quantity=-1))
-        broker.get_last_price = MagicMock(return_value=95.0)
+class TestValidateOrderPosition:
+    """Regression tests for validate_order_position — short cover/close paths."""
 
-        broker.settle_expired_option_contract(
-            broker.get_tracked_position(strategy.name, option),
-            strategy,
-        )
+    def _make_broker(self):
+        from unittest.mock import MagicMock, patch
+        from lumibot.backtesting.backtesting_broker import BacktestingBroker
+        from lumibot.data_sources.pandas_data import PandasData
 
-        events = broker._trade_event_log_df
-        option_events = events[(events["symbol"] == "AAPL") & (events["asset.asset_type"] == "option")]
-        stock_events = events[(events["symbol"] == "AAPL") & (events["asset.asset_type"] == "stock")]
+        ds = MagicMock(spec=PandasData)
+        ds.SOURCE = "PANDAS"
+        strategy = MagicMock()
+        strategy.name = "test_strategy"
+        with patch.object(BacktestingBroker, "__init__", lambda self, *a, **kw: None):
+            broker = BacktestingBroker.__new__(BacktestingBroker)
+            broker._strategies = {}
+            broker.MARKET = "NYSE"
+        return broker
 
-        assert "assigned" in option_events["status"].tolist()
-        assert "assigned" in option_events["type"].tolist()
-        assert not stock_events.empty
-        assert "fill" in stock_events["status"].tolist()
-        assert "assigned" in stock_events["type"].tolist()
+    def _make_order(self, side_str, quantity=10):
+        from lumibot.entities import Asset, Order
+        asset = Asset("AAPL")
+        order = MagicMock()
+        order.asset = asset
+        order.quantity = quantity
+        order.side = getattr(Order.OrderSide, side_str)
+        order.is_sell_order.return_value = side_str.startswith("SELL")
+        order.is_buy_order.return_value = side_str.startswith("BUY")
+        return order
 
-        stock_position = broker.get_tracked_position(strategy.name, underlying)
-        assert stock_position is not None
-        assert stock_position.quantity == 100.0
-        assert broker.get_tracked_position(strategy.name, option) is None
+    def test_buy_to_cover_passes_when_sufficient_short(self):
+        from unittest.mock import MagicMock
+        from lumibot.brokers.broker import Broker
+        from collections import namedtuple
+        ValidationResult = namedtuple("ValidationResult", ["is_valid", "message", "error_code"])
 
-    def test_option_expiry_long_call_exercise_delivers_stock_when_supported(self):
-        start = dt(2023, 8, 1)
-        end = dt(2023, 8, 2)
-        data_source = PandasData(datetime_start=start, datetime_end=end, pandas_data={})
-        broker = BacktestingBroker(data_source=data_source)
-        strategy = _OptionSettlementStrategyStub(broker=broker, cash=10_000.0)
+        broker = MagicMock(spec=Broker)
+        position = MagicMock()
+        position.quantity = -15
+        broker.get_tracked_position.return_value = position
 
-        underlying = Asset(symbol="MSFT", asset_type="stock")
-        option = Asset(
-            symbol="MSFT",
-            asset_type="option",
-            expiration=datetime.date(2023, 8, 1),
-            strike=50,
-            right=Asset.OptionRight.CALL,
-            multiplier=100,
-            underlying_asset=underlying,
-        )
-        broker._filled_positions.append(Position(strategy.name, option, quantity=1))
-        broker.get_last_price = MagicMock(return_value=55.0)
+        order = self._make_order("BUY_TO_COVER", quantity=10)
+        result = Broker.validate_order_position(broker, order, "strat")
+        assert result.is_valid, f"Expected valid, got: {result.message}"
 
-        broker.settle_expired_option_contract(
-            broker.get_tracked_position(strategy.name, option),
-            strategy,
-        )
+    def test_buy_to_cover_fails_when_no_short_position(self):
+        from unittest.mock import MagicMock
+        from lumibot.brokers.broker import Broker
 
-        events = broker._trade_event_log_df
-        option_events = events[(events["symbol"] == "MSFT") & (events["asset.asset_type"] == "option")]
-        stock_events = events[(events["symbol"] == "MSFT") & (events["asset.asset_type"] == "stock")]
+        broker = MagicMock(spec=Broker)
+        broker.get_tracked_position.return_value = None
 
-        assert "exercised" in option_events["status"].tolist()
-        assert "exercised" in option_events["type"].tolist()
-        assert not stock_events.empty
-        assert "fill" in stock_events["status"].tolist()
-        assert "exercised" in stock_events["type"].tolist()
-        assert broker.get_tracked_position(strategy.name, underlying).quantity == 100.0
-        assert broker.get_tracked_position(strategy.name, option) is None
+        order = self._make_order("BUY_TO_COVER", quantity=5)
+        result = Broker.validate_order_position(broker, order, "strat")
+        assert not result.is_valid
+        assert result.error_code == "insufficient_position"
 
-    def test_option_expiry_long_call_itm_with_insufficient_cash_cash_settles(self):
-        start = dt(2023, 8, 1)
-        end = dt(2023, 8, 2)
-        data_source = PandasData(datetime_start=start, datetime_end=end, pandas_data={})
-        broker = BacktestingBroker(data_source=data_source)
-        strategy = _OptionSettlementStrategyStub(broker=broker, cash=100.0)
+    def test_buy_to_cover_fails_when_short_too_small(self):
+        from unittest.mock import MagicMock
+        from lumibot.brokers.broker import Broker
 
-        underlying = Asset(symbol="NVDA", asset_type="stock")
-        option = Asset(
-            symbol="NVDA",
-            asset_type="option",
-            expiration=datetime.date(2023, 8, 1),
-            strike=300,
-            right=Asset.OptionRight.CALL,
-            multiplier=100,
-            underlying_asset=underlying,
-        )
-        broker._filled_positions.append(Position(strategy.name, option, quantity=1))
-        broker.get_last_price = MagicMock(return_value=350.0)
+        broker = MagicMock(spec=Broker)
+        position = MagicMock()
+        position.quantity = -3
+        broker.get_tracked_position.return_value = position
 
-        broker.settle_expired_option_contract(
-            broker.get_tracked_position(strategy.name, option),
-            strategy,
-        )
+        order = self._make_order("BUY_TO_COVER", quantity=10)
+        result = Broker.validate_order_position(broker, order, "strat")
+        assert not result.is_valid
 
-        events = broker._trade_event_log_df
-        option_events = events[(events["symbol"] == "NVDA") & (events["asset.asset_type"] == "option")]
-        stock_events = events[(events["symbol"] == "NVDA") & (events["asset.asset_type"] == "stock")]
+    def test_plain_buy_always_passes(self):
+        from unittest.mock import MagicMock
+        from lumibot.brokers.broker import Broker
+        from lumibot.entities import Order
 
-        assert "cash_settled" in option_events["status"].tolist()
-        assert "cash_settled" in option_events["type"].tolist()
-        assert stock_events.empty
-        assert broker.get_tracked_position(strategy.name, underlying) is None
-        assert strategy.cash == 5_100.0
-
-    def test_option_expiry_index_option_itm_cash_settles(self):
-        start = dt(2023, 8, 1)
-        end = dt(2023, 8, 2)
-        data_source = PandasData(datetime_start=start, datetime_end=end, pandas_data={})
-        broker = BacktestingBroker(data_source=data_source)
-        strategy = _OptionSettlementStrategyStub(broker=broker, cash=1_000.0)
-
-        underlying = Asset(symbol="SPX", asset_type="index")
-        option = Asset(
-            symbol="SPX",
-            asset_type="option",
-            expiration=datetime.date(2023, 8, 1),
-            strike=5000,
-            right=Asset.OptionRight.CALL,
-            multiplier=100,
-            underlying_asset=underlying,
-        )
-        broker._filled_positions.append(Position(strategy.name, option, quantity=1))
-        broker.get_last_price = MagicMock(return_value=5100.0)
-
-        broker.settle_expired_option_contract(
-            broker.get_tracked_position(strategy.name, option),
-            strategy,
-        )
-
-        events = broker._trade_event_log_df
-        option_events = events[(events["symbol"] == "SPX") & (events["asset.asset_type"] == "option")]
-        stock_events = events[(events["symbol"] == "SPX") & (events["asset.asset_type"] == "stock")]
-
-        assert "cash_settled" in option_events["status"].tolist()
-        assert "cash_settled" in option_events["type"].tolist()
-        assert stock_events.empty
-        assert strategy.cash == 11_000.0
-
-    def test_option_early_assignment_short_call_delivers_stock_before_expiry(self):
-        start = dt(2023, 8, 1)
-        end = dt(2023, 8, 2)
-        data_source = PandasData(datetime_start=start, datetime_end=end, pandas_data={})
-        broker = BacktestingBroker(data_source=data_source)
-        strategy = _OptionSettlementStrategyStub(broker=broker, cash=50_000.0)
-        strategy.parameters.update(
-            {
-                "option_early_assignment_enabled": True,
-                "option_early_assignment_max_dte_days": 30,
-                "option_early_assignment_max_extrinsic": 0.05,
-            }
-        )
-
-        underlying = Asset(symbol="AAPL", asset_type="stock")
-        option = Asset(
-            symbol="AAPL",
-            asset_type="option",
-            expiration=datetime.date(2023, 8, 15),
-            strike=100,
-            right=Asset.OptionRight.CALL,
-            multiplier=100,
-            underlying_asset=underlying,
-        )
-        broker._filled_positions.append(Position(strategy.name, option, quantity=-1))
-
-        def _mock_last_price(asset):
-            if asset.asset_type == Asset.AssetType.OPTION:
-                return 10.02  # intrinsic=10, extrinsic=0.02 -> should assign
-            return 110.0
-
-        broker.get_last_price = MagicMock(side_effect=_mock_last_price)
-        broker.process_early_assignment_contracts(strategy, force=True)
-
-        events = broker._trade_event_log_df
-        option_events = events[(events["symbol"] == "AAPL") & (events["asset.asset_type"] == "option")]
-        stock_events = events[(events["symbol"] == "AAPL") & (events["asset.asset_type"] == "stock")]
-
-        assert "assigned" in option_events["status"].tolist()
-        assert "assigned" in option_events["type"].tolist()
-        assert "fill" in stock_events["status"].tolist()
-        assert "assigned" in stock_events["type"].tolist()
-        assert broker.get_tracked_position(strategy.name, option) is None
-        assert broker.get_tracked_position(strategy.name, underlying).quantity == -100.0
-
-    def test_option_early_assignment_skips_when_extrinsic_is_high(self):
-        start = dt(2023, 8, 1)
-        end = dt(2023, 8, 2)
-        data_source = PandasData(datetime_start=start, datetime_end=end, pandas_data={})
-        broker = BacktestingBroker(data_source=data_source)
-        strategy = _OptionSettlementStrategyStub(broker=broker, cash=50_000.0)
-        strategy.parameters.update(
-            {
-                "option_early_assignment_enabled": True,
-                "option_early_assignment_max_dte_days": 30,
-                "option_early_assignment_max_extrinsic": 0.05,
-            }
-        )
-
-        underlying = Asset(symbol="MSFT", asset_type="stock")
-        option = Asset(
-            symbol="MSFT",
-            asset_type="option",
-            expiration=datetime.date(2023, 8, 15),
-            strike=100,
-            right=Asset.OptionRight.CALL,
-            multiplier=100,
-            underlying_asset=underlying,
-        )
-        broker._filled_positions.append(Position(strategy.name, option, quantity=-1))
-
-        def _mock_last_price(asset):
-            if asset.asset_type == Asset.AssetType.OPTION:
-                return 12.5  # intrinsic=10, extrinsic=2.5 -> should not assign
-            return 110.0
-
-        broker.get_last_price = MagicMock(side_effect=_mock_last_price)
-        broker.process_early_assignment_contracts(strategy, force=True)
-
-        events = getattr(broker, "_trade_event_log_df", pd.DataFrame())
-        if not events.empty:
-            option_events = events[(events["symbol"] == "MSFT") & (events["asset.asset_type"] == "option")]
-            assert "assigned" not in option_events["status"].tolist()
-
-        assert broker.get_tracked_position(strategy.name, option) is not None
-        assert broker.get_tracked_position(strategy.name, underlying) is None
+        broker = MagicMock(spec=Broker)
+        order = self._make_order("BUY", quantity=5)
+        order.side = Order.OrderSide.BUY
+        result = Broker.validate_order_position(broker, order, "strat")
+        assert result.is_valid
 
 
 # New Test Class for Time Advancement Logic

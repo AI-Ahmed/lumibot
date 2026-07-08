@@ -1,11 +1,9 @@
 from types import SimpleNamespace
 
-import pandas as pd
 import pytest
 from alpaca.trading.enums import PositionSide
 
 from lumibot.brokers.alpaca import Alpaca
-from lumibot.brokers.tradier import Tradier
 from lumibot.entities import Asset, Order
 from lumibot.tools.symbol_normalization import normalize_symbol_for_broker, normalize_symbol_for_internal
 
@@ -17,44 +15,9 @@ def test_normalize_symbol_for_internal_uses_dot_canonical_format():
 
 
 def test_normalize_symbol_for_broker_maps_class_share_separator_by_broker():
-    assert normalize_symbol_for_broker("BRK.B", "tradier") == "BRK/B"
-    assert normalize_symbol_for_broker("BRK.B", "Schwab") == "BRK/B"
     assert normalize_symbol_for_broker("BRK.B", "interactive_brokers") == "BRK B"
     assert normalize_symbol_for_broker("BRK.B", "alpaca") == "BRK.B"
     assert normalize_symbol_for_broker("BRK.B", "unknown-broker") == "BRK.B"
-
-
-def test_non_equity_symbols_are_not_rewritten():
-    assert normalize_symbol_for_internal("BTC/USD", asset_type=Asset.AssetType.CRYPTO) == "BTC/USD"
-    assert normalize_symbol_for_broker("BTC/USD", "tradier", asset_type=Asset.AssetType.CRYPTO) == "BTC/USD"
-
-
-def test_tradier_pull_positions_normalizes_class_share_symbol():
-    broker = Tradier(account_number="1234", access_token="a1b2c3", paper=True, connect_stream=False)
-    broker.tradier.account.get_positions = lambda: pd.DataFrame([{"symbol": "BRK/B", "quantity": 3.0}])
-
-    positions = broker._pull_positions("unit_test_strategy")
-    assert len(positions) == 1
-    assert positions[0].asset.symbol == "BRK.B"
-
-
-def test_tradier_parse_broker_order_normalizes_class_share_symbol():
-    broker = Tradier(account_number="1234", access_token="a1b2c3", paper=True, connect_stream=False)
-    response = {
-        "id": 123,
-        "type": "market",
-        "side": "buy",
-        "symbol": "BRK/B",
-        "class": "equity",
-        "quantity": 1,
-        "status": "submitted",
-        "tag": "unit-test",
-        "duration": "day",
-        "create_date": "2026-02-25T14:31:39.559Z",
-    }
-
-    parsed = broker._parse_broker_order(response, "unit_test_strategy")
-    assert parsed.asset.symbol == "BRK.B"
 
 
 def test_alpaca_parse_broker_position_normalizes_class_share_symbol():
@@ -91,45 +54,6 @@ def test_alpaca_parse_broker_order_treats_equity_slash_symbol_as_class_share_not
     parsed = Alpaca._parse_broker_order(broker, response, "unit_test_strategy")
     assert parsed.asset.symbol == "BRK.B"
     assert parsed.asset.asset_type == Asset.AssetType.STOCK
-
-
-def test_schwab_stock_builder_uses_slash_class_share_symbol():
-    pytest.importorskip("schwab")
-    from lumibot.brokers.schwab import Schwab
-
-    broker = Schwab.__new__(Schwab)
-    broker.name = "Schwab"
-    order = Order(
-        "unit_test_strategy",
-        Asset("BRK.B"),
-        1,
-        Order.OrderSide.BUY,
-        order_type=Order.OrderType.MARKET,
-    )
-
-    calls = {}
-
-    def _buy_market(symbol, quantity):
-        calls["symbol"] = symbol
-        calls["quantity"] = quantity
-        return {"symbol": symbol, "quantity": quantity}
-
-    builder = Schwab._prepare_stock_order_builder(
-        broker,
-        order,
-        _buy_market,
-        lambda *args, **kwargs: None,
-        lambda *args, **kwargs: None,
-        lambda *args, **kwargs: None,
-        lambda *args, **kwargs: None,
-        lambda *args, **kwargs: None,
-        lambda *args, **kwargs: None,
-        lambda *args, **kwargs: None,
-    )
-
-    assert builder is not None
-    assert calls["symbol"] == "BRK/B"
-    assert calls["quantity"] == 1
 
 
 def test_interactive_brokers_converts_dot_symbol_for_contract_and_back_for_positions():

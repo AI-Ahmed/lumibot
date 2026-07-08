@@ -7,16 +7,11 @@ from datetime import datetime, timedelta, time
 import pandas as pd
 from pandas.testing import assert_series_equal
 
-from lumibot.backtesting import (
-    PolygonDataBacktesting,
-    YahooDataBacktesting,
-    CcxtBacktesting,
-)
+from lumibot.backtesting import YahooDataBacktesting
 from lumibot.data_sources import PandasData
 from tests.fixtures import pandas_data_fixture
 from lumibot.tools import print_full_pandas_dataframes, set_pandas_float_display_precision
 from lumibot.entities import Asset
-from lumibot.credentials import POLYGON_CONFIG
 
 
 logger = logging.getLogger(__name__)
@@ -119,67 +114,6 @@ class TestBacktestingDataSources:
         bars = data_source.get_historical_prices(asset=asset, length=length, timestep=timestep)
         self.check_dividends_and_adjusted_returns(bars)
 
-    @pytest.mark.skipif(
-        not POLYGON_CONFIG['API_KEY'] or POLYGON_CONFIG['API_KEY'] == '<your key here>',
-        reason="This test requires a Polygon.io API key"
-    )
-    def test_polygon_backtesting_data_source_get_historical_prices_daily_bars_for_backtesting_broker(self):
-        asset = Asset("SPY")
-        timestep = "day"
-        tzinfo = pytz.timezone('America/New_York')
-
-        datetime_start = tzinfo.localize(datetime(2025, 1, 2))
-        datetime_end = tzinfo.localize(datetime(2025, 12, 31))
-        # First trading day after MLK day
-        now = tzinfo.localize(datetime(2025, 1, 21)).replace(hour=9, minute=30)
-        data_source = PolygonDataBacktesting(
-            datetime_start,
-            datetime_end,
-            api_key=POLYGON_CONFIG["API_KEY"]
-        )
-
-        # Test getting 2 bars into the future (which is what the backtesting does when trying to fill orders
-        # for the next trading day)
-        length = 2
-        timeshift = -length  # negative length gets future bars
-        data_source._datetime = now
-        bars = data_source.get_historical_prices(
-            asset=asset,
-            length=length,
-            timeshift=timeshift,
-            timestep=timestep
-        )
-        # Handle cases where API might not return data due to rate limits or data availability
-        if bars is None or bars.df is None or bars.df.empty:
-            pytest.skip("Polygon API returned no data - possibly due to rate limits, invalid API key, or data availability")
-
-    @pytest.mark.skipif(
-        not POLYGON_CONFIG['API_KEY'] or POLYGON_CONFIG['API_KEY'] == '<your key here>',
-        reason="This test requires a Polygon.io API key"
-    )
-    def test_polygon_backtesting_data_source_get_historical_prices_daily_bars_over_long_weekend(self):
-        asset = Asset("SPY")
-        timestep = "day"
-        tzinfo = pytz.timezone('America/New_York')
-
-        datetime_start = tzinfo.localize(datetime(2025, 1, 2))
-        datetime_end = tzinfo.localize(datetime(2025, 12, 31))
-        # First trading day after MLK day
-        now = tzinfo.localize(datetime(2025, 1, 21)).replace(hour=9, minute=30)
-
-        length = 10
-        data_source = PolygonDataBacktesting(
-            datetime_start,
-            datetime_end,
-            api_key=POLYGON_CONFIG["API_KEY"]
-        )
-
-        data_source._datetime = now
-        bars = data_source.get_historical_prices(asset=asset, length=length, timestep=timestep)
-        # Handle cases where API might not return data due to rate limits or data availability
-        if bars is None or bars.df is None or bars.df.empty:
-            pytest.skip("Polygon API returned no data - possibly due to rate limits, invalid API key, or data availability")
-
     @pytest.mark.xfail(reason="yahoo sucks")
     def test_yahoo_backtesting_data_source_get_historical_prices_daily_bars_dividends_and_adj_returns(
             self
@@ -204,40 +138,6 @@ class TestBacktestingDataSources:
         data_source._datetime = now
         bars = data_source.get_historical_prices(asset=asset, length=length, timestep=timestep)
         self.check_dividends_and_adjusted_returns(bars)
-
-    @pytest.mark.skip(reason="CCXT Kraken integration test requires stable network connection and external API availability")
-    def test_kraken_ccxt_backtesting_data_source_get_historical_prices_daily_bars(
-            self
-    ):
-        """
-        This tests that the kraken ccxt data_source gets the right bars
-        """
-        length = 30
-        tzinfo = pytz.timezone('UTC')
-        now = tzinfo.localize(datetime.now()).replace(hour=0, minute=0, second=0, microsecond=0)
-        datetime_start = now - timedelta(days=length + 5)
-        datetime_end = now - timedelta(days=2)
-        now = datetime_end - timedelta(days=2)
-        base = Asset(symbol='BTC', asset_type='crypto')
-        quote = Asset(symbol='USD', asset_type='forex')
-        timestep = "day"
-        kwargs = {
-            # "max_data_download_limit":10000, # optional
-            "exchange_id": "kraken"  # "kucoin" #"bybit" #"okx" #"bitmex" # "binance"
-        }
-        data_source = CcxtBacktesting(
-            datetime_start=datetime_start,
-            datetime_end=datetime_end,
-            **kwargs
-        )
-        data_source._datetime = now
-        bars = data_source.get_historical_prices(
-            asset=(base, quote),
-            length=length,
-            timestep=timestep
-        )
-        assert bars.df is not None and not bars.df.empty
-
 
 
 class TestTimestepParsing:

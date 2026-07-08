@@ -12,14 +12,13 @@ from lumibot.example_strategies.drift_rebalancer import DriftRebalancer
 from lumibot.components.drift_rebalancer_logic import DriftType
 from lumibot.components.drift_rebalancer_logic import DriftRebalancerLogic, DriftCalculationLogic, DriftOrderLogic
 from decimal import Decimal
-from lumibot.backtesting import BacktestingBroker, PandasDataBacktesting, YahooDataBacktesting, PolygonDataBacktesting, \
-    AlpacaBacktesting
+from lumibot.backtesting import BacktestingBroker, PandasDataBacktesting, YahooDataBacktesting, AlpacaBacktesting
 from lumibot.strategies.strategy import Strategy
 from lumibot.traders import Trader
 from tests.fixtures import pandas_data_fixture
 from lumibot.tools import print_full_pandas_dataframes, set_pandas_float_display_precision
 from lumibot.entities import Order, Asset, TradingFee
-from lumibot.credentials import ALPACA_TEST_CONFIG, POLYGON_CONFIG
+from lumibot.credentials import ALPACA_TEST_CONFIG
 from lumibot.components.drift_rebalancer_logic import get_last_price_or_raise
 from lumibot.tools.helpers import quantize_to_num_decimals
 
@@ -105,8 +104,7 @@ class MockStrategyWithDriftCalculationLogic(Strategy):
         return Decimal(100.0)  # Mock price
 
     def get_portfolio_value(self) -> float:
-        # Default implementation that matches most test expectations
-        return self.default_portfolio  # Can be overridden in individual tests
+        return self._portfolio_value
 
     def update_broker_balances(self, force_update: bool = False) -> None:
         pass
@@ -200,7 +198,6 @@ class TestDriftCalculationLogic:
         mocker.patch.object(DriftCalculationLogic, "_add_positions", mock_add_positions)
         # Mock portfolio value to return the sum of current values (1500+1000+800=3300)
         strategy.portfolio_value = 3300.0
-        mocker.patch.object(strategy, "get_portfolio_value", return_value=strategy.portfolio_value)
 
         df = strategy.drift_rebalancer_logic.calculate(portfolio_weights=portfolio_weights)
 
@@ -265,7 +262,6 @@ class TestDriftCalculationLogic:
         mocker.patch.object(DriftCalculationLogic, "_add_positions", mock_add_positions)
         # Mock portfolio value to return the sum of current values (400+400+200=1000)
         strategy.portfolio_value = 1000.0
-        mocker.patch.object(strategy, "get_portfolio_value", return_value=strategy.portfolio_value)
 
         df = strategy.drift_rebalancer_logic.calculate(portfolio_weights=portfolio_weights)
         # print(f"/n{df[['symbol', 'current_weight', 'target_weight', 'drift']]}")
@@ -330,7 +326,6 @@ class TestDriftCalculationLogic:
         mocker.patch.object(DriftCalculationLogic, "_add_positions", mock_add_positions)
         # Mock portfolio value to return the sum of current values (1500+1000+800=3300)
         strategy.portfolio_value = 3300.0
-        mocker.patch.object(strategy, "get_portfolio_value", return_value=strategy.portfolio_value)
 
         df = strategy.drift_rebalancer_logic.calculate(portfolio_weights=portfolio_weights)
 
@@ -395,7 +390,6 @@ class TestDriftCalculationLogic:
         mocker.patch.object(DriftCalculationLogic, "_add_positions", mock_add_positions)
         # Mock portfolio value to return the sum of current values (1500+1000+800=3300)
         strategy.portfolio_value = 3300.0
-        mocker.patch.object(strategy, "get_portfolio_value", return_value=strategy.portfolio_value)
 
         df = strategy.drift_rebalancer_logic.calculate(portfolio_weights=portfolio_weights)
 
@@ -464,7 +458,6 @@ class TestDriftCalculationLogic:
         mocker.patch.object(DriftCalculationLogic, "_add_positions", mock_add_positions)
         # Mock portfolio value to return the sum of current values (1500+1000+800=3300)
         strategy.portfolio_value = 3300.0
-        mocker.patch.object(strategy, "get_portfolio_value", return_value=strategy.portfolio_value)
 
         df = strategy.drift_rebalancer_logic.calculate(portfolio_weights=portfolio_weights)
 
@@ -531,7 +524,6 @@ class TestDriftCalculationLogic:
         mocker.patch.object(DriftCalculationLogic, "_add_positions", mock_add_positions)
         # Mock portfolio value to return the sum of current values (1500+1000+800=3300)
         strategy.portfolio_value = 3300.0
-        mocker.patch.object(strategy, "get_portfolio_value", return_value=strategy.portfolio_value)
 
         df = strategy.drift_rebalancer_logic.calculate(portfolio_weights=portfolio_weights)
 
@@ -604,7 +596,6 @@ class TestDriftCalculationLogic:
         mocker.patch.object(DriftCalculationLogic, "_add_positions", mock_add_positions)
         # Mock portfolio value to return the sum of all current values (1000+1500+1000+800=4300)
         strategy.portfolio_value = 4300.0
-        mocker.patch.object(strategy, "get_portfolio_value", return_value=strategy.portfolio_value)
 
         df = strategy.drift_rebalancer_logic.calculate(portfolio_weights=portfolio_weights)
 
@@ -678,7 +669,6 @@ class TestDriftCalculationLogic:
         mocker.patch.object(DriftCalculationLogic, "_add_positions", mock_add_positions)
         # Mock portfolio value to return the sum of all current values (1000+1500+1000+800=4300)
         strategy.portfolio_value = 4300.0
-        mocker.patch.object(strategy, "get_portfolio_value", return_value=strategy.portfolio_value)
 
         df = strategy.drift_rebalancer_logic.calculate(portfolio_weights=portfolio_weights)
 
@@ -745,7 +735,6 @@ class TestDriftCalculationLogic:
         mocker.patch.object(DriftCalculationLogic, "_add_positions", mock_add_positions)
         # Mock portfolio value to return the sum of current values (0+500+500=1000)
         strategy.portfolio_value = 1000.0
-        mocker.patch.object(strategy, "get_portfolio_value", return_value=strategy.portfolio_value)
 
         df = strategy.drift_rebalancer_logic.calculate(portfolio_weights=portfolio_weights)
 
@@ -784,7 +773,6 @@ class TestDriftCalculationLogic:
         mocker.patch.object(DriftCalculationLogic, "_add_positions", mock_add_positions)
         # Mock portfolio value to return the sum of current values (1000+0=1000)
         strategy.portfolio_value = 1000.0
-        mocker.patch.object(strategy, "get_portfolio_value", return_value=strategy.portfolio_value)
 
         df = strategy.drift_rebalancer_logic.calculate(portfolio_weights=portfolio_weights)
 
@@ -825,7 +813,6 @@ class TestDriftCalculationLogic:
         mocker.patch.object(DriftCalculationLogic, "_add_positions", mock_add_positions)
         # Mock portfolio value to return the sum of current values (1500+(-550)=950)
         strategy.portfolio_value = 950.0
-        mocker.patch.object(strategy, "get_portfolio_value", return_value=strategy.portfolio_value)
 
         df = strategy.drift_rebalancer_logic.calculate(portfolio_weights=portfolio_weights)
         assert df["current_weight"].tolist() == [Decimal('-0.5789473684210526315789473684'),
@@ -872,7 +859,6 @@ class TestDriftCalculationLogic:
         mocker.patch.object(DriftCalculationLogic, "_add_positions", mock_add_positions)
         # Mock portfolio value to return the sum of current values (0+500+500=1000)
         strategy.portfolio_value = 1000.0
-        mocker.patch.object(strategy, "get_portfolio_value", return_value=strategy.portfolio_value)
 
         df = strategy.drift_rebalancer_logic.calculate(portfolio_weights=portfolio_weights)
 
@@ -912,7 +898,6 @@ class TestDriftCalculationLogic:
         mocker.patch.object(DriftCalculationLogic, "_add_positions", mock_add_positions)
         # Mock portfolio value to return the sum of current values (1000+0=1000)
         strategy.portfolio_value = 1000.0
-        mocker.patch.object(strategy, "get_portfolio_value", return_value=strategy.portfolio_value)
 
         df = strategy.drift_rebalancer_logic.calculate(portfolio_weights=portfolio_weights)
 
@@ -951,7 +936,6 @@ class TestDriftCalculationLogic:
         mocker.patch.object(DriftCalculationLogic, "_add_positions", mock_add_positions)
         # Mock portfolio value to return the sum of current values (1000+0=1000)
         strategy.portfolio_value = 1000.0
-        mocker.patch.object(strategy, "get_portfolio_value", return_value=strategy.portfolio_value)
 
         df = strategy.drift_rebalancer_logic.calculate(portfolio_weights=portfolio_weights)
 
@@ -1921,86 +1905,6 @@ class TestDriftRebalancer:
         assert filled_orders.iloc[1]["type"] == "limit"
         assert filled_orders.iloc[1]["side"] == "buy"
         assert filled_orders.iloc[1]["symbol"] == "ETH-USD"
-
-    # @pytest.mark.skip()
-    @pytest.mark.skipif(
-        not POLYGON_CONFIG["API_KEY"],
-        reason="This test requires a Polygon.io API key"
-    )
-    @pytest.mark.skipif(
-        POLYGON_CONFIG['API_KEY'] == '<your key here>',
-        reason="This test requires a Polygon.io API key"
-    )
-    def test_crypto_50_50_with_polygon(self):
-        parameters = {
-            "market": "24/7",
-            "sleeptime": "1D",
-            "drift_type": DriftType.ABSOLUTE,
-            "drift_threshold": "0.03",
-            "order_type": Order.OrderType.LIMIT,
-            "acceptable_slippage": "0.005",
-            "fill_sleeptime": 15,
-            "portfolio_weights": [
-                {
-                    "base_asset": Asset(symbol='BTC', asset_type='crypto'),
-                    "weight": Decimal("0.5")
-                },
-                {
-                    "base_asset": Asset(symbol='ETH', asset_type='crypto'),
-                    "weight": Decimal("0.5")
-                }
-            ],
-            "shorting": False,
-            "fractional_shares": True
-        }
-
-        # Expensive polygon subscriptions required if we go back to 2019. Just use recent dates.
-        end_date = datetime.now() - timedelta(days=1)
-        start_date = end_date - timedelta(days=5)
-
-        def _fake_polygon(api_key, asset, start_datetime, end_datetime, timespan="day", quote_asset=None, **kwargs):
-            tz = start_datetime.tzinfo or pytz.timezone("America/New_York")
-            freq = {"minute": "min", "hour": "H", "day": "D"}.get(timespan, "D")
-            index = pd.date_range(start_datetime, end_datetime, freq=freq, tz=tz)
-            if index.empty:
-                index = pd.DatetimeIndex([pd.Timestamp(start_datetime, tz=tz)])
-            base = pd.Series(range(len(index)), index=index).astype(float)
-            data = {
-                "open": 200 + base,
-                "high": 201 + base,
-                "low": 199 + base,
-                "close": 200.5 + base,
-                "volume": 1000 + base * 10,
-            }
-            return pd.DataFrame(data, index=index)
-
-        strat_obj: Strategy
-        with patch(
-                "lumibot.backtesting.polygon_backtesting.polygon_helper.get_price_data_from_polygon",
-                side_effect=_fake_polygon,
-        ):
-            results, strat_obj = DriftRebalancer.run_backtest(
-                datasource_class=PolygonDataBacktesting,
-                polygon_api_key=POLYGON_CONFIG["API_KEY"],
-                backtesting_start=start_date,
-                backtesting_end=end_date,
-                parameters=parameters,
-                benchmark_asset=None,
-                analyze_backtest=False,
-                show_progress_bar=False,
-            )
-
-        trades_df = strat_obj.broker._trade_event_log_df
-
-        # Get all the filled limit orders
-        filled_orders = trades_df[(trades_df["status"] == "fill")]
-
-        assert filled_orders.iloc[0]["type"] == "limit"
-        assert filled_orders.iloc[0]["side"] == "buy"
-        assert filled_orders.iloc[0]["symbol"] == "BTC"
-        assert filled_orders.iloc[1]["type"] == "limit"
-        assert filled_orders.iloc[1]["side"] == "buy"
-        assert filled_orders.iloc[1]["symbol"] == "ETH"
 
     @pytest.mark.skipif(
         not ALPACA_TEST_CONFIG['API_KEY'] or ALPACA_TEST_CONFIG['API_KEY'] == '<your key here>',

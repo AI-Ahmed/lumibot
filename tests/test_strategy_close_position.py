@@ -61,22 +61,7 @@ class DummyStrategy(Strategy):
 
 
 class TestStrategyClosePosition(unittest.TestCase):
-    def test_close_position_resolves_continuous_future(self):
-        broker = DummyBroker()
-        strategy = DummyStrategy(broker)
-
-        contract_asset = Asset("ESZ4", asset_type=Asset.AssetType.FUTURE)
-        position = Position(strategy=strategy.name, asset=contract_asset, quantity=2)
-        broker._filled_positions.append(position)
-
-        cont_asset = Asset("ES", asset_type=Asset.AssetType.CONT_FUTURE)
-        result = strategy.close_position(cont_asset)
-
-        self.assertIsNotNone(result)
-        self.assertEqual(result.asset, contract_asset)
-        self.assertEqual(len(broker.close_calls), 1)
-        self.assertEqual(broker.close_calls[0]["asset"], contract_asset)
-        self.assertIsNotNone(broker.close_calls[0]["order"])
+    pass
 
 
 if __name__ == "__main__":

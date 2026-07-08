@@ -170,15 +170,16 @@ class TestHftIndicatorsRegression:
         genuinely different SR from the information-driven track.
         """
         np.random.seed(42)
-        # Create realistic strategy and benchmark data
-        dates = pd.date_range("2020-01-01", periods=50, freq="B")
+        # Intraday strategy bars — aligned track resamples to daily, info track keeps bar structure
+        idx = pd.date_range("2020-01-01 09:30", periods=50, freq="15min")
         strategy_df = pd.DataFrame({
             'portfolio_value': 100 * (1 + np.random.randn(50) * 0.01).cumprod()
-        }, index=dates)
+        }, index=idx)
 
-        # Benchmark with different pattern
+        # Daily benchmark with different pattern
+        dates = pd.date_range("2020-01-01", periods=10, freq="B")
         benchmark_df = pd.DataFrame({
-            'symbol_cumprod': 100 * (1 + np.random.randn(50) * 0.008).cumprod()
+            'symbol_cumprod': 100 * (1 + np.random.randn(10) * 0.008).cumprod()
         }, index=dates)
 
         analyzer = DualTrackAnalyzer(strategy_df, benchmark_df, 'volume')

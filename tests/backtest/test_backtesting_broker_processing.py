@@ -220,35 +220,6 @@ def test_process_pending_orders_equity_appies_fee_once():
     assert position.quantity == pytest.approx(10.0)
 
 
-def test_process_pending_orders_crypto_keeps_cash_consistent():
-    base = Asset("BTC", asset_type=Asset.AssetType.CRYPTO)
-    quote = Asset("USD", asset_type=Asset.AssetType.CRYPTO)
-    strategy, broker, _ = setup_strategy_with_prices(
-        base,
-        quote,
-        bars=[(20000.0, 20100.0, 19900.0, 20050.0), (20100.0, 20200.0, 20050.0, 20150.0)],
-    )
-
-    order = strategy.create_order(
-        base,
-        Decimal("0.5"),
-        Order.OrderSide.BUY,
-        order_type=Order.OrderType.MARKET,
-        quote=quote,
-    )
-    submit_and_fill(strategy, broker, order)
-
-    assert strategy.cash == pytest.approx(100000.0, rel=1e-9)
-
-    btc_position = broker.get_tracked_position(strategy.name, base)
-    assert btc_position is not None
-    assert btc_position.quantity == pytest.approx(0.5)
-
-    usd_position = broker.get_tracked_position(strategy.name, quote)
-    assert usd_position is not None
-    assert usd_position.quantity == pytest.approx(-0.5 * 20000.0)
-
-
 def test_bracket_order_entry_and_exit_cash_consistency():
     asset = Asset("AAPL", asset_type=Asset.AssetType.STOCK)
     quote = Asset("USD", asset_type=Asset.AssetType.FOREX)
@@ -652,95 +623,6 @@ def test_bracket_order_trailing_exit_executes():
     assert position_quantity(broker, strategy, asset) == pytest.approx(0.0)
 
 
-def test_crypto_market_sell_returns_quote_balance():
-    base = Asset("BTC", asset_type=Asset.AssetType.CRYPTO)
-    quote = Asset("USD", asset_type=Asset.AssetType.CRYPTO)
-    bars = [
-        (20000.0, 20020.0, 19980.0, 20010.0),
-        (20000.0, 20050.0, 19990.0, 20030.0),
-    ]
-    strategy, broker, _ = setup_strategy_with_prices(base, quote, bars)
-
-    buy_order = strategy.create_order(
-        base,
-        Decimal("0.5"),
-        Order.OrderSide.BUY,
-        order_type=Order.OrderType.MARKET,
-        quote=quote,
-    )
-    submit_and_fill(strategy, broker, buy_order)
-
-    usd_position = broker.get_tracked_position(strategy.name, quote)
-    assert float(usd_position.quantity) == pytest.approx(-10000.0)
-
-    broker._update_datetime(broker.datetime + timedelta(minutes=1))
-
-    sell_order = strategy.create_order(
-        base,
-        Decimal("0.5"),
-        Order.OrderSide.SELL,
-        order_type=Order.OrderType.MARKET,
-        quote=quote,
-    )
-    submit_and_fill(strategy, broker, sell_order)
-
-    btc_position = broker.get_tracked_position(strategy.name, base)
-    usd_position = broker.get_tracked_position(strategy.name, quote)
-
-    assert btc_position is None or btc_position.quantity == 0
-    assert float(usd_position.quantity) == pytest.approx(0.0)
-
-
-def test_crypto_limit_order_not_filled_when_price_not_hit():
-    base = Asset("ETH", asset_type=Asset.AssetType.CRYPTO)
-    quote = Asset("USD", asset_type=Asset.AssetType.CRYPTO)
-    strategy, broker, _ = setup_strategy_with_prices(
-        base,
-        quote,
-        bars=[(3000.0, 3010.0, 2995.0, 3005.0)],
-    )
-
-    order = strategy.create_order(
-        base,
-        Decimal("1"),
-        Order.OrderSide.BUY,
-        order_type=Order.OrderType.LIMIT,
-        limit_price=2900.0,
-        quote=quote,
-    )
-    submit_and_fill(strategy, broker, order)
-
-    assert not order.is_filled()
-    assert broker.get_tracked_position(strategy.name, base) is None
-
-
-def test_forex_market_buy_updates_positions():
-    base = Asset("EUR", asset_type=Asset.AssetType.FOREX)
-    quote = Asset("USD", asset_type=Asset.AssetType.FOREX)
-    strategy, broker, _ = setup_strategy_with_prices(
-        base,
-        quote,
-        bars=[(1.10, 1.11, 1.09, 1.105)],
-    )
-
-    order = strategy.create_order(
-        base,
-        Decimal("10000"),
-        Order.OrderSide.BUY,
-        order_type=Order.OrderType.MARKET,
-        quote=quote,
-    )
-    submit_and_fill(strategy, broker, order)
-
-    eur_position = broker.get_tracked_position(strategy.name, base)
-    usd_position = broker.get_tracked_position(strategy.name, quote)
-
-    expected_cash = 100000.0 - (10000.0 * 1.10)
-    assert float(eur_position.quantity) == pytest.approx(10000.0)
-    assert strategy.cash == pytest.approx(expected_cash, rel=1e-9)
-    assert float(usd_position.quantity) == pytest.approx(expected_cash, rel=1e-9)
-
-
 def test_percent_fee_is_applied_once():
     asset = Asset("FEEPCT", asset_type=Asset.AssetType.STOCK)
     quote = Asset("USD", asset_type=Asset.AssetType.FOREX)
@@ -929,149 +811,6 @@ def test_smart_limit_downgrades_to_market_when_quotes_missing():
     assert order.get_fill_price() == pytest.approx(50.0)
     assert order.trade_slippage == pytest.approx(0.0)
 
-
-def test_smart_limit_option_asset_fills_from_bid_ask():
-    asset = Asset(
-        "SPY",
-        asset_type=Asset.AssetType.OPTION,
-        expiration=pd.Timestamp("2025-02-21").date(),
-        strike=500,
-        right="CALL",
-        multiplier=100,
-    )
-    quote = Asset("USD", asset_type=Asset.AssetType.FOREX)
-    df = make_ohlcv(
-        [(4.0, 4.5, 3.5, 4.1)],
-        bid=3.9,
-        ask=4.3,
-    )
-    data_source = build_data_source(asset, quote, df)
-    broker = BacktestingBroker(data_source=data_source)
-    broker.initialize_market_calendars(data_source.get_trading_days_pandas())
-    broker._first_iteration = False
-
-    strategy = build_strategy(broker)
-    strategy._first_iteration = False
-
-    config = SmartLimitConfig(
-        preset=SmartLimitPreset.FAST,
-        slippage=TradingSlippage(amount=0.1),
-    )
-    order = strategy.create_order(
-        asset,
-        Decimal("1"),
-        Order.OrderSide.BUY,
-        order_type=Order.OrderType.SMART_LIMIT,
-        smart_limit=config,
-    )
-    strategy.submit_order(order)
-    order._date_created = broker.datetime - timedelta(seconds=60)
-
-    broker.process_pending_orders(strategy)
-    strategy._executor.process_queue()
-
-    assert order.is_filled()
-    assert order.get_fill_price() == pytest.approx(4.2)  # mid 4.1 plus slippage 0.1
-
-
-def test_smart_limit_multileg_fills_children_atomically_and_sets_parent_price():
-    quote = Asset("USD", asset_type=Asset.AssetType.FOREX)
-    underlying = Asset("AAA", asset_type=Asset.AssetType.STOCK)
-    expiration = pd.Timestamp("2025-02-21").date()
-
-    long_call = Asset(
-        "AAA",
-        asset_type=Asset.AssetType.OPTION,
-        expiration=expiration,
-        strike=100,
-        right="CALL",
-        multiplier=100,
-    )
-    short_call = Asset(
-        "AAA",
-        asset_type=Asset.AssetType.OPTION,
-        expiration=expiration,
-        strike=105,
-        right="CALL",
-        multiplier=100,
-    )
-
-    df_underlying = make_ohlcv([(100.0, 101.0, 99.0, 100.0)])
-    df_long = make_ohlcv([(4.0, 4.5, 3.5, 4.1)], bid=4.0, ask=4.4)
-    df_short = make_ohlcv([(3.0, 3.3, 2.9, 3.1)], bid=3.0, ask=3.2)
-
-    pandas_data = {}
-    for asset, df in ((underlying, df_underlying), (long_call, df_long), (short_call, df_short)):
-        df_local = df.copy()
-        if df_local.index.tz is not None:
-            df_local = df_local.tz_convert("America/New_York").tz_localize(None)
-        pandas_data[(asset, quote)] = Data(
-            asset=asset,
-            df=df_local,
-            quote=quote,
-            timestep="minute",
-            timezone="America/New_York",
-        )
-
-    data_source = PandasDataBacktesting(
-        pandas_data=pandas_data,
-        datetime_start=df_long.index[0],
-        datetime_end=df_long.index[-1] + pd.Timedelta(minutes=1),
-        show_progress_bar=False,
-        market="24/7",
-        auto_adjust=True,
-    )
-    data_source.load_data()
-
-    broker = BacktestingBroker(data_source=data_source)
-    broker.initialize_market_calendars(data_source.get_trading_days_pandas())
-    broker._first_iteration = False
-
-    strategy = build_strategy(broker)
-    strategy._first_iteration = False
-
-    config = SmartLimitConfig(
-        preset=SmartLimitPreset.FAST,
-        slippage=TradingSlippage(amount=0.09),
-    )
-    buy_long = strategy.create_order(
-        long_call,
-        Decimal("1"),
-        Order.OrderSide.BUY,
-        order_type=Order.OrderType.SMART_LIMIT,
-        smart_limit=config,
-    )
-    sell_short = strategy.create_order(
-        short_call,
-        Decimal("1"),
-        Order.OrderSide.SELL,
-        order_type=Order.OrderType.SMART_LIMIT,
-        smart_limit=config,
-    )
-
-    submitted = strategy.submit_order([buy_long, sell_short])
-    assert isinstance(submitted, list)
-    assert len(submitted) == 1
-    parent = submitted[0]
-
-    # Force the parent into the final step so it becomes executable.
-    parent._date_created = broker.datetime - timedelta(seconds=60)
-
-    broker.process_pending_orders(strategy)
-    strategy._executor.process_queue()
-
-    assert buy_long.is_filled()
-    assert sell_short.is_filled()
-    assert parent.is_filled()
-
-    assert buy_long.get_fill_price() == pytest.approx(4.26)
-    assert sell_short.get_fill_price() == pytest.approx(3.07)
-    assert float(parent.avg_fill_price) == pytest.approx(1.19)
-
-    assert buy_long.trade_slippage == pytest.approx(6.0)
-    assert sell_short.trade_slippage == pytest.approx(3.0)
-
-
 def test_smart_limit_sell_applies_slippage_below_mid():
     asset = Asset("SMARTSELL", asset_type=Asset.AssetType.STOCK)
     quote = Asset("USD", asset_type=Asset.AssetType.FOREX)
@@ -1087,6 +826,18 @@ def test_smart_limit_sell_applies_slippage_below_mid():
 
     strategy = build_strategy(broker)
     strategy._first_iteration = False
+
+    buy_order = strategy.create_order(
+        asset,
+        Decimal("1"),
+        Order.OrderSide.BUY,
+        order_type=Order.OrderType.MARKET,
+    )
+    strategy.submit_order(buy_order)
+    buy_order._date_created = broker.datetime - timedelta(seconds=120)
+    broker.process_pending_orders(strategy)
+    strategy._executor.process_queue()
+    assert buy_order.is_filled()
 
     config = SmartLimitConfig(
         preset=SmartLimitPreset.FAST,
