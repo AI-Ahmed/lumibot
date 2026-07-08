@@ -72,16 +72,10 @@ IBKR backtests cache historical bars as Parquet:
 - Local: ``LUMIBOT_CACHE_FOLDER/ibkr/...``
 - Optional S3 mirroring: configured via the standard ``LUMIBOT_CACHE_*`` variables (see :ref:`environment_variables`).
 
-Multi-provider routing (Theta + IBKR)
--------------------------------------
+Multi-provider routing
+----------------------
 
-To use multiple providers in a single backtest (example: ThetaData for options/stocks/indexes and IBKR for futures/crypto), set a JSON mapping in ``BACKTESTING_DATA_SOURCE``:
-
-.. code-block:: bash
-
-   export BACKTESTING_DATA_SOURCE='{"default":"thetadata","stock":"thetadata","option":"thetadata","index":"thetadata","future":"ibkr","crypto":"ibkr"}'
-
-Routing values are case/whitespace/_/- insensitive. For crypto, you may also route to CCXT by using either ``"ccxt"`` (auto-select exchange) or a CCXT exchange id directly (for example: ``"coinbase"`` or ``"kraken"``).
+Multi-provider JSON routing (e.g., different sources per asset type) is not supported in this equity-focused build. Set ``BACKTESTING_DATA_SOURCE`` to a single provider: ``yahoo``, ``alpaca``, or ``ibkr``.
 
 Market Data Subscriptions (IBKR)
 --------------------------------

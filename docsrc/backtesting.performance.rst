@@ -33,7 +33,7 @@ Quick diagnosis checklist
 
 1. **Is the backtest downloading a lot of data?**
 
-   - Look for many “Submitted to queue” log lines (ThetaData) or repeated API calls (Polygon).
+   - Look for many “Submitted to queue” log lines or repeated API calls from your data provider.
    - If yes, you are hydration-bound: fix request fanout or cache coverage first.
 
 2. **Is the backtest slow even with near-zero downloads?**
@@ -72,25 +72,6 @@ Common performance-related flags:
 - ``LUMIBOT_DISABLE_DOTENV``: disables recursive ``.env`` discovery (reduces startup latency and avoids accidental config overrides)
 - ``SHOW_TEARSHEET`` / ``SHOW_PLOT`` / ``SHOW_INDICATORS``: disables heavy artifact generation when you only need core results
 - ``BACKTESTING_PROFILE``: enable profiling (yappi)
-
-ThetaData options: common performance pitfalls
-----------------------------------------------
-
-Options backtests can be slower than stock backtests because they may need:
-
-- option chains (expirations/strikes)
-- quote history (bid/ask) for realistic pricing
-- additional mark-to-market logic for illiquid contracts
-
-The fastest options backtests are those that:
-
-- build **only the chain data they need** (one expiry and a narrow strike neighborhood)
-- avoid probing hundreds/thousands of strikes when searching for a delta/ATM contract
-- reuse cached quote history instead of requesting tiny windows repeatedly
-
-In practice, the easiest way to get this right is to use :doc:`options_helper` for strike/expiry selection (for example ``OptionsHelper.find_strike_for_delta(...)``) instead of manually scanning chains and calling ``get_greeks()`` per strike.
-
-For ThetaData details, see :doc:`backtesting.thetadata`.
 
 Alpaca HFT trades backtesting
 -----------------------------

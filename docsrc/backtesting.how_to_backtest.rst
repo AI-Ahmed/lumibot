@@ -1,174 +1,68 @@
 How To Backtest
 ===================================
 
-Backtesting is a vital step in validating your trading strategies using historical data. With LumiBot, you can backtest strategies across various data sources such as **ThetaData** (our recommended vendor), **Polygon.io**, **Yahoo Finance**, or even your own custom **CSV** files. This guide will walk you through each step of backtesting, explain the data sources, and introduce the files that LumiBot generates during backtesting.
+Backtesting is a vital step in validating your trading strategies using historical data. With LumiBot, you can backtest **US equity and ETF** strategies using **Yahoo Finance** (default), **Alpaca**, **Interactive Brokers (REST)**, or your own **Pandas/CSV** datasets. This guide walks through setup, data-source selection, and the artifacts LumiBot generates during a backtest.
 
 .. note::
 
    **Why Backtest?**
-   
-   Backtesting allows you to see how your strategies would have performed in the past, helping you identify weaknesses or strengths before deploying them in live markets.
+
+   Backtesting lets you see how a strategy would have behaved historically before deploying it live.
 
 Installing LumiBot
 -----------------------------------
 
-Before you begin, make sure LumiBot is installed on your machine. You can install LumiBot using the following command:
-
-.. code-block:: bash
-
-    pip install lumibot
-
-To upgrade to the latest version of LumiBot, run:
+Install or upgrade LumiBot:
 
 .. code-block:: bash
 
     pip install lumibot --upgrade
 
-Once installed, you can use an IDE like **Visual Studio Code (VS Code)** or **PyCharm** to write and test your code.
-
-.. tip::
-
-   **Quick Setup for VS Code**
-   
-   1. Download and install **Visual Studio Code** from the official website: https://code.visualstudio.com/.
-   2. Open VS Code and install the Python extension by going to **Extensions** and searching for **Python**.
-   3. Create a new project folder for LumiBot.
-   4. Open a terminal in VS Code and install LumiBot using `pip install lumibot`.
-   5. You're ready to start backtesting with LumiBot!
+Use any Python IDE (VS Code, PyCharm, etc.) to author strategies.
 
 Choosing a Data Source
 -----------------------------------
 
-LumiBot supports several data sources for backtesting, each suited for different asset types and backtesting needs. Here's an overview of the available sources:
+This fork focuses on **equity backtesting**. Supported providers:
 
-**1. ThetaData (Recommended)**
+**1. Yahoo Finance (Default)**
 
-- Deep historical coverage for U.S. equities and options with SIP-quality filtering.
-- Offers free tiers plus paid plans with higher rate limits and multi-year history.
+- Free daily OHLCV for US stocks and ETFs.
+- Best for longer-horizon daily strategies.
+- Set ``BACKTESTING_DATA_SOURCE=yahoo`` or pass ``YahooDataBacktesting`` in code.
 
-.. important::
+See :ref:`Yahoo Backtesting <backtesting.yahoo>`.
 
-   **Get Your ThetaData Account**
+**2. Alpaca**
 
-   Sign up at `ThetaData <https://www.thetadata.net/>`_. Use the promo code ``BotSpot10`` for 10% off the first order—ThetaData uses this code to credit BotSpot for the referral.
+- Intraday and daily US equity data (requires Alpaca API credentials).
+- Useful when you already trade or paper-trade with Alpaca.
 
-For more details, see the :ref:`ThetaData Backtesting <backtesting.thetadata>` section.
+**3. Interactive Brokers (REST)**
 
-**2. Yahoo Finance**
+- IBKR Client Portal REST backtesting via the LumiBot data downloader.
+- Set ``BACKTESTING_DATA_SOURCE=ibkr`` (aliases: ``interactivebrokersrest``).
 
-- Free stock and ETF data for daily trading backtests.
-- Suitable for longer-term strategies but not ideal for intraday backtesting.
+See :ref:`Interactive Brokers Backtesting <backtesting.ibkr>`.
 
-For more details, see the :ref:`Yahoo Backtesting <backtesting.yahoo>` section.
+**4. Pandas (CSV or Custom Data)**
 
-**3. Polygon.io**
+- Bring your own minute/daily equity bars in CSV or DataFrame form.
+- Advanced setup; see :ref:`Pandas Backtesting <backtesting.pandas>`.
 
-- Offers intraday and end-of-day data for stocks, options, forex, and cryptocurrency.
-- Provides up to two years of free data; paid plans offer more advanced features and faster data retrieval.
-- Best suited for existing workflows; new LumiBot users should consider ThetaData first for the BotSpot10 promo and deeper coverage.
-
-For more details, see the :ref:`Polygon.io Backtesting <backtesting.polygon>` section.
-
-**4. Pandas (CSV or Other Custom Data)**
-
-- Allows for full flexibility by using your own custom datasets (e.g., CSV, database exports).
-- Ideal for advanced users but requires more manual configuration.
-
-For more details, see the :ref:`Pandas Backtesting <backtesting.pandas>` section.
-
-Running a Backtest with Polygon.io
+Running a Backtest with Yahoo
 -----------------------------------
 
-Once you've selected your data source and built your strategy, you can run your backtest using the `run_backtest` function. This function requires:
-
-- **Data source**: (e.g., Yahoo, Polygon.io, ThetaData, or Pandas)
-- **Start and end dates**: The period you want to test.
-- **Additional parameters**: Strategy-specific parameters.
-
-Here's an example of a backtest using **Polygon.io**:
-
-.. important::
-
-   **You Must Use Your Polygon.io API Key**
-
-   Make sure to replace `"YOUR_POLYGON_API_KEY"` with your actual API key from Polygon.io for the backtest to work.
+``run_backtest`` needs a datasource class (or ``BACKTESTING_DATA_SOURCE``), a date range, and optional parameters:
 
 .. code-block:: python
 
     from datetime import datetime
-    from lumibot.backtesting import PolygonDataBacktesting
+    from lumibot.backtesting import YahooDataBacktesting
     from lumibot.strategies import Strategy
 
     class MyStrategy(Strategy):
-        parameters = {
-            "symbol": "AAPL",
-        }
-
-        def initialize(self):
-            self.sleeptime = "1D"  # Sleep for 1 day between iterations
-
-        def on_trading_iteration(self):
-            if self.first_iteration:
-                symbol = self.parameters["symbol"]
-                price = self.get_last_price(symbol)
-                qty = self.portfolio_value / price
-                order = self.create_order(symbol, quantity=qty, side="buy")
-                self.submit_order(order)
-
-    if __name__ == "__main__":
-        polygon_api_key = "YOUR_POLYGON_API_KEY"  # Replace with your actual Polygon.io API key
-        backtesting_start = datetime(2025, 1, 1)
-        backtesting_end = datetime(2025, 5, 1)
-        result = MyStrategy.run_backtest(
-            PolygonDataBacktesting,
-            backtesting_start,
-            backtesting_end,
-            benchmark_asset="SPY",
-            polygon_api_key=polygon_api_key  # Pass the Polygon.io API key here
-        )
-
-Optional: Using Environment Variables for Backtest Configuration
------------------------------------------------------------------
-
-Instead of specifying `backtesting_start`, `backtesting_end`, and data sources in your code, you can set these environment variables:
-
-- ``IS_BACKTESTING``
-- ``BACKTESTING_START``
-- ``BACKTESTING_END``
-- ``BACKTESTING_DATA_SOURCE``
-
-If they are set, LumiBot will automatically pick them up. For example:
-
-.. list-table::
-   :header-rows: 1
-   :widths: 20 60 20
-
-   * - **Variable**
-     - **Description**
-     - **Example**
-   * - IS_BACKTESTING
-     - Set to **"True"** to run in backtesting mode, or **"False"** for live (defaults to False).
-     - False
-   * - BACKTESTING_START
-     - Start date in the format "YYYY-MM-DD".
-     - 2025-01-01
-   * - BACKTESTING_END
-     - End date in the format "YYYY-MM-DD".
-     - 2025-05-01
-   * - BACKTESTING_DATA_SOURCE
-     - Backtesting data source. This value is case-insensitive and takes precedence even when your code passes a ``datasource_class`` argument. Set it to ``none`` (or leave it unset) if you prefer to control the data source from code. Valid options: **Polygon**, **ThetaData**, **Yahoo**, **Alpaca**, **CCXT**, **DataBento** (defaults to ThetaData).
-     - Polygon
-
-Below is a short example showing how you might rely *entirely* on environment variables and **omit** any explicit date or data source definitions in code. Set ``BACKTESTING_DATA_SOURCE=Polygon`` in your environment to use Polygon.io (API key still required):
-
-.. code-block:: python
-
-    from lumibot.strategies import Strategy
-
-    class MyStrategy(Strategy):
-        parameters = {
-            "symbol": "AAPL",
-        }
+        parameters = {"symbol": "SPY"}
 
         def initialize(self):
             self.sleeptime = "1D"
@@ -182,62 +76,76 @@ Below is a short example showing how you might rely *entirely* on environment va
                 self.submit_order(order)
 
     if __name__ == "__main__":
-        # Set in environment: BACKTESTING_DATA_SOURCE=Polygon
-        # Set in environment: BACKTESTING_START=2025-01-01
-        # Set in environment: BACKTESTING_END=2025-05-01
-        polygon_api_key = "YOUR_POLYGON_API_KEY"  # Still required for Polygon
         result = MyStrategy.run_backtest(
-            None,  # Auto-selects from BACKTESTING_DATA_SOURCE env var
-            polygon_api_key=polygon_api_key
+            YahooDataBacktesting,
+            datetime(2020, 1, 1),
+            datetime(2024, 12, 31),
+            benchmark_asset="SPY",
         )
 
-For more information about running backtests, refer to the :ref:`Backtesting Function <backtesting.backtesting_function>` section.
+Optional: Environment Variables for Backtest Configuration
+-----------------------------------------------------------------
 
-.. tip::
+Instead of hard-coding dates or datasources, set:
 
-   For a full list of supported configuration environment variables (audit telemetry, remote cache, profiling, etc.),
-   see :ref:`Environment Variables <environment_variables>`.
+- ``IS_BACKTESTING``
+- ``BACKTESTING_START``
+- ``BACKTESTING_END``
+- ``BACKTESTING_DATA_SOURCE``
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 60 20
+
+   * - **Variable**
+     - **Description**
+     - **Example**
+   * - IS_BACKTESTING
+     - ``True`` for backtest mode; ``False`` for live.
+     - True
+   * - BACKTESTING_START
+     - Start date ``YYYY-MM-DD``.
+     - 2020-01-01
+   * - BACKTESTING_END
+     - End date ``YYYY-MM-DD``.
+     - 2024-12-31
+   * - BACKTESTING_DATA_SOURCE
+     - Overrides code datasource. Valid values: ``yahoo``, ``alpaca``, ``ibkr`` (default: ``yahoo``). Use ``none`` to rely on code.
+     - yahoo
+
+Example relying on environment variables:
+
+.. code-block:: python
+
+    from lumibot.strategies import Strategy
+
+    class MyStrategy(Strategy):
+        def initialize(self):
+            self.sleeptime = "1D"
+
+        def on_trading_iteration(self):
+            if self.first_iteration:
+                order = self.create_order("SPY", quantity=10, side="buy")
+                self.submit_order(order)
+
+    if __name__ == "__main__":
+        # BACKTESTING_DATA_SOURCE=yahoo
+        # BACKTESTING_START=2020-01-01
+        # BACKTESTING_END=2024-12-31
+        MyStrategy.run_backtest(None)
+
+See :ref:`Environment Variables <environment_variables>` for the full list.
 
 Files Generated from Backtesting
 ===================================
 
-When you run a backtest in LumiBot, several important files are generated. These files provide detailed insights into the performance and behavior of the strategy. Each file is crucial for understanding different aspects of your strategy's execution.
+LumiBot writes tearsheets, trade logs, and indicator artifacts under your strategy log directory. See:
 
-Tearsheet HTML
------------------------------------
-
-LumiBot generates a detailed **Tearsheet HTML** file that provides visual and statistical analysis of your strategy’s performance. The tear sheet includes:
-
-- Equity curve
-- Performance metrics (e.g., Sharpe ratio, drawdown)
-- Benchmark comparisons
-
-For more information, see the :ref:`Tearsheet HTML <backtesting.tearsheet_html>` section.
-
-Trades Files
------------------------------------
-
-The **Trades File** logs every trade executed during the backtest, including:
-
-- The asset traded
-- The quantity of the trade
-- The price at which the trade was executed
-- The timestamp of the trade
-
-This file is essential for reviewing your strategy's trading behavior and identifying any potential issues or optimizations.
-
-For more information on how to interpret the **Trades Files**, see the :ref:`Trades Files <backtesting.trades_files>` section.
-
-Indicators Files
------------------------------------
-
-The **Indicators File** logs any technical indicators used in your strategy, such as moving averages, RSI, or custom indicators. This file helps you understand how your strategy responded to market conditions based on specific indicators.
-
-For more information, see the :ref:`Indicators Files <backtesting.indicators_files>` section.
+- :ref:`Tearsheet HTML <backtesting.tearsheet_html>`
+- :ref:`Trades Files <backtesting.trades_files>`
+- :ref:`Indicators Files <backtesting.indicators_files>`
 
 Conclusion
 -----------------------------------
 
-LumiBot’s backtesting feature provides a powerful framework for validating your strategies across multiple data sources. By following this guide, you can quickly set up your environment, choose a data source, and begin backtesting with confidence.
-
-For further details on each data source and the files generated during backtesting, refer to the individual sections listed above.
+Pick **Yahoo** for daily equity research, **Alpaca** or **IBKR** when you need broker-aligned intraday data, and **Pandas** when you supply custom CSVs. Use ``BACKTESTING_DATA_SOURCE`` to switch providers without changing strategy code.

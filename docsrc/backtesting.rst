@@ -1,16 +1,14 @@
 Backtesting
 ************************
 
-Lumibot has multiple modes for backtesting:
+Lumibot has multiple modes for backtesting US equities and ETFs:
 
-1. **Yahoo Backtesting:** Daily stock backtesting with data from Yahoo.
-2. **Pandas Backtesting:** Intra-day and inter-day testing of stocks and futures using CSV data supplied by you.
-3. **Polygon Backtesting:** Intra-day and inter-day testing of stocks and futures using Polygon data from polygon.io.
-4. **DataBento Backtesting:** Backtesting with high-quality data from DataBento for stocks, futures, and options.
-5. **ThetaData Backtesting:** Backtesting with ThetaData (via the LumiBot Data Downloader).
-6. **Interactive Brokers (REST) Backtesting:** Backtesting with IBKR Client Portal Gateway (via the LumiBot Data Downloader).
+1. **Yahoo Backtesting:** Daily stock/ETF backtesting with data from Yahoo Finance (default).
+2. **Alpaca Backtesting:** Intraday or daily US equity data via Alpaca.
+3. **Pandas Backtesting:** Intra-day and inter-day testing using CSV or DataFrame data you supply.
+4. **Interactive Brokers (REST) Backtesting:** Backtesting with IBKR Client Portal Gateway (via the LumiBot Data Downloader).
 
-It is recommended to use Yahoo Backtesting for daily stock backtesting, ThetaData Backtesting for stocks/options/index data, and Interactive Brokers (REST) Backtesting for futures and crypto data. Pandas Backtesting is an advanced feature that allows you to test any type of data you have in CSV format but requires more work to setup and is not recommended for most users.
+For most daily equity strategies, start with **Yahoo**. Use **Alpaca** or **IBKR** when you need broker-aligned intraday bars. **Pandas** is an advanced option when you already have custom datasets.
 
 Files Generated from Backtesting
 ================================
@@ -26,9 +24,6 @@ When you run a backtest, several important files are generated, each prefixed by
    backtesting.performance
    backtesting.yahoo
    backtesting.pandas
-   backtesting.polygon
-   backtesting.databento
-   backtesting.thetadata
    backtesting.ibkr
    backtesting.tearsheet_html
    backtesting.trades_files

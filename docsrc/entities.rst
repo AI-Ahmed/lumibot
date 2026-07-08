@@ -17,4 +17,3 @@ Here's a list of the main entities in Lumibot:
    entities.trading_fee
    entities.trading_slippage
    entities.smart_limit
-   entities.chains

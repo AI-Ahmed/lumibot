@@ -31,6 +31,18 @@ Examples:
 
 ## Index (newest first)
 
+### 2026-07-08 — Equity-only fork broker deletion
+
+| Doc | Purpose |
+|-----|---------|
+| `2026-07-08_DELETION_TODO_AUDIT.md` | **Live audit** — ~88% complete, blockers |
+| `2026-07-08_BROKER_DATA_SOURCE_DELETION_TODO.md` | Phased deletion plan (SA-0–SA-7) |
+| `2026-07-08_SUBAGENT_BLOCKER_FIX.md` | Subagent Task hook fix + SA queue |
+| `2026-07-08_UPSTREAM_MERGE_EQUITY_FILTER.md` | Upstream merge ACCEPT/REJECT matrix |
+| `2026-07-08_DELETION_REVIEW_CODE_OPTIMIZER.md` | Code-optimizer review (if present) |
+
+### Earlier handoffs
+
 - `2026-01-04_NVDA_SPX_PROD_PARITY_STARTUP_HANDOFF.md`
 - `2026-01-04_THETADATA_CI_ACCEPTANCE_GATE_HANDOFF.md`
 - `2026-01-01_THETADATA_SESSION_HANDOFF.md`

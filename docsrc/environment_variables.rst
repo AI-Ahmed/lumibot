@@ -3,7 +3,7 @@
 Environment Variables
 =====================
 
-LumiBot supports configuring many behaviors via environment variables. This page documents the variables most commonly used for **backtesting**, **ThetaData**, and **remote caching**.
+LumiBot supports configuring many behaviors via environment variables. This page documents the variables most commonly used for **backtesting**, **broker credentials**, and **remote caching**.
 
 .. important::
 
@@ -48,16 +48,9 @@ BACKTESTING_DATA_SOURCE
 
 - Purpose: Select the backtesting datasource **even if your code passes a `datasource_class`**.
 - Values (case-insensitive):
-  - ``thetadata``, ``yahoo``, ``polygon``, ``alpaca``, ``ccxt``, ``databento``
+  - ``yahoo`` (default)
+  - ``alpaca``
   - ``ibkr`` / ``interactivebrokersrest`` / ``interactive_brokers_rest`` (IBKR Client Portal REST)
-  - ``router`` (multi-provider routing; defaults to Theta for stock/option/index and IBKR for futures/crypto)
-  - JSON mapping (multi-provider routing by asset type), e.g. ``{"default":"thetadata","stock":"thetadata","option":"thetadata","index":"thetadata","future":"ibkr","crypto":"ibkr"}``
-
-    - Provider values are case/whitespace/_/- insensitive.
-    - Supported values include ``thetadata``, ``ibkr``, ``polygon``, ``alpaca``, and ``ccxt``.
-    - For CCXT, you may use ``ccxt`` (auto-select exchange from existing env/credentials) **or** specify a CCXT exchange id directly (for example: ``coinbase``, ``kraken``, ``binance``, ``kucoin``).
-    - Routing keys are the canonical asset types (``future``, ``cont_future``, ``crypto``, etc.). Common plural aliases like ``futures``/``cont_futures`` are accepted.
-
   - ``none`` to disable the env override and rely on code.
 
 Testing / CI guardrails
@@ -163,60 +156,6 @@ BACKTESTING_PROFILE
 - Output:
   - Produces a ``*_profile_yappi.csv`` artifact alongside other backtest artifacts.
 
-ThetaData option-chain building (performance)
----------------------------------------------
-
-THETADATA_CHAIN_DEFAULT_MAX_DAYS_OUT
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-- Purpose: Bounds the default option-chain expiration window for equity underlyings to reduce strike-list fanout in cold caches/backtests.
-- Values: integer days.
-- Default: ``730`` (2 years).
-- Notes: set to ``0`` to disable the default bound (fetch all expirations).
-
-THETADATA_CHAIN_DEFAULT_MAX_DAYS_OUT_INDEX
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-- Purpose: Same as ``THETADATA_CHAIN_DEFAULT_MAX_DAYS_OUT``, but for index-like underlyings (SPX/NDX/VIX/etc) with dense expiration schedules.
-- Values: integer days.
-- Default: ``180``.
-- Notes: set to ``0`` to disable the default bound.
-
-THETADATA_CHAIN_RECENT_FILE_TOLERANCE_DAYS
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-- Purpose: Local chain cache file reuse window (equities) when no chain hints are in effect.
-- Values: integer days.
-- Default: ``7``.
-
-THETADATA_CHAIN_STRIKES_TIMEOUT
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-- Purpose: Downloader wait timeout per strike-list request when building chains.
-- Values: seconds (float).
-- Default: ``300``.
-
-THETADATA_CHAIN_STRIKES_BATCH_SIZE
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-- Purpose: Number of in-flight strike-list requests when building chains.
-- Values: integer.
-- Default: ``0`` (use queue client concurrency).
-
-ThetaData corporate action normalization (accuracy)
-------------------------------------------------------------
-
-THETADATA_APPLY_CORPORATE_ACTIONS_INTRADAY
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-- Purpose: Apply split/dividend adjustments to **intraday** frames (minute/second/hour) in backtests so intraday prices match daily split-adjusted prices and option-chain strike normalization stays consistent.
-- Values: ``1`` / ``true`` enable; ``0`` / ``false`` disable.
-- Default:
-  - enabled when ``IS_BACKTESTING`` is truthy
-  - disabled otherwise
-- Notes:
-  - Disabling can break options strike selection around splits (example: NVDA 10-for-1 split on 2024-06-10).
-
 Remote cache (S3)
 -----------------
 
@@ -304,10 +243,8 @@ TRADING_BROKER
 
 - Purpose: Explicitly specify which broker to use for live trading.
 - Values (case-insensitive):
-  - ``alpaca``, ``tradier``, ``ccxt``, ``coinbase``, ``kraken``
+  - ``alpaca``
   - ``ib``, ``interactivebrokers``, ``ibrest``, ``interactivebrokersrest``
-  - ``tradovate``, ``schwab``, ``bitunix``
-  - ``projectx``, ``projectx-topstepx``, ``projectx-topone``, etc.
 - Note: If not set, broker is auto-detected based on available credentials.
 
 DATA_SOURCE
@@ -315,8 +252,7 @@ DATA_SOURCE
 
 - Purpose: Explicitly specify which data source to use.
 - Values (case-insensitive):
-  - ``alpaca``, ``tradier``, ``polygon``, ``yahoo``, ``thetadata``, ``databento``
-  - ``ccxt``, ``coinbase``, ``kraken``, ``schwab``, ``bitunix``, ``projectx``
+  - ``alpaca``, ``yahoo``, ``ibkr``, ``interactivebrokersrest``
 - Note: If not set, uses broker's default data source.
 
 Alpaca broker
@@ -352,29 +288,6 @@ LUMIBOT_ALPACA_TRADES_RATE_LIMIT
   - When using ``AlpacaBacktesting`` with trades data (HFT strategies), parallel downloads share a global rate limiter.
   - Users with premium/custom Alpaca agreements may set ``0`` to disable rate limiting.
   - Reference: `Alpaca API rate limits <https://alpaca.markets/support/usage-limit-api-calls>`_.
-
-Tradier broker
---------------
-
-TRADIER_ACCESS_TOKEN
-^^^^^^^^^^^^^^^^^^^^
-
-- Purpose: Tradier API access token.
-- Values: Obtain from Tradier dashboard (**do not hardcode**).
-
-TRADIER_ACCOUNT_NUMBER
-^^^^^^^^^^^^^^^^^^^^^^
-
-- Purpose: Tradier account number for trading.
-- Values: Your Tradier account number.
-
-TRADIER_IS_PAPER
-^^^^^^^^^^^^^^^^
-
-- Purpose: Toggle between paper and live trading.
-- Values: ``true`` (paper) / ``false`` (live).
-- Default: ``true`` (paper trading).
-
 Interactive Brokers
 -------------------
 
@@ -514,133 +427,6 @@ TRADOVATE_MD_URL
 - Purpose: Market data URL override.
 - Values: URL string.
 - Default: ``https://md.tradovateapi.com/v1``.
-
-Crypto brokers (CCXT)
----------------------
-
-KRAKEN_API_KEY / KRAKEN_API_SECRET
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-- Purpose: Kraken exchange API credentials.
-- Values: Obtain from Kraken (**do not hardcode**).
-
-COINBASE_API_KEY_NAME / COINBASE_PRIVATE_KEY
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-- Purpose: Coinbase Advanced Trade API credentials.
-- Values: Obtain from Coinbase (**do not hardcode**).
-
-COINBASE_API_PASSPHRASE
-^^^^^^^^^^^^^^^^^^^^^^^
-
-- Purpose: API passphrase (if required by Coinbase).
-- Values: Passphrase string (**do not hardcode**).
-
-COINBASE_SANDBOX
-^^^^^^^^^^^^^^^^
-
-- Purpose: Use Coinbase sandbox environment.
-- Values: ``true`` / ``false``.
-- Default: ``false``.
-
-Bitunix broker
---------------
-
-BITUNIX_API_KEY / BITUNIX_API_SECRET
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-- Purpose: Bitunix exchange API credentials.
-- Values: Obtain from Bitunix (**do not hardcode**).
-
-BITUNIX_TRADING_MODE
-^^^^^^^^^^^^^^^^^^^^
-
-- Purpose: Trading mode selection.
-- Values: ``FUTURES`` / ``SPOT``.
-- Default: ``FUTURES``.
-
-ProjectX brokers
-----------------
-
-ProjectX supports multiple prop trading firms. Each firm uses a unique prefix pattern.
-
-PROJECTX_FIRM
-^^^^^^^^^^^^^
-
-- Purpose: Select which ProjectX firm to use.
-- Values: ``TOPSTEPX``, ``TOPONE``, ``TICKTICKTRADER``, ``BULENOX``, ``E8X``, etc.
-
-PROJECTX_{FIRM}_API_KEY
-^^^^^^^^^^^^^^^^^^^^^^^
-
-- Purpose: API key for the specified firm.
-- Example: ``PROJECTX_TOPSTEPX_API_KEY``, ``PROJECTX_TOPONE_API_KEY``
-- Values: Obtain from firm's platform (**do not hardcode**).
-
-PROJECTX_{FIRM}_USERNAME
-^^^^^^^^^^^^^^^^^^^^^^^^
-
-- Purpose: Username for the specified firm.
-- Example: ``PROJECTX_TOPSTEPX_USERNAME``
-- Values: Your username on the firm's platform.
-
-PROJECTX_{FIRM}_PREFERRED_ACCOUNT_NAME
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-- Purpose: Preferred account name when multiple accounts exist.
-- Example: ``PROJECTX_TOPSTEPX_PREFERRED_ACCOUNT_NAME``
-- Values: Account name string.
-
-Data source credentials
------------------------
-
-POLYGON_API_KEY
-^^^^^^^^^^^^^^^
-
-- Purpose: Polygon.io API key for market data.
-- Values: Obtain from Polygon.io (**do not hardcode**).
-
-POLYGON_MAX_MEMORY_BYTES
-^^^^^^^^^^^^^^^^^^^^^^^^
-
-- Purpose: Hard limit on memory Polygon can use for caching.
-- Values: Integer (bytes).
-
-THETADATA_USERNAME / THETADATA_PASSWORD
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-- Purpose: ThetaData API credentials.
-- Values: Obtain from ThetaData (**do not hardcode**).
-- Note: Required for ThetaData backtesting and live data.
-
-THETADATA_BASE_URL
-^^^^^^^^^^^^^^^^^^
-
-- Purpose: Base URL for the local ThetaTerminal REST API.
-- Default: ``http://127.0.0.1:25503``
-- Values: URL string.
-- Note: You typically do not need to set this; LumiBot auto-manages a local ThetaTerminal for ThetaData usage.
-
-DATABENTO_API_KEY
-^^^^^^^^^^^^^^^^^
-
-- Purpose: DataBento API key for market data.
-- Values: Obtain from DataBento (**do not hardcode**).
-
-DATABENTO_TIMEOUT
-^^^^^^^^^^^^^^^^^
-
-- Purpose: Request timeout for DataBento API calls.
-- Values: Integer (seconds).
-- Default: ``30``.
-
-DATABENTO_MAX_RETRIES
-^^^^^^^^^^^^^^^^^^^^^
-
-- Purpose: Maximum retry attempts for failed DataBento requests.
-- Values: Integer.
-- Default: ``3``.
-
 LUMIWEALTH_API_KEY
 ^^^^^^^^^^^^^^^^^^
 
