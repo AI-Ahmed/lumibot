@@ -3,6 +3,7 @@
 .DS_Store
 **/*.ipynb
 **/.ipynb_checkpoints
+**/__pycache__/
 **/__pycache__
 
 # Cache files
@@ -19,6 +20,7 @@ generated-docs/
 docsrc/_build/
 **/*.pkl
 .pytest*
+.pytest_cache/
 
 # Development files
 venv*
@@ -36,7 +38,7 @@ test_bot.py
 lumi_tradier
 lumiwealth_tradier
 /ThetaTerminal.jar
-!lumibot/resources/ThetaTerminal.jar
+lumibot/resources/ThetaTerminal.jar
 pytest.ini
 .secrets/.env
 .secrets/config.py
@@ -64,10 +66,12 @@ token.json
 schwab_token.json
 
 # AI assistant instruction files (contain local paths)
+.cursorignore
 CLAUDE.md
 AGENTS.md
 llms.txt
 llms-full.txt
+BROKER_DATA_SOURCE_INVENTORY.md
 
 # Allow scoped agent instructions for the test suite.
 !tests/AGENTS.md
@@ -83,16 +87,25 @@ tests/backtest/_manual_visual_runs/
 # Local benchmarks (cache + profiler outputs)
 tests/backtest/_ibkr_speed_burner_cache/
 tests/backtest/_speed_burner_profiles/
+tests/backtest/backtest_performance_history.csv
 
 # Prod-like local runner output
 backtest_runs/
 
 # Local tool configs (untracked, user-specific)
 context*.json
-!context7.json
+context7.json
 /tests/backtest/_manual_runs
+shard_files.txt
 
 # Local scratch / diagnostics (never commit)
 tmp/
 
 .cursor/
+
+# Agent context tooling (local, regenerable) — Cursor + Claude Code only
+graphify-out/
+.wolf/
+.code-review-graph/
+.claude/
+.mcp.json

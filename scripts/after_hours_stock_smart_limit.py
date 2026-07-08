@@ -1,7 +1,7 @@
 """After-hours SMART_LIMIT experiment for stocks (paper).
 
 This is an ops script: it places real paper orders and logs repricing + fills.
-Use this to sanity-check after-hours behavior (e.g. Tradier `time_in_force='post'`).
+Use this to sanity-check after-hours behavior with Alpaca (time_in_force='post').
 """
 
 from __future__ import annotations
@@ -19,8 +19,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from lumibot.brokers.alpaca import Alpaca
-from lumibot.brokers.tradier import Tradier
-from lumibot.credentials import ALPACA_TEST_CONFIG, TRADIER_TEST_CONFIG
+from lumibot.credentials import ALPACA_TEST_CONFIG
 from lumibot.entities import Asset, Order, SmartLimitConfig, SmartLimitPreset
 from lumibot.strategies.strategy import Strategy
 
@@ -43,35 +42,14 @@ class _Snapshot:
 
 def _make_broker(name: str):
     name = name.lower().strip()
-    if name == "tradier":
-        if not TRADIER_TEST_CONFIG.get("ACCOUNT_NUMBER") or not TRADIER_TEST_CONFIG.get("ACCESS_TOKEN"):
-            raise RuntimeError("Missing TRADIER_TEST_ACCOUNT_NUMBER / TRADIER_TEST_ACCESS_TOKEN in .env")
-        return Tradier(
-            account_number=TRADIER_TEST_CONFIG["ACCOUNT_NUMBER"],
-            access_token=TRADIER_TEST_CONFIG["ACCESS_TOKEN"],
-            paper=True,
-            connect_stream=True,
-        )
     if name == "alpaca":
         return Alpaca(ALPACA_TEST_CONFIG, connect_stream=False)
-    raise ValueError(f"Unsupported broker: {name}")
+    raise ValueError(f"Unsupported broker: {name!r}. This fork supports Alpaca only.")
 
 
 def _poll(broker, order: Order) -> _Snapshot:
     now = time.time()
     broker_name = str(getattr(broker, "name", "")).lower()
-
-    if broker_name == "tradier":
-        record = broker._pull_broker_order(order.identifier)  # noqa: SLF001 (ops script)
-        status = str(record.get("status", "")).lower()
-        limit_price = record.get("price")
-        avg_fill = record.get("avg_fill_price")
-        return _Snapshot(
-            ts=now,
-            status=status,
-            limit_price=float(limit_price) if limit_price is not None else None,
-            avg_fill_price=float(avg_fill) if avg_fill is not None else None,
-        )
 
     if broker_name == "alpaca":
         raw = broker.api.get_order_by_id(order.identifier)
@@ -132,10 +110,10 @@ def _drive_until_done(strategy: _Harness, order: Order, *, timeout_seconds: int)
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--broker", choices=["tradier", "alpaca"], required=True)
+    parser.add_argument("--broker", choices=["alpaca"], default="alpaca")
     parser.add_argument("--symbol", default="SPY")
     parser.add_argument("--timeout-seconds", type=int, default=180)
-    parser.add_argument("--tif", default="post", help="Tradier duration (post/pre/day/gtc). Alpaca ignores this.")
+    parser.add_argument("--tif", default="post", help="Time-in-force (post/pre/day/gtc).")
     args = parser.parse_args()
 
     broker = _make_broker(args.broker)
