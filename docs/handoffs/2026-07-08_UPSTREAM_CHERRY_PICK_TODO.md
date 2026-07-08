@@ -17,7 +17,9 @@ Audit on 2026-07-08 found the fork **735 commits behind** `upstream/dev` (`b618a
 | REJECT | 129 | Skip (forbidden brokers/assets) |
 | Other REVIEW | ~388 | Classify per batch |
 
-**Tool:** `scripts/upstream_cherry_pick_todo.sh` — status, list, cherry-pick helpers.
+**Tool:** `scripts/upstream_cherry_pick_todo.sh` — status, **new**, set-baseline, list, cherry-pick helpers.
+
+**Baseline:** `docs/UPSTREAM_REVIEWED_BASELINE.txt` — backlog through `b618afa6` (v4.5.74) is archived. Use `new` for future syncs only.
 
 **Rules:** `BROKER_DATA_SOURCE_INVENTORY.md`, `docs/UPSTREAM_MERGE_PROTOCOL.md`, `.cursor/rules/equity-only-fork.mdc`
 
@@ -26,6 +28,7 @@ Audit on 2026-07-08 found the fork **735 commits behind** `upstream/dev` (`b618a
 ```bash
 git fetch upstream dev
 scripts/upstream_cherry_pick_todo.sh status
+scripts/upstream_cherry_pick_todo.sh new    # 0 = nothing new to review
 git status --porcelain=v1
 ```
 

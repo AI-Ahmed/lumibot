@@ -30,24 +30,27 @@ See also: [`docs/handoffs/2026-07-08_UPSTREAM_MERGE_EQUITY_FILTER.md`](handoffs/
 ```bash
 cd /path/to/lumibot
 git fetch upstream dev
+scripts/upstream_cherry_pick_todo.sh status   # shows archived backlog + new count
+scripts/upstream_cherry_pick_todo.sh new      # only commits AFTER reviewed baseline
 git status --porcelain=v1
-git log --oneline -1
-git rev-list --count HEAD..upstream/dev
 ```
+
+**Reviewed baseline:** `docs/UPSTREAM_REVIEWED_BASELINE.txt` records the upstream SHA through which the 2026-07-08 audit was completed (`b618afa6`, v4.5.74). The 735-commit backlog is **archived** — do not re-classify it. Only review commits that appear in `new`.
 
 Read:
 1. `BROKER_DATA_SOURCE_INVENTORY.md`
 2. `docs/handoffs/2026-07-08_UPSTREAM_MERGE_EQUITY_FILTER.md`
 3. `docs/handoffs/2026-07-08_UPSTREAM_CHERRY_PICK_TODO.md` — Tier 1/2 commit manifest
-4. `.cursor/rules/equity-only-fork.mdc`
+4. `docs/UPSTREAM_REVIEWED_BASELINE.txt` — last reviewed upstream tip
+5. `.cursor/rules/equity-only-fork.mdc`
 
 ---
 
 ## Classify commits
 
 ```bash
-# List commits we don't have
-git log --oneline HEAD..upstream/dev | head -100
+# NEW commits only (since reviewed baseline — not the full 735 backlog)
+scripts/upstream_cherry_pick_todo.sh new
 
 # Inspect one commit
 git show --name-only --format='%h %s' <sha>
@@ -84,6 +87,7 @@ If a merge brings back deleted modules, **remove them again** per deletion TODO.
 - [ ] `setup.py` has no forbidden deps re-added
 - [ ] CHANGELOG notes fork-specific filtering if version bumped
 - [ ] `graphify update .` if code structure changed
+- [ ] Advance baseline after review: `scripts/upstream_cherry_pick_todo.sh set-baseline`
 
 ---
 
@@ -97,10 +101,11 @@ Upstream README lists options, crypto, futures, forex, Polymarket, ThetaData, Po
 
 When user asks to "sync with upstream" or "merge main":
 
-1. Fetch and list commits behind
-2. Classify each candidate (see filter handoff)
+1. Fetch and run `scripts/upstream_cherry_pick_todo.sh new` (not full `HEAD..upstream/dev`)
+2. Classify each **new** candidate (see filter handoff)
 3. Cherry-pick ACCEPT only
 4. Re-filter tests/scripts
 5. Report REJECT list with reasons
+6. Run `set-baseline` when review session is complete
 
 Do **not** copy upstream `CLAUDE.md` or `AGENTS.md` ThetaData sections without fork override banners.

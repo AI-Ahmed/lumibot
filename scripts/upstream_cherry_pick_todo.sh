@@ -13,6 +13,7 @@ cd "$ROOT"
 
 UPSTREAM_REF="${UPSTREAM_REF:-upstream/dev}"
 TODO_DOC="docs/handoffs/2026-07-08_UPSTREAM_CHERRY_PICK_TODO.md"
+BASELINE_FILE="docs/UPSTREAM_REVIEWED_BASELINE.txt"
 
 # Tier 1 — ACCEPT (chronological: oldest first)
 TIER1_SHAS=(
@@ -56,6 +57,16 @@ TIER2_SHAS=(
 
 die() { echo "error: $*" >&2; exit 1; }
 
+read_baseline_sha() {
+  [[ -f "$BASELINE_FILE" ]] || return 1
+  grep -E '^REVIEWED_THROUGH=' "$BASELINE_FILE" | cut -d= -f2
+}
+
+read_baseline_field() {
+  local key="$1"
+  grep -E "^${key}=" "$BASELINE_FILE" 2>/dev/null | cut -d= -f2- || true
+}
+
 require_upstream() {
   git fetch upstream dev >/dev/null 2>&1 || true
   git rev-parse --verify "$UPSTREAM_REF" >/dev/null 2>&1 || die "missing ref $UPSTREAM_REF (git fetch upstream dev)"
@@ -89,15 +100,25 @@ print_commit() {
 
 cmd_status() {
   require_upstream
-  local behind ahead
+  local behind ahead baseline new_count
   behind="$(git rev-list --count HEAD.."$UPSTREAM_REF")"
   ahead="$(git rev-list --count "$UPSTREAM_REF"..HEAD)"
   echo "Upstream sync status"
   echo "  fork HEAD:    $(git log -1 --oneline HEAD)"
   echo "  upstream:     $(git log -1 --oneline "$UPSTREAM_REF")"
-  echo "  behind:       $behind"
+  echo "  behind:       $behind (total fork divergence — includes archived backlog)"
   echo "  ahead:        $ahead"
   echo "  todo doc:     $TODO_DOC"
+  if baseline="$(read_baseline_sha 2>/dev/null)"; then
+    new_count="$(git rev-list --count "${baseline}..${UPSTREAM_REF}" 2>/dev/null || echo 0)"
+    echo "  baseline:     $baseline ($(read_baseline_field REVIEWED_DATE), v$(read_baseline_field REVIEWED_UPSTREAM_VERSION))"
+    echo "  new upstream: $new_count commit(s) since baseline (run: $0 new)"
+    if [[ "$new_count" == "0" ]]; then
+      echo "  → No new upstream commits to review. Backlog archived."
+    fi
+  else
+    echo "  baseline:     (missing — run: $0 set-baseline)"
+  fi
   echo ""
   echo "Tier 1 (ACCEPT — cherry-pick as-is):"
   local t1_done=0 t1_pending=0
@@ -195,18 +216,68 @@ cmd_cherry_pick() {
   echo "Done. For Tier 2 commits, verify no forbidden files were re-introduced."
 }
 
+cmd_new() {
+  require_upstream
+  local baseline limit="${1:-50}"
+  baseline="$(read_baseline_sha)" || die "missing $BASELINE_FILE — run: $0 set-baseline"
+  local count
+  count="$(git rev-list --count "${baseline}..${UPSTREAM_REF}")"
+  echo "New upstream commits since reviewed baseline"
+  echo "  baseline:  $baseline ($(read_baseline_field REVIEWED_DATE))"
+  echo "  upstream:  $(git log -1 --oneline "$UPSTREAM_REF")"
+  echo "  count:     $count"
+  echo ""
+  if [[ "$count" == "0" ]]; then
+    echo "Nothing new to review."
+    return 0
+  fi
+  git log --oneline "${baseline}..${UPSTREAM_REF}" | head -n "$limit"
+  if [[ "$count" -gt "$limit" ]]; then
+    echo "... ($((count - limit)) more — increase limit: $0 new <limit>)"
+  fi
+}
+
+cmd_set_baseline() {
+  require_upstream
+  local new_sha date version
+  new_sha="$(git rev-parse "$UPSTREAM_REF")"
+  date="$(date +%Y-%m-%d)"
+  version="$(git show "$new_sha:setup.py" 2>/dev/null | grep -E 'version=' | head -1 | sed -E 's/.*version="([^"]+)".*/\1/' || echo unknown)"
+  cat > "$BASELINE_FILE" <<EOF
+# Upstream review baseline — equity-only fork
+#
+# All upstream/dev commits at or before REVIEWED_THROUGH were classified.
+# Do NOT re-audit this backlog. Only classify NEW commits after this SHA.
+#
+# Check for new upstream work:
+#   scripts/upstream_cherry_pick_todo.sh new
+#
+# After a future review session, advance the baseline:
+#   scripts/upstream_cherry_pick_todo.sh set-baseline
+#
+REVIEWED_THROUGH=${new_sha}
+REVIEWED_DATE=${date}
+REVIEWED_UPSTREAM_VERSION=${version}
+EOF
+  echo "Baseline updated to $new_sha (v${version}) on ${date}"
+  echo "Future 'new' checks will only show commits after this point."
+}
+
 usage() {
   cat <<EOF
 Upstream cherry-pick TODO tool (equity-only fork)
 
 Usage:
   $0 status                     Show merge gap and per-commit status
+  $0 new [limit]                List upstream commits since reviewed baseline
+  $0 set-baseline               Advance reviewed baseline to current upstream/dev
   $0 list [tier1|tier2|all]     Print commit SHAs
   $0 show <sha>                 Show commit stat summary
   $0 cherry-pick tier1          Cherry-pick all Tier 1 ACCEPT commits
   $0 cherry-pick <sha>          Cherry-pick one commit
 
 Docs: $TODO_DOC
+      $BASELINE_FILE
 Env:  UPSTREAM_REF (default: upstream/dev)
 EOF
 }
@@ -216,6 +287,8 @@ main() {
   shift || true
   case "$cmd" in
     status) cmd_status ;;
+    new) cmd_new "${1:-50}" ;;
+    set-baseline|set_baseline) cmd_set_baseline ;;
     list) cmd_list "${1:-all}" ;;
     show) cmd_show "${1:-}" ;;
     cherry-pick|pick) cmd_cherry_pick "${1:-}" ;;

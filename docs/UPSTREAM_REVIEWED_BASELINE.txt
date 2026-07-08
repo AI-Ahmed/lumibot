@@ -1,0 +1,20 @@
+# Upstream review baseline — equity-only fork
+#
+# All upstream/dev commits at or before REVIEWED_THROUGH were classified on
+# 2026-07-08 (see docs/handoffs/2026-07-08_UPSTREAM_MERGE_EQUITY_FILTER.md).
+# Do NOT re-audit this backlog. Only classify NEW commits after this SHA.
+#
+# Check for new upstream work:
+#   scripts/upstream_cherry_pick_todo.sh new
+#
+# After a future review session, advance the baseline:
+#   scripts/upstream_cherry_pick_todo.sh set-baseline
+#
+REVIEWED_THROUGH=b618afa6f628f6d39d52319f89dd55559077ae73
+REVIEWED_DATE=2026-07-08
+REVIEWED_UPSTREAM_VERSION=4.5.74
+MERGE_BASE_AT_REVIEW=d5945bdc24a9a0c9056e823083bfdf57cdc5b2ca
+CLASSIFIED_TOTAL=604
+CLASSIFIED_TIER1=15
+CLASSIFIED_TIER2=17
+CLASSIFIED_REJECT=129
